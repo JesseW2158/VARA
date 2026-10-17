@@ -1,5 +1,95 @@
 # VARA implementation handoff
 
+## Current completion checkpoint (2026-10-17, Codex)
+
+**Read this before the historical handoffs.** The user requested continued parallel work and an
+immediate durable handoff. The remaining software changes have passed the full gate and were saved
+in ten task-sized local commits; this documentation checkpoint is the eleventh. No remote push.
+
+**Final software gate: 1,406 tests passed, no skips, in 310.96 seconds.** Ruff check passes; format
+check reports 90 files already formatted. Whitespace/LF checks pass. `docs/interfaces.md`, schemas,
+contract tests, synthetic homography and selected policy ZIP were not changed. Final fake juice-box
+learn reached `saved`. Full evidence: [verification record](docs/verification-2026-10-17.md).
+
+### Running now: physical camera stability check
+
+- Unified exec session **59704** is running the real `vision.cameras --check 1800` (30 minutes),
+  configured camera 2 and wrist camera 1. It opens cameras only; it cannot move an arm.
+- Log: `runs/setup/camera-soak-20261017/camera-check.log`. On completion, the wrapper writes
+  `runs/setup/camera-soak-20261017/result.json`. Check the existing process/result before restarting.
+- Do not mark B1 complete until the full duration passes with both feeds and zero failed/late frames.
+  A five-second precursor passed: 148 frames per feed, about 29 fps, zero failures/late frames.
+- Camera 2 now opens, superseding its earlier open failure. Current captures in
+  `runs/setup/cameras/current/` show camera 2 looking across the table from a low position and a mostly
+  dark/occluded wrist view. Neither detected markers. The user replied **"Still preparing the table"**
+  to the calibration-measurement request. Camera transport stability does not establish calibration.
+
+### Implemented and reviewed in this pass
+
+- Fresh per-motor goal synchronization immediately before each configuration torque enable, partial
+  connection cleanup, STOP preservation; all new driver tests use mocks, not motor writes.
+- Offline A6 five-pose checker with raw/normalized encoder consistency and calibration/config/model
+  hashes. The template `runs/calibration/measurements-template.json` deliberately contains nulls.
+- Simulator preserves unseen flags/stale poses and collision bodies; incomplete carry clearance,
+  rise, travel or descent aborts before release. Starters and two-handoff routine pass 5/5 each.
+- Disabled PPO runtime uses replay safety for Cartesian speed, workspace and STOP; preserves grip
+  and wrist; rejects expired commands. Policy-to-IK pacing regression reproduced and fixed.
+- Calibration requires >=4 fitting markers, <=1 cm mean/<=1.5 cm max error; supports >=5 independent
+  measured points; rejects fake cameras in live modes; writes accepted matrices atomically.
+- Camera checker rejects incomplete/interrupted/missing-feed/invalid-duration/empty captures and
+  releases captures on failures. Its focused camera/vision subset passed 83 tests.
+- Genuine C7 repair integration turns six colliding first-round programs into passing repairs and a
+  saved skill. Five clear-table rehearsals all saved, reaching execution in 8.6-11.8 seconds.
+- Current xAI defaults: grok-4.3/none for routing and grok-4.7/low for generation, configurable effort,
+  visible-output caps and truncated-reply rejection. Official documentation checked; 187 focused
+  adapter/router/candidate tests pass. No paid xAI or Daytona calls have been made.
+- Setup diagnostic opens no devices/services and emits only key-presence booleans. `/runtime` labels
+  robot/camera/model/scoring provenance. Edge accepted a full clear-table learn, six cards, live
+  events, H.264 video and Esc stopping the fake arm.
+- README, pitch, demo guide and Devpost draft are ready with measured local results. Final recording
+  and publication remain undone. Marker PDF: `runs/setup/markers/markers-a4.pdf` (13 markers, two A4 pages).
+
+### External prerequisites and next actions
+
+1. Recover the running camera check, record its exact result, and update B1 only if acceptance passes.
+2. The user is preparing the table. Mount camera 2 overhead, clear the wrist view, print markers at
+   actual size, and measure camera Hc/c and marker 0-7 centers in `config/scene.yaml`.
+   Follow [table calibration](docs/table-calibration.md), including five independent check points.
+3. Reconcile leader COM7's saved/hardware encoder calibration mismatch before teleoperation. Follower
+   COM8 matched its saved encoder file, but the joint map/limits still need A6 measurements. Follow
+   [joint calibration](docs/joint-calibration.md) and [hardware notes](docs/hardware-calibration.md).
+   Physical gripper, STOP, replay and I2/I3 acceptance remain open. `use_policy: false` stays in place.
+4. Gitignored `.env` exists with the real arm ports and blank API keys for the user to fill. Last
+   boolean-only check: XAI_API_KEY and DAYTONA_API_KEY absent. Never print the file/values. Once keys
+   exist, run the documented live model, Daytona smoke/pool and voice checks within sandbox caps,
+   cleaning up all created cloud resources. Fixtures do not satisfy those live gates.
+5. `.env` and `.env.example` now select OVERHEAD_CAM=2 through a user/external change. Preserve it.
+   The example's camera-index change is intentionally left unstaged/uncommitted; our model-options
+   hunk was committed separately. No other pending code changes are expected after this checkpoint.
+
+All three worker agents have now reached usage limits. Their earlier completed work is included.
+The last requested additional mapping review did not receive a final agent report; root inspected
+its implementation/tests. No active worker should be assumed to remain. Parallel tools can still
+run independent checks in the main session. Previous full-suite session 2459 completed successfully;
+its log is `runs/verification/final-completion/20261017-160904/pytest.log`.
+
+Use `.venv/Scripts/python.exe`; the venv has no pip (use uv). All serial/LeRobot access stays inside
+`arm/driver.py`. No physical motion, goal, torque or calibration writes occurred in this pass.
+Task-observer observations live at `C:/Users/jesse/.codex/skill-observations` outside this repository.
+
+### Local implementation commits
+
+- `c5670c0` D8: document measured results and prepare the submission story
+- `0079715` C7: verify failed-round repair and successful demo budgets
+- `81b8e54` C1: select current Grok models with bounded request options
+- `7cb23d3` S0: add a non-invasive local setup diagnostic
+- `ecf41f5` B9: label runtime provenance and distinguish marker consistency checks
+- `106e2b1` B1: reject incomplete camera checks and release failed captures
+- `062e4c2` B5: validate measured calibration and preserve accepted homographies
+- `150e241` D7: enforce motion safety and pacing around policy execution
+- `66660cd` A8: preserve scene visibility and reject incomplete simulated carries
+- `a3b1007` A6: validate encoder mapping evidence and synchronize calibrated startup
+
 ## Latest follow-up (2026-10-17, Codex)
 
 Three parallel workstreams continued from the status below:

@@ -123,6 +123,79 @@ mismatch. Both arms reported torque off and stored goals zero; nothing was synch
 Full report: `runs/hardware/20261017-continuation.json`. See
 [hardware calibration notes](hardware-calibration.md) for supply, temperature and A6 prerequisites.
 
+## Software completion and calibration preparation
+
+The next parallel pass addressed the remaining software findings without pretending that configuration
+files establish physical calibration. The user confirmed both arms and cameras are connected and that
+the table still needs calibration. A gitignored `.env` was created from the example, with COM8/COM7 and
+the existing follower ID; API-key fields remain for the user to fill. Key values were never logged.
+
+| Check | Result |
+| --- | --- |
+| Five clear-table demo rehearsals | All executed and saved; 8.6, 10.2, 8.9, 9.9, 11.8 seconds to execution; median 9.9 seconds |
+| C7 repair integration | Actual first-round collision failures in 6/6 programs; fake-model repair passed 6/6 and saved the skill |
+| Updated starter/carry scoring | `hand_over`, `place_in_tray`, and pill-bottle/juice-box two-handoff routine each passed 5/5, seed 7, zero collisions, limit hits and IK failures |
+| Selected PPO through runtime safety wrapper | 20/20 reaches with FakeDriver, seed 7; gripper preserved and no stops |
+| Real Edge dashboard | Typed clear-table request saved; six candidate cards, event updates, H.264 video ready state 4 at width 640, and Esc changed fake-arm state to stopped |
+| Physical cameras, read-only smoke | DSHOW indexes 0 and 1 delivered 640x480 frames; index 2 did not open |
+| Later configured-feed check | Camera 2 now opens; cameras 2 and 1 each delivered 148 frames over five seconds, about 29 fps, zero failed or late reads |
+| Marker print artifact | 13 markers, two A4 pages at 300 dpi; PDF and PNG files generated locally |
+
+Evidence directories:
+
+- `runs/verification/c7-bench-20261017-194847/`: five-run log, summary and per-task artifacts.
+- `runs/verification/c7-repair-20261017-195100/`: failures, repair prompts, second-round scores and saved skill.
+- `runs/verification/scene-visibility-20261017/carry-guards/`: three fresh five-trial scoring runs.
+- `runs/verification/policy-runtime-20261017-194639.json`: actual selected ZIP through the runtime wrapper.
+- `runs/verification/browser-final/1792266692/`: browser result, screenshot, server log and isolated skills.
+- `runs/setup/cameras/`: captured frames and device report; `runs/setup/markers/markers-a4.pdf`: print artifact.
+
+Camera 0 was visually identified as the laptop webcam and camera 1 as the wrist view. The later
+configured-feed check supersedes the earlier index-2 failure: camera 2 now opens, matching the user's
+updated environment setting. Evidence is `runs/setup/cameras/configured-check-20261017.log` and
+`runs/setup/cameras/current/`. The current camera-2 image looks across the table from a low position;
+the wrist image is mostly dark/occluded. No markers were detected in either capture. Mount the overhead
+camera and clear the wrist view. These short checks do not establish the B1 thirty-minute soak.
+
+Implementation changes:
+
+- Driver startup re-reads each motor immediately before syncing its goal, and synchronizes again
+  immediately before every torque enable inside LeRobot configuration. Failed handshakes close the
+  serial port; failure cleanup preserves torque intent. Configuration still temporarily disables torque,
+  so a supported pose remains necessary. All new driver validation used mocks, not physical motion.
+- Simulation preserves incoming visibility and last-known poses. Unseen objects cannot be picked but
+  retain collision bodies; only a handoff completed in that simulator proves removal. Failed clearance,
+  rise, travel or descent aborts before release; failed backoff/home does not emit a completed handoff.
+- The disabled PPO runtime now uses the replay safety session for workspace, STOP and Cartesian speed
+  checks (0.2 m/s, or 0.1 m/s near a hand). It preserves wrist/gripper commands, rejects invalid readings,
+  and prevents expired or catch-up commands. A pacing regression at the policy-to-IK transition was
+  reproduced and fixed. Native inference that never returns still requires the independent STOP path.
+- Table calibration enforces mean error <=1.0 cm and maximum <=1.5 cm, requires at least four fitting
+  markers, supports five independent measured check points, rejects fake cameras in live modes, and
+  atomically preserves an existing matrix on failure. The dashboard reports a marker consistency check;
+  it cannot certify the independent measurements. See [table calibration](table-calibration.md).
+- The A6 offline checker compares five measured tip poses with saved encoder inspection reports and
+  current mapping/model hashes. It refuses mismatched calibration and incomplete measurements; it
+  does not invent offsets or authorize motion. See [joint calibration](joint-calibration.md).
+- `scripts/check_setup.py` reports local prerequisites and key-presence booleans without opening
+  hardware or network connections. `/runtime` labels the dashboard's device/model/scoring modes.
+- The camera soak CLI now requires all requested feeds and a completed finite positive duration.
+  Interrupted checks, empty/one-frame captures and failed partial opens cannot report acceptance;
+  captures are released on errors. The 83-test camera/vision subset passed.
+- Model defaults now explicitly request `grok-4.3` with no reasoning for routing and `grok-4.7` with
+  low reasoning for generation, with configurable effort, visible-output limits and truncated-reply
+  rejection. All 187 focused adapter/router/candidate tests passed. Official documentation supports
+  these options; account access and service latency remain untested. See [model setup](setup.md#live-model-configuration).
+- README, pitch, demo instructions and [Devpost draft](devpost-draft.md) now use measured local results
+  and identify pending physical/cloud acceptance. No final presentation was recorded or published.
+
+**Final combined gate: 1,406 passed, no skips, in 310.96 seconds.** The full log is
+`runs/verification/final-completion/20261017-160904/pytest.log`. Ruff check passes, format check reports
+90 files already formatted, and whitespace/LF/protected-file checks pass. The final fake juice-box
+learn reached `saved`; its log is `runs/verification/final-completion/20261017-160702/e2e-juice.log`,
+with isolated skills under `runs/e2e_fake/20261017-200702/skills/`. No live model call or physical
+motion is implied by these checks. The local prerequisite report is `runs/setup/final-check.json`.
+
 ## Remaining acceptance work
 
 - A6: measure joint signs/offsets against the model and pass the five-pose 1.5 cm accuracy test.
@@ -134,15 +207,13 @@ Full report: `runs/hardware/20261017-continuation.json`. See
 - C1-C3/C5-C6/C8, D3-D5 and A14: live model, Daytona and voice checks where the task requires them.
   Offline fixtures do not establish API compatibility or cloud cleanup on a real account.
 - I1 still needs the other laptops; I3 and the M gates need the integrated physical scene.
-- D7 remains off (`use_policy: false`); simulated policy results do not establish loaded-object,
-  grasp-pose or moving-hand performance on the real arm. The policy runner also needs Cartesian
-  tip-speed enforcement before enabling it.
+- D7 remains off (`use_policy: false`); simulated policy results and runtime speed enforcement do not
+  establish loaded-object, grasp-pose or moving-hand performance on the real arm.
 - Clear-table fixtures now pass the demo seed but still fail on some broader perturbations; the 15 cm
   release drops props into the tray. Revisit the real layout/tray height under A15 before choreography.
-- Preserve incoming scene visibility in simulation: unseen objects currently reappear as seen in its
-  snapshot. Auxiliary after-handoff runs therefore do not prove correct reduced-object behavior.
 - Reconcile the leader's hardware/saved calibration mismatch before teleoperation. Keep the arm
-  supported during real connection: configure temporarily disables torque after the initial goal sync.
+  supported during real connection: configure temporarily disables torque even with a fresh goal sync.
+- D8/M7: review the prepared story, record the final demonstration, and publish the approved submission.
 
 Task checkboxes are updated only where the stated acceptance can be supported by available evidence.
 Hardware, live-service and human-observation checks remain open.
