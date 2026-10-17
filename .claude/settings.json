@@ -1,0 +1,29 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pytest *)",
+      "Bash(python -m pytest *)",
+      "Bash(ruff *)",
+      "Bash(python scripts/e2e_fake.py *)",
+      "Bash(python -m sim.run_candidate *)",
+      "Bash(git status *)",
+      "Bash(git diff *)",
+      "Bash(git log *)",
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(git switch *)"
+    ],
+    "ask": [
+      "Bash(* --real *)",
+      "Bash(* --real)",
+      "Bash(git push *)",
+      "Bash(python scripts/daytona_smoke.py *)",
+      "Edit(docs/interfaces.md)",
+      "Edit(schemas/**)",
+      "Edit(tests/contract/**)"
+    ],
+    "deny": [
+      "Read(.env)"
+    ]
+  }
+}

@@ -1,0 +1,30 @@
+{
+  "name": "clear_table",
+  "trusted": false,
+  "spec": {
+    "name": "clear_table",
+    "description": "Put every object on the table into the tray.",
+    "params": {},
+    "success": {
+      "all": [
+        {
+          "in_zone": {
+            "object": "*",
+            "zone": "tray"
+          }
+        }
+      ]
+    },
+    "english": "Every object ends inside the tray."
+  },
+  "code": "import math\n\ndef run(robot, args):\n    scene = robot.scene()\n    objs = scene[\"objects\"]\n    tallest = max([o[\"h\"] for o in scene[\"obstacles\"].values()] + [0.0])\n    for name in sorted(objs, key=lambda n: objs[n][\"x\"]):\n        if not robot.pick(name, transit_z=tallest + 0.08):\n            return False\n        if not robot.place_in_zone(\"tray\", transit_z=tallest + 0.08):\n            return False\n    robot.home()\n    return True\n",
+  "sim": {
+    "successes": 5,
+    "trials": 5
+  },
+  "real": {
+    "runs": 1,
+    "successes": 1
+  },
+  "created": "2026-10-17T14:02:00-04:00"
+}

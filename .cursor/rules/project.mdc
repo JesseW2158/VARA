@@ -1,0 +1,5 @@
+---
+description: Shared project rules (same sources as Claude Code)
+alwaysApply: true
+---
+Follow @CLAUDE.md and the contracts in @docs/interfaces.md. Lane rules are in .claude/rules/ (arm, vision, agents, rl, web); read the one for the files you edit. Tasks are in docs/tasks/.

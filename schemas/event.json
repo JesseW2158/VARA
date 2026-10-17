@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Orchestrator event",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "t",
+    "task_id",
+    "stage",
+    "detail"
+  ],
+  "properties": {
+    "t": {
+      "type": "number"
+    },
+    "task_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "stage": {
+      "enum": [
+        "routing",
+        "spec_ready",
+        "writing_code",
+        "candidate_rejected",
+        "simulating",
+        "candidate_scored",
+        "selected",
+        "planning",
+        "validating",
+        "executing",
+        "verifying",
+        "saved",
+        "not_saved",
+        "queued",
+        "done",
+        "stopped",
+        "error"
+      ]
+    },
+    "detail": {
+      "type": "object"
+    }
+  }
+}

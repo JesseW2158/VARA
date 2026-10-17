@@ -1,0 +1,334 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Router output",
+  "oneOf": [
+    {
+      "type": "object",
+      "required": [
+        "action",
+        "skill",
+        "args"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "const": "run"
+        },
+        "skill": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]{1,40}$"
+        },
+        "args": {
+          "type": "object"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": [
+        "action",
+        "spec"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "const": "learn"
+        },
+        "spec": {
+          "$ref": "#/$defs/task_spec"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": [
+        "action",
+        "name",
+        "steps"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "const": "define_routine"
+        },
+        "name": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]{1,40}$"
+        },
+        "steps": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": [
+              "skill",
+              "args"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "skill": {
+                "type": "string",
+                "pattern": "^[a-z][a-z0-9_]{1,40}$"
+              },
+              "args": {
+                "type": "object"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": [
+        "action",
+        "task",
+        "reason"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "const": "queue"
+        },
+        "task": {
+          "type": "string",
+          "minLength": 1
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": [
+        "action"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "const": "stop"
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "objref": {
+      "type": "string",
+      "minLength": 1,
+      "description": "An object name, \"*\" for every object seen in before, or \"$param\"."
+    },
+    "predicate": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "all"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "all": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "$ref": "#/$defs/predicate"
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "any"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "any": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "$ref": "#/$defs/predicate"
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "not"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "not": {
+              "$ref": "#/$defs/predicate"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "in_zone"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "in_zone": {
+              "type": "object",
+              "required": [
+                "object",
+                "zone"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "object": {
+                  "$ref": "#/$defs/objref"
+                },
+                "zone": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "near"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "near": {
+              "type": "object",
+              "required": [
+                "object",
+                "x",
+                "y",
+                "tol"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "object": {
+                  "$ref": "#/$defs/objref"
+                },
+                "x": {
+                  "type": "number"
+                },
+                "y": {
+                  "type": "number"
+                },
+                "tol": {
+                  "type": "number",
+                  "exclusiveMinimum": 0
+                }
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "moved"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "moved": {
+              "type": "object",
+              "required": [
+                "object",
+                "min"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "object": {
+                  "$ref": "#/$defs/objref"
+                },
+                "min": {
+                  "type": "number",
+                  "minimum": 0
+                }
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "not_moved"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "not_moved": {
+              "type": "object",
+              "required": [
+                "object",
+                "max"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "object": {
+                  "$ref": "#/$defs/objref"
+                },
+                "max": {
+                  "type": "number",
+                  "minimum": 0
+                }
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "event"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "event": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        }
+      ]
+    },
+    "task_spec": {
+      "type": "object",
+      "required": [
+        "name",
+        "description",
+        "params",
+        "success",
+        "english"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]{1,40}$"
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1
+        },
+        "params": {
+          "type": "object",
+          "additionalProperties": {
+            "enum": [
+              "object",
+              "zone",
+              "number"
+            ]
+          }
+        },
+        "success": {
+          "$ref": "#/$defs/predicate"
+        },
+        "english": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    }
+  }
+}

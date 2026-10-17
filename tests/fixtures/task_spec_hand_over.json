@@ -1,0 +1,21 @@
+{
+  "name": "hand_over",
+  "description": "Pick up an object and hand it to the user.",
+  "params": {
+    "object": "object"
+  },
+  "success": {
+    "all": [
+      {
+        "moved": {
+          "object": "$object",
+          "min": 0.05
+        }
+      },
+      {
+        "event": "handoff_done"
+      }
+    ]
+  },
+  "english": "The object leaves its spot and the user takes it from the gripper."
+}

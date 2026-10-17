@@ -1,0 +1,19 @@
+{
+  "action": "learn",
+  "spec": {
+    "name": "clear_table",
+    "description": "Put every object on the table into the tray.",
+    "params": {},
+    "success": {
+      "all": [
+        {
+          "in_zone": {
+            "object": "*",
+            "zone": "tray"
+          }
+        }
+      ]
+    },
+    "english": "Every object ends inside the tray."
+  }
+}

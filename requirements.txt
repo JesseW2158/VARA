@@ -1,0 +1,15 @@
+# Every laptop. The demo laptop also installs "lerobot[feetech]".
+# OpenCV: keep exactly one OpenCV package (B2). The headless build matches what LeRobot installs.
+fastapi
+uvicorn[standard]
+httpx
+python-dotenv
+openai
+daytona
+mujoco
+numpy
+pyyaml
+jsonschema
+opencv-python-headless>=4.8
+pytest
+ruff

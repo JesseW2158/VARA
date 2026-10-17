@@ -1,0 +1,7 @@
+{
+  "action": "run",
+  "skill": "hand_over",
+  "args": {
+    "object": "pill_bottle"
+  }
+}

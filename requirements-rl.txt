@@ -1,0 +1,4 @@
+# Lane D, on top of requirements.txt. Install PyTorch first; the CPU wheel is enough:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+gymnasium
+stable-baselines3

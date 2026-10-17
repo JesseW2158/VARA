@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Candidate score line",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "candidate",
+    "passed",
+    "successes",
+    "trials",
+    "nominal_success",
+    "collisions",
+    "limit_hits",
+    "ik_failures",
+    "mean_sim_s",
+    "fail_reason",
+    "traj",
+    "error"
+  ],
+  "properties": {
+    "candidate": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "passed": {
+      "type": "boolean"
+    },
+    "successes": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "trials": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "nominal_success": {
+      "type": "boolean"
+    },
+    "collisions": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "limit_hits": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "ik_failures": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "mean_sim_s": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "fail_reason": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "traj": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "error": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  }
+}

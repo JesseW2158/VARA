@@ -1,0 +1,192 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Scene state",
+  "type": "object",
+  "required": [
+    "t",
+    "objects",
+    "obstacles",
+    "hand",
+    "zones"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "t": {
+      "type": "number"
+    },
+    "objects": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/item"
+      }
+    },
+    "obstacles": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/item"
+      }
+    },
+    "hand": {
+      "type": "object",
+      "required": [
+        "marker",
+        "x",
+        "y",
+        "z",
+        "seen"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "marker": {
+          "type": "integer"
+        },
+        "x": {
+          "type": "number"
+        },
+        "y": {
+          "type": "number"
+        },
+        "z": {
+          "type": "number"
+        },
+        "seen": {
+          "type": "boolean"
+        }
+      }
+    },
+    "zones": {
+      "type": "object",
+      "required": [
+        "tray",
+        "handoff"
+      ],
+      "properties": {
+        "tray": {
+          "type": "object",
+          "required": [
+            "x",
+            "y",
+            "r",
+            "wall",
+            "slots"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "x": {
+              "type": "number"
+            },
+            "y": {
+              "type": "number"
+            },
+            "r": {
+              "type": "number",
+              "exclusiveMinimum": 0
+            },
+            "wall": {
+              "type": "number",
+              "minimum": 0
+            },
+            "slots": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "array",
+                "minItems": 2,
+                "maxItems": 2,
+                "items": {
+                  "type": "number"
+                }
+              }
+            }
+          }
+        },
+        "handoff": {
+          "type": "object",
+          "required": [
+            "x",
+            "y",
+            "z"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "x": {
+              "type": "number"
+            },
+            "y": {
+              "type": "number"
+            },
+            "z": {
+              "type": "number"
+            }
+          }
+        }
+      },
+      "additionalProperties": {
+        "type": "object",
+        "required": [
+          "x",
+          "y"
+        ],
+        "properties": {
+          "x": {
+            "type": "number"
+          },
+          "y": {
+            "type": "number"
+          },
+          "r": {
+            "type": "number",
+            "exclusiveMinimum": 0
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "item": {
+      "type": "object",
+      "required": [
+        "marker",
+        "x",
+        "y",
+        "yaw",
+        "h",
+        "size",
+        "seen"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "marker": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 49
+        },
+        "x": {
+          "type": "number"
+        },
+        "y": {
+          "type": "number"
+        },
+        "yaw": {
+          "type": "number"
+        },
+        "h": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "size": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": {
+            "type": "number",
+            "exclusiveMinimum": 0
+          }
+        },
+        "seen": {
+          "type": "boolean"
+        }
+      }
+    }
+  }
+}

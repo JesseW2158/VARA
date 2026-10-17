@@ -1,0 +1,62 @@
+{
+  "version": 1,
+  "skill": "clear_table",
+  "args": {},
+  "dt": 0.0333,
+  "joints": [
+    "shoulder_pan",
+    "shoulder_lift",
+    "elbow_flex",
+    "wrist_flex",
+    "wrist_roll"
+  ],
+  "segments": [
+    {
+      "kind": "path",
+      "q": [
+        [
+          0.0,
+          -1.75,
+          1.6,
+          0.75,
+          0.0
+        ],
+        [
+          0.006,
+          -1.741,
+          1.593,
+          0.748,
+          0.0
+        ]
+      ]
+    },
+    {
+      "kind": "grip",
+      "action": "close",
+      "object": "juice_box",
+      "expect_held": true
+    },
+    {
+      "kind": "path",
+      "q": [
+        [
+          0.006,
+          -1.741,
+          1.593,
+          0.748,
+          0.0
+        ]
+      ]
+    },
+    {
+      "kind": "grip",
+      "action": "open",
+      "object": "juice_box"
+    },
+    {
+      "kind": "live",
+      "primitive": "carry_to_hand",
+      "object": "pill_bottle"
+    }
+  ]
+}

@@ -1,0 +1,3 @@
+# carry_to_hand tracks the hand with IK unless use_policy is true. D7 sets it only after M4 passes.
+use_policy: false
+policy: rl/policies/handoff_best.zip

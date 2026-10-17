@@ -1,0 +1,10 @@
+{
+  "t": 1792209641.2,
+  "task_id": "t-0042",
+  "stage": "candidate_scored",
+  "detail": {
+    "candidate": 3,
+    "passed": true,
+    "fail_reason": null
+  }
+}

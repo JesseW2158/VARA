@@ -1,0 +1,14 @@
+{
+  "candidate": 3,
+  "passed": true,
+  "successes": 5,
+  "trials": 5,
+  "nominal_success": true,
+  "collisions": 0,
+  "limit_hits": 0,
+  "ik_failures": 0,
+  "mean_sim_s": 21.4,
+  "fail_reason": null,
+  "traj": "out/traj.json",
+  "error": null
+}
