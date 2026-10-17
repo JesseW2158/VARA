@@ -1,46 +1,71 @@
-# Pitch and Devpost
+# Pitch and recording guide
 
-The pitch is one idea: home robots ship with fixed skills, and ours safely learns the user's own tasks from a sentence. Lead with the live learning moment, not the architecture.
+VARA's central idea is a personal skill library built from requests that can be tested. Show the
+success test, a rejected candidate, and the saved skill. Explain the active mode before the demo:
+currently verified footage uses local MuJoCo, fixture model replies, and fake hardware/cameras.
 
-**Talk track (60 seconds, presenter):**
+## A 60-second talk track for the verified local demo
 
-1. "Home robots ship with a fixed list of tasks. The help someone with limited mobility needs is specific to their home."
-2. "So we built an arm you teach by talking to it."
-3. When the success test appears: "Before any code exists, it writes down how it will know it succeeded."
-4. While the cards fill: "Six AI agents each write a different program, and Daytona runs every one in its own simulated copy of this table. Watch the ones that hit the cereal box fail."
-5. "The arm replays only the winner's exact path, checked for collisions in simulation, and the camera checks the result against the same test before it's saved."
-6. "When code isn't enough, Grok writes reward functions and we train policies in parallel. That's how it follows your hand."
-7. "Every skill it learns stays. The library is longer now than when we started."
+"The help someone needs at home is personal. VARA explores a robot arm that can build a library of
+those requests.
 
-**How we differ**, based on their public writeups:
+Here, we're showing the working software pipeline in local simulation. Model responses and devices
+are fixtures for this demonstration. The request is 'clear the table.' Before any program runs, the
+system states what success means: every object must end inside the tray.
 
-| Project | What it did | What's different here |
+Six programs try the task. Each gets five trials. The ones that hit the cereal box fail, even when
+they put the objects in the right place. Only a passing trajectory reaches the validator and fake
+arm. The same success test checks the final scene before the skill is saved.
+
+Five local rehearsals all saved the skill, with a median 9.9 seconds to execution. A separate PPO
+baseline reached its target in 97 of 100 simulated episodes. Physical calibration and live service
+acceptance are our next integration gates."
+
+Keep the local-mode qualification in the recording. If a later live run passes its acceptance gates,
+replace this talk track using that run's actual evidence and preserve its mode labels.
+
+## Questions to answer precisely
+
+| Question | Answer supported today |
+| --- | --- |
+| Is this learning? | New skills are reusable programs selected by tests; PPO separately trains a neural reaching policy. The offline demo uses fixed model-response fixtures, so it demonstrates the learning workflow rather than fresh model generation. |
+| Can a candidate grade itself? | Its return value is insufficient. Our evaluator checks the independent success specification, collisions, joint-limit hits, and IK failures. |
+| Where does generated code run? | In Daytona sandboxes when configured, or restricted local child processes with a minimal environment. It never executes inside the orchestrator and never receives the real driver. |
+| Does simulation make motion safe? | It is one check. Physical joint/camera calibration, validated replay, measured grip behavior, and the STOP drill are still required. Unmodeled geometry and sim-to-real error remain limits. |
+| Did the robot physically clear the table? | The cited five-run result is simulation plus fake replay and verification. We have not established physical clear-table acceptance. |
+| What did RL learn? | Reaching and tracking in the MuJoCo environment. The selected artifact is the hand-written-reward PPO baseline, with 97/100 successes and zero falls at evaluation seed 0. Physical RL deployment is disabled. |
+| Why preserve a skill? | A saved program can be re-planned for the current scene without generating six new programs. A saved skill still needs a new plan and validation. |
+| How fast is it? | Five fixture-backed clear-table commands reached fake execution in 8.6, 10.2, 8.9, 9.9, and 11.8 seconds. This does not predict live xAI or Daytona latency. |
+| What remains unsupported? | Unmeasured physical setups, unverified objects, and requests whose success cannot be expressed by the supported predicates. Cloth and liquids are outside the current demo scope. |
+
+## Two-minute video storyboard
+
+| Time | Picture | Narration / on-screen label |
 | --- | --- | --- |
-| [Baymax](https://devpost.com/software/baymax-your-personal-healthcare-companion), TreeHacks 2024 grand prize | Speech-controlled assistive arm with computer vision that picks up objects and feeds users | Its abilities were fixed at build time; ours grow at use time, and every new skill passes simulation before the arm moves |
-| [Robosurge](https://devpost.com/software/we-use-nix), TreeHacks 2026, 2nd in the grand prize | A surgeon commands several arms in natural language, with custom IK, a depth camera and Lean proofs that trajectories stay in safe bounds | It plans each command; we learn reusable skills and keep them, each judged by a success test written before the code |
+| 0:00-0:15 | Presenter and stationary kit; title card | "A personal skill library for a robot arm." Do not imply that a stationary physical arm is executing the adjacent simulation. |
+| 0:15-0:25 | Dashboard showing mode banner and two starter skills | "Local simulation; fixture model replies; fake arm and cameras." |
+| 0:25-0:55 | One continuous capture: type `clear the table`, show success spec, six candidate cards, rejection reasons, selected result, and saved skill | Explain test-first scoring. Keep the actual waiting period uncut; retain the clock and mode banner. |
+| 0:55-1:10 | Type the command again; show saved-skill planning | "The saved program is re-planned for this scene." Do not claim a measured live-start latency. |
+| 1:10-1:20 | Type `Fold my laundry`; show queued result | "Requests outside the supported task vocabulary are queued." |
+| 1:20-1:35 | Generated PPO simulation clip | Persistent label: "Simulation. Selected hand-written-reward PPO baseline. 97/100, seed 0; zero falls." |
+| 1:35-1:50 | Architecture diagram; highlight sandbox/local subprocess and validator boundaries | State where xAI and Daytona integrate; live service acceptance is tracked separately. |
+| 1:50-2:00 | Current-status card and repository link | "Local workflow verified. Physical joint/camera calibration and supervised arm acceptance pending." |
 
-**Judge questions and answers:**
+The storyboard is prepared; the final video still needs recording, editing, export, and review.
+Capture clean audio separately if needed. A physical STOP clip belongs only after the real drill has
+been measured; the fake STOP button can be shown with its mode label.
 
-- *Is it actually learning, or just running LLM code?* "Two kinds of learning: new skills are programs that must pass a success test in simulation and on the real arm before they're kept, and the RL path trains neural policies. We don't claim one model learns everything."
-- *What stops the AI from doing something dangerous?* "AI-written code never runs on this laptop. It runs in Daytona sandboxes and hands back only a joint path. Our code checks every point against joint limits, speed and a workspace box before the arm replays it, and STOP freezes the arm in place."
-- *How do you know it worked?* "The success test is written from your sentence before any code. The same test scores every simulation and checks the camera after the real run."
-- *Couldn't a program just claim it succeeded?* "Programs never grade themselves. The test is separate, written first, and evaluated by our own code."
-- *IK could follow a hand. Why RL?* "It could. We chose reaching because it transfers reliably from simulation to this arm, so it honestly shows the training pipeline. The pipeline is the point."
-- *Why not a vision-language-action model like SmolVLA?* "Those need recorded demonstrations and GPU training per task. We add a skill in [measured M2 time] with no data collection. VLAs are our next step for dexterous tasks."
-- *How long does a new skill take?* Give the median from `runs/`, measured, never estimated.
-- *What can't it do?* "Cloth, liquids, unknown objects, and anything whose success we can't state and check. Those get queued, and we showed you one."
-- *Does it work on another arm?* "Swap the MuJoCo model and the driver. The agents, sandboxes and library don't change."
+## Recording and submission checklist
 
-**Sponsor challenges.** For Best Use of Daytona, show the six-sandbox fan-out per new skill, the planning sandbox that re-plans every saved skill, and the four-way RL training fan-out, with measured numbers in the README: sandboxes per task, median scoring time, total sandbox runs. For Make It Legendary, the Grok Voice Agent is the product's voice, and the README shows how the project was built with Cursor, with Claude Code running inside it, the shared rules files and screenshots. Say plainly which tool did what.
+- [ ] Record the continuous local learn using [the isolated demo setup](demo.md).
+- [ ] Capture saved-skill reuse, the queued task, and the PPO simulation clip.
+- [ ] Keep fixture/simulation labels visible; add captions and check their timing.
+- [ ] Verify every quoted number against the [verification record](verification-2026-10-17.md).
+- [ ] Export a playable two-minute video and inspect the complete export with sound.
+- [ ] Review [the Devpost draft](devpost-draft.md), team names, repository visibility, and media rights.
+- [ ] Add the actual repository and video links, then publish from the team's account.
+- [ ] Select sponsor categories only after checking current event requirements and the integration evidence.
 
-**Devpost checklist:**
-
-- [ ] Title and tagline, for example "A home robot arm you teach by talking to it."
-- [ ] Video, 2 minutes: 20 s problem, 80 s demo footage with the learning moment uncut, 20 s how it works.
-- [ ] What it does, How we built it (with this doc's architecture diagram), Challenges, Accomplishments (measured numbers), What we learned, What's next.
-- [ ] Built with: Python, LeRobot, SO-101, MuJoCo, Daytona, xAI Grok (Voice Agent API and text API), Cursor, Claude Code, OpenCV, Stable-Baselines3, FastAPI.
-- [ ] Public GitHub repo with a README: setup, architecture, where Daytona and Grok run, and how Cursor and Claude Code were used.
-- [ ] Challenges selected: Best Use of Daytona, Make It Legendary.
-- [ ] Draft submitted by 4:30 AM Sunday; final edits before 7:45 AM.
-
-**Video shot list (Sun 1:00 AM, right after feature freeze):** a wide shot of the table with the dashboard screen-recorded beside it, two clean takes of the full demo, a close-up of the success-test banner and the sandbox cards during learning, the RL simulation video, and 10 seconds of STOP freezing the arm.
+Do not claim measured Daytona sandbox counts, cloud training, live voice success, or Cursor use without
+supporting records. Claude Code and Codex implementation assistance is recorded in repository history;
+that attribution is separate from runtime model calls.

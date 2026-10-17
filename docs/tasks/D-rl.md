@@ -16,7 +16,7 @@ Lane D proves the slow path: Grok writes four reward functions, Daytona trains f
 - [ ] D5 · Parallel training on Daytona · Sat 1:00 PM
 - [x] D6 · Simulation video · Sat 2:00 PM
 - [ ] D7 · Real deployment · Sat 6:00 PM (M4)
-- [ ] D8 · Story work · from Sat 6:00 PM
+- [ ] D8 · Story work · from Sat 6:00 PM (README, pitch, demo guide and Devpost draft ready; M7 pending)
 
 ## D1 · Environment (`rl/handoff_env.py`)
 
