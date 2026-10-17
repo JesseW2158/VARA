@@ -19,23 +19,20 @@ ceiling).
   any running primitive checks every tick; a cancelled primitive returns reason `stopped`.
 - `carry_to_hand(obj, *, driver, scene, on_event, timeout, ...)`: with the object held, take the grasp
   center (`arm.ik.fk_grasp`) to the target, the seen wristband + 0.05 m (the handoff zone when the hand is
-  unseen), clamped TARGET_INSET_M inside the workspace box, so a hand at or beyond the tape is served at
-  the nearest point inside and the tip never leaves the box (9.9 suggested the handoff zone instead; the
-  clamp is kept because the clamped target is still a validated point inside the box, at most 3 cm from
-  the tape, and the release still needs the hand within 0.08 m of the grasp center, so a hand far outside
-  waits out the timeout and gets the handoff zone anyway). The carry has three legs, like
-  `arm.sim_robot.SimRobot.carry_to_hand`, which is what the skill was scored with:
+  unseen). A target outside the workspace box latches a fallback to the configured handoff zone; a
+  valid target near the tape is inset TARGET_INSET_M to leave room for the tip. The handoff zone must
+  itself have that inset. The carry has three legs, like `arm.sim_robot.SimRobot.carry_to_hand`:
   1. Rise: straight up at the present xy to the carry height, the sim's clearance rule
      (`carry_height`): the held object's longest half-extent plus CARRY_CLEARANCE_M above the tallest
-     obstacle or seen object still on the table, capped CEILING_MARGIN_M under the box top, with heights
-     and sizes from config/objects.yaml (`arm.replay.load_objects`; the scene's own entry when the file
-     lacks the name). The rise is planned whole before it starts (`_plan_rise`: IK every LINE_SAMPLE_M,
-     the pitch blended toward the steepest one that reaches the top) and validated against the limits, the
-     box (which holds the tip under the 0.30 m ceiling), the vertical line (CARRY_LINE_TOL_M) and the
-     start height. No rise when the grasp center is already there or the target is at or above the carry
-     height (the sim's rule too). When the scene, a height or the held object's size is missing, or the
-     rise does not validate (IK, box, ceiling), there is no rise and no travel: the carry goes straight
-     for the target as before this leg existed, and an event says why.
+     obstacle or seen object still on the table, required to fit CEILING_MARGIN_M under the box top.
+     Heights and sizes come from config/objects.yaml (`arm.replay.load_objects`), or the scene's entry
+     when the file lacks the name. The rise is planned whole before it starts (`_plan_rise`: IK every
+     LINE_SAMPLE_M, the pitch blended toward the steepest one that reaches the top) and validated against
+     the limits, the box (which holds the tip under the 0.30 m ceiling), the vertical line
+     (CARRY_LINE_TOL_M) and the
+     start height. The rise is skipped only when the grasp center is already at clearance. Missing
+     geometry, insufficient room below the ceiling, an invalid rise, or encoder feedback below the
+     required height aborts while holding the object. No travel or tracking follows a failed rise.
   2. Travel: straight lines at the carry height toward the point above the target, re-aimed at 10 Hz as
      the hand moves, each cycle's bridge validated like the tracking's (below) and never taking the grasp
      center more than CARRY_LINE_TOL_M under the carry height, with no joint-space sweep. It ends above
@@ -54,8 +51,9 @@ ceiling).
      point on the line is reachable, the first ticks of the validated joint-space sweep to the goal's pose
      run, else the arm holds. Once the hand has stayed within 0.08 m of the grasp center for 1 s the
      gripper opens; after `timeout` seconds of tracking (finite; capped at TIMEOUT_MAX_S) with no steady
-     hand it opens at the handoff zone instead; MAX_TRACK_S of tracking, or a clock that stops advancing,
-     ends the tracking where it is.
+     hand it aims for the handoff zone instead. The fallback has FALLBACK_EXTRA_S to reach that zone.
+     Release requires encoder feedback within ZONE_REACHED_M of it. An unreached fallback, MAX_TRACK_S
+     of tracking, or a stalled clock aborts while holding the object, with torque on.
   Then it backs off 0.05 m up, goes home and emits `handoff_done`. With `use_policy: true` in
   config/rl.yaml the RL policy (`rl.policy_runner.run_policy`, imported lazily) does the reach after the
   rise and travel, before the IK tracking; when it cannot be imported, IK is used with a warning. The 10
@@ -64,8 +62,9 @@ ceiling).
 
 Each primitive returns `{"ok": bool, "reason": None | "stopped" | "hand_too_close" | "error",
 "events": [...]}` and never raises for driver, IK or scene failures: an error while moving freezes the arm;
-a failure before anything can move (config files, arm.ik, a bad argument, torque off, a plan that does not
-validate) returns `error` without freezing, and a driver that is already stopped returns `stopped`.
+a setup failure (config files, arm.ik, a bad argument, torque off) returns `error` without freezing,
+and a driver that is already stopped returns `stopped`. A carry whose clearance cannot be established
+freezes even before motion, preserving the grasp while the failed plan is reviewed.
 
     python -m arm.real_robot --fake --carry-test             # in-memory arm, fake hand, no sleeping
     python -m arm.real_robot --real --carry-test [--scene-file scene.json]
@@ -447,7 +446,7 @@ def carry_to_hand(
         _carry_high(session, obj, target)
         cfg = policy_config()
         if cfg["use_policy"]:
-            _run_policy(session, cfg, seconds)
+            _run_policy(session, cfg, seconds, target)
         _track_hand(session, seconds, target)
         session.open_gripper(where="release")
         session.emit("released")
@@ -474,7 +473,7 @@ def carry_to_hand(
         return _failure(drv, session, exc)
 
 
-def _run_policy(session: Session, cfg: dict[str, Any], timeout: float) -> bool:
+def _run_policy(session: Session, cfg: dict[str, Any], timeout: float, target: _Target) -> bool:
     """Reach the hand with the RL policy; False (IK takes over) when it is unavailable or gives up."""
     try:
         from rl.policy_runner import run_policy  # lazy: rl/ is Lane D's and absent from the sandbox bundle
@@ -484,7 +483,21 @@ def _run_policy(session: Session, cfg: dict[str, Any], timeout: float) -> bool:
         return False
     policy_path = ROOT / cfg["policy"]
     session.emit(f"policy: {cfg['policy']}")
-    reached = bool(run_policy(session.driver, session.scene_fn, str(policy_path), timeout=timeout))
+
+    def policy_scene() -> dict:
+        scene = session.scene_dict() or {}
+        hand = session.hand()
+        target.goal(session, hand, fallback=False)
+        if target.rejected_hand:
+            # Share the latched fallback with the policy without changing tracker data.
+            return {
+                **scene,
+                "hand": {"seen": False},
+                "zones": {**scene.get("zones", {}), "handoff": dict(zip("xyz", target.zone, strict=True))},
+            }
+        return scene
+
+    reached = bool(run_policy(session.driver, policy_scene, str(policy_path), timeout=timeout))
     session.refresh()  # the policy moved the arm through the driver
     session.check_stopped()
     session.emit("policy reached the hand" if reached else "policy gave up: tracking with IK")
@@ -499,24 +512,32 @@ def _clamp_point(point: Sequence[float], box: dict[str, Sequence[float]]) -> tup
 
 
 class _Target:
-    """Where the grasp center goes: HAND_ABOVE_M over the seen wristband, else the handoff zone, clamped
-    TARGET_INSET_M inside the workspace box (one event the first time a target is clamped). Shared by the
-    travel and the tracking, so the note is not repeated."""
+    """Target shared by travel, policy and tracking. Out-of-box hands latch the handoff zone;
+    valid hand targets near the boundary are inset to keep the tip inside too."""
 
     def __init__(self, session: Session) -> None:
         self.zone = handoff_zone(session.scene_dict())
         self.box = shrunk_box(session.box, TARGET_INSET_M)
+        if not inside_box(self.zone, self.box):
+            raise ValueError("handoff zone is outside the workspace box with the required target inset")
+        self.rejected_hand = False
         self._noted = False
 
     def goal(self, session: Session, hand: Vec3 | None, *, fallback: bool) -> Vec3:
-        raw = self.zone if fallback or hand is None else (hand[0], hand[1], hand[2] + HAND_ABOVE_M)
+        if hand is not None and not fallback and not self.rejected_hand:
+            hand_target = (hand[0], hand[1], hand[2] + HAND_ABOVE_M)
+            if not inside_box(hand_target, session.box):
+                self.rejected_hand = True
+                session.emit("hand target outside the workspace box: falling back to the handoff zone")
+        raw = (
+            self.zone
+            if fallback or self.rejected_hand or hand is None
+            else (hand[0], hand[1], hand[2] + HAND_ABOVE_M)
+        )
         goal = _clamp_point(raw, self.box)
         if goal != tuple(float(v) for v in raw) and not self._noted:
             self._noted = True
-            session.emit(
-                f"target outside the workspace box (inset {TARGET_INSET_M:.2f} m): aiming at the nearest "
-                "point inside"
-            )
+            session.emit(f"target near the workspace edge: keeping the {TARGET_INSET_M:.2f} m target inset")
         return goal
 
 
@@ -563,12 +584,12 @@ def carry_height(
     """The grasp-center height of the carry by the sim's rule (`arm.sim_robot.SimRobot._carry_clearance`):
     the held object's longest half-extent (`_item_reach`) plus CARRY_CLEARANCE_M above the tallest
     obstacle (seen or not: an obstacle never moves and keeps its last pose) or seen object other than
-    `obj`, capped CEILING_MARGIN_M under `ceiling` (the top of the workspace box).
+    `obj`. Refused if this would exceed `ceiling` minus CEILING_MARGIN_M.
 
     Heights and sizes come from config/objects.yaml (`objects`, default `arm.replay.load_objects()`) by
     name, else from the scene's own entry (which the scene contract copies from that file). Returns
     `(height, how)` with a short description of the sum, or `(None, why)` when the scene, a height or the
-    held object's size is missing."""
+    held object's size is missing, or the required clearance exceeds the ceiling."""
     if not isinstance(scene, dict):
         return None, "no scene data"
     config = load_objects() if objects is None else objects
@@ -597,34 +618,38 @@ def carry_height(
     how = f"{tallest_name} {tallest:.2f} m + {obj} {reach:.3f} m + {CARRY_CLEARANCE_M:.2f} m"
     cap = float(ceiling) - CEILING_MARGIN_M
     if height > cap:
-        return cap, f"{how}, capped {CEILING_MARGIN_M:.2f} m under the box top"
+        return None, f"required height {height:.3f} m exceeds the safe ceiling {cap:.3f} m ({how})"
     return height, how
+
+
+def _hold_error(session: Session, detail: str) -> None:
+    """Abort a carry without releasing its object or attempting another motion."""
+    session.driver.freeze()
+    session.emit(f"error: {detail}; holding the object")
+    raise Abort("error")
 
 
 def _carry_high(session: Session, obj: str | None, target: _Target) -> None:
     """Legs 1 and 2 of the carry (module docstring): rise at the present xy to the carry height, then
-    travel at that height to above the target. Returns with the arm wherever they ended; an event says why
-    whenever a leg is skipped or cut short. Raises Abort like every motion (STOP, box gate)."""
+    travel at that height to above the target. A failed rise aborts holding the object; bounded travel
+    can end before the target and continue with validated tracking. Raises Abort on STOP or a box gate."""
     session.check_stopped()
     height, how = carry_height(obj, session.scene_dict(), ceiling=float(session.box["z"][1]))
     if height is None:
-        session.emit(f"carry: no rise ({how}): straight toward the target")
-        return
-    goal = target.goal(session, session.hand(), fallback=False)
-    if goal[2] >= height:
-        session.emit(
-            f"carry: target {goal[2]:.2f} m high, at or above the carry height {height:.2f} m: no rise"
-        )
-        return
+        _hold_error(session, f"carry clearance unavailable ({how})")
+    target.goal(session, session.hand(), fallback=False)
     session.emit(f"carry height {height:.2f} m ({how})")
     (x, y, z), _ = ik.fk_grasp(session.q)
     if z < height - RISE_DONE_M:
         path, why = _plan_rise(session, height)
         if path is None:
-            session.emit(f"carry: rise to {height:.2f} m refused ({why}): straight toward the target")
-            return
+            _hold_error(session, f"carry rise to {height:.2f} m refused ({why})")
         session.emit(f"carry: rising {(height - z) * 100:.1f} cm at ({x:.2f}, {y:.2f}), {len(path)} steps")
         session.stream(path, where="carry rise")
+        session.refresh()
+        reached = ik.fk_grasp(session.q)[0]
+        if reached[2] < height - RISE_DONE_M or math.hypot(reached[0] - x, reached[1] - y) > CARRY_LINE_TOL_M:
+            _hold_error(session, f"carry rise did not reach its clearance height {height:.2f} m")
     _travel(session, height, target)
 
 
@@ -673,6 +698,8 @@ def _plan_rise(session: Session, height: float) -> tuple[list[list[float]] | Non
             return None, f"the grasp center would stray {math.hypot(x - x0, y - y0) * 100:.1f} cm sideways"
         if z < z0 - DIVE_TOL_M:
             return None, f"the grasp center would dip to {z:.3f} m"
+    if ik.fk_grasp(path[-1])[0][2] < height - RISE_DONE_M:
+        return None, "the rise ends below the required clearance height"
     return path, ""
 
 
@@ -805,9 +832,9 @@ def _servo_path(
 def _track_hand(session: Session, timeout: float, target: _Target | None = None) -> None:
     """Leg 3: straight-line tracking at TRACK_HZ until the release condition holds (the hand steady within
     RELEASE_WITHIN_M of the grasp center for RELEASE_STEADY_S, or the handoff zone reached after the
-    timeout, which counts from here). Targets come from `target` (clamped TARGET_INSET_M inside the
-    workspace box). The tracking ends where it is after MAX_TRACK_S whatever the deadlines, and when the
-    clock stops advancing (STALL_CYCLES cycles with the same reading), since the deadlines need it."""
+    timeout, which counts from here). Invalid hand targets latch the zone fallback. Every release
+    decision uses encoder feedback. A failed fallback, MAX_TRACK_S, or STALL_CYCLES with the same clock
+    reading aborts holding the object instead of releasing at an unverified position."""
     pacer = session.pacer
     t0 = pacer.now()
     deadline = t0 + timeout
@@ -815,9 +842,10 @@ def _track_hand(session: Session, timeout: float, target: _Target | None = None)
     target = _Target(session) if target is None else target
     zone = target.zone
     near_since: float | None = None
-    fallback = session.scene_fn is None
+    fallback = session.scene_fn is None or target.rejected_hand
     if fallback:
-        session.emit("no hand data: releasing at the handoff zone")
+        fallback_deadline = t0 + FALLBACK_EXTRA_S
+        session.emit("using the handoff zone")
     last_note = ""
     last_now: float | None = None
     stalled = 0
@@ -827,11 +855,17 @@ def _track_hand(session: Session, timeout: float, target: _Target | None = None)
         stalled = stalled + 1 if now == last_now else 0
         last_now = now
         hand = session.hand()
+        goal = target.goal(session, hand, fallback=fallback)
+        if not fallback and target.rejected_hand:
+            fallback = True
+            fallback_deadline = now + FALLBACK_EXTRA_S
         if not fallback and now >= deadline:
             fallback = True
+            fallback_deadline = now + FALLBACK_EXTRA_S
             session.emit(f"no steady hand within {timeout:g} s: falling back to the handoff zone")
+            goal = target.zone
+        session.refresh()  # release decisions use encoder feedback, never the last commanded pose
         grasp_center, _ = ik.fk_grasp(session.q)
-        goal = target.goal(session, hand, fallback=fallback)
         if not fallback and hand is not None:
             if math.dist(grasp_center, hand) <= RELEASE_WITHIN_M:
                 near_since = now if near_since is None else near_since
@@ -840,15 +874,18 @@ def _track_hand(session: Session, timeout: float, target: _Target | None = None)
                     return
             else:
                 near_since = None
-        if fallback and (math.dist(grasp_center, zone) <= ZONE_REACHED_M or now >= fallback_deadline):
-            session.emit("at the handoff zone")
-            return
+        else:
+            near_since = None
+        if fallback:
+            if math.dist(grasp_center, zone) <= ZONE_REACHED_M:
+                session.emit("at the handoff zone")
+                return
+            if now >= fallback_deadline:
+                _hold_error(session, "handoff zone was not reached before the fallback deadline")
         if stalled >= STALL_CYCLES:
-            session.emit(f"the clock did not advance for {STALL_CYCLES} cycles: releasing here")
-            return
+            _hold_error(session, f"the clock did not advance for {STALL_CYCLES} cycles")
         if now - t0 >= MAX_TRACK_S:
-            session.emit(f"tracking ran for {MAX_TRACK_S:g} s: releasing here")
-            return
+            _hold_error(session, f"tracking ran for {MAX_TRACK_S:g} s without a release position")
         path, note = _servo_path(session, goal, START_PITCH)
         if note and note != last_note:
             session.emit(note)

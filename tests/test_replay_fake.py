@@ -452,7 +452,10 @@ def test_policy_config_falls_back_to_ik_and_uses_a_runner_when_present(monkeypat
     d = FakeDriver(gripper0=0.2)
     result = real_robot.carry_to_hand("pill_bottle", driver=d, scene=scene, timeout=7.0, realtime=False)
     assert result["ok"], result["events"]
-    assert calls == [(d, scene, str(ROOT / "rl" / "policies" / "handoff_best.zip"), 7.0)]
+    assert len(calls) == 1
+    driver, guarded_scene, policy_path, timeout = calls[0]
+    assert driver is d and guarded_scene() == scene()
+    assert policy_path == str(ROOT / "rl" / "policies" / "handoff_best.zip") and timeout == 7.0
     assert "policy reached the hand" in result["events"] and "handoff_done" in result["events"]
     assert d.commands[-1][0] == pytest.approx(HOME, abs=1e-6)
     rl_yaml.write_text("use_policy: false\n", encoding="utf-8")

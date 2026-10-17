@@ -6,7 +6,9 @@ from __future__ import annotations
 
 import json
 import math
+import sys
 import time
+import types
 from pathlib import Path
 
 import pytest
@@ -297,16 +299,17 @@ def test_carry_to_hand_from_a_raised_pick_pose_stays_under_the_ceiling():
         assert "handoff_done" in result["events"]
 
 
-def test_hand_outside_the_box_is_served_at_the_edge_or_the_zone():
-    # 2 cm past the far tape: the target is clamped 3 cm inside the box, still within 8 cm of the hand
+def test_hand_outside_the_box_falls_back_to_the_zone_instead_of_the_edge():
+    # Even a hand near enough for edge service must use the configured zone when it leaves the box.
     result, d = carry((0.42, 0.0, 0.03))
     assert result["ok"], result["events"]
     assert_tips_inside(d)
-    assert any(e.startswith("hand steady within") for e in result["events"])
+    assert not any(e.startswith("hand steady within") for e in result["events"])
     assert any("outside the workspace box" in e for e in result["events"])
     grippers = [g for _, g in d.commands]
     release = grippers.index(1.0)
-    assert math.dist(ik.fk_grasp(d.commands[release][0])[0], (0.42, 0.0, 0.03)) < real_robot.RELEASE_WITHIN_M
+    zone = real_robot.handoff_zone(FAKE_SCENE)
+    assert math.dist(ik.fk_grasp(d.commands[release][0])[0], zone) <= real_robot.ZONE_REACHED_M
     assert d.commands[-1][0] == pytest.approx(HOME, abs=1e-6)
     # far outside to the side, or raised off the table: never followed out of the box, never above 0.30 m
     clock = {"t": 0.0}
@@ -601,17 +604,16 @@ def test_carry_servo_path_is_a_validated_bridge_from_the_present_pose(monkeypatc
     assert path is not None and note.startswith("re-aiming with a")
     assert real_robot.TICKS_PER_CYCLE < len(path) <= math.ceil(replay.LINE_JUMP_RAD / replay.MAX_STEP_RAD)
     assert_on_the_line_toward(session, path, goal)
-    # when IK finds nothing at all, nothing is streamed: the arm holds, the clock advances, and the carry
-    # ends through the timeout and the fallback deadline with the arm where it was
+    # When IK finds nothing, the clearance rise fails before any travel or release.
     monkeypatch.setattr(ik, "solve_grasp", lambda xyz, pitch=-math.pi / 2, q0=None: (list(q0), False))
     path, note = real_robot._servo_path(session, goal, real_robot.START_PITCH)
     assert path is None and "holding" in note
     start = CARRY_STARTS["pill lifted 8 cm (the demo's hand_over start)"]
     result, d = carry((0.30, 0.02, 0.03), start_q=start, timeout=0.5)
-    assert result["ok"], result["events"]
-    assert any("holding" in e for e in result["events"])
-    assert all(q == pytest.approx(start) for q, g in d.commands if g != 1.0)  # held still until the release
-    assert "handoff_done" in result["events"] and d.commands[-1][0] == pytest.approx(HOME, abs=1e-6)
+    assert result["reason"] == "error", result["events"]
+    assert any("rise" in e and "refused" in e for e in result["events"])
+    assert d.commands == [] and d.stopped and d.torque
+    assert "handoff_done" not in result["events"] and d.read()[1] == 0.2
 
 
 # -- boundaries pinned (mutations that survived round 2) ----------------------------------------------------
@@ -711,9 +713,10 @@ def test_carry_timeout_is_checked_capped_and_survives_a_stalled_clock():
         sleep=lambda s: None,
         realtime=False,
     )
-    assert result["ok"], result["events"]
+    assert result["reason"] == "error", result["events"]
     assert any("clock did not advance" in e for e in result["events"])
-    assert "handoff_done" in result["events"]
+    assert "handoff_done" not in result["events"] and "released" not in result["events"]
+    assert d.stopped and d.torque and all(g == 0.2 for _, g in d.commands)
 
 
 def test_carry_with_a_broken_scene_source_fails_loud():
@@ -764,10 +767,11 @@ def test_carry_tracking_has_an_absolute_time_bound(monkeypatch):
         sleep=sleep,
         realtime=False,
     )
-    assert result["ok"], result["events"]
-    assert any(e.startswith("tracking ran for 3 s") for e in result["events"])
+    assert result["reason"] == "error", result["events"]
+    assert any("tracking ran for 3 s" in e for e in result["events"])
     assert "at the handoff zone" not in result["events"]
-    assert "handoff_done" in result["events"] and d.commands[-1][0] == pytest.approx(HOME, abs=1e-6)
+    assert "handoff_done" not in result["events"] and "released" not in result["events"]
+    assert d.stopped and d.torque and all(g == 0.2 for _, g in d.commands)
 
 
 def test_no_hand_releases_at_the_handoff_zone_after_the_timeout():
@@ -799,3 +803,133 @@ def test_no_hand_releases_at_the_handoff_zone_after_the_timeout():
     grasp = ik.fk_grasp(d.commands[grippers.index(1.0)][0])[0]
     zone = real_robot.handoff_zone(FAKE_SCENE)
     assert math.dist(grasp, zone) <= real_robot.ZONE_REACHED_M + 0.005, (grasp, zone)
+
+
+@pytest.mark.parametrize(
+    "hand",
+    [
+        (0.09, 0.0, 0.03),
+        (0.41, 0.0, 0.03),
+        (0.3, 0.26, 0.03),
+        (0.3, -0.26, 0.03),
+        (0.3, 0.0, -0.04),
+        (0.3, 0.0, 0.26),
+    ],
+)
+def test_rejected_hand_target_latches_the_zone(hand):
+    session = servo_session(HOME)
+    target = real_robot._Target(session)
+    assert target.goal(session, hand, fallback=False) == target.zone
+    assert target.rejected_hand
+    # Tracking jitter back into the box must not resume pursuit during the fallback.
+    assert target.goal(session, (0.30, 0.0, 0.03), fallback=False) == target.zone
+    assert len(session.events) == 1 and "falling back" in session.events[0]
+
+
+def test_invalid_handoff_zone_aborts_before_motion():
+    scene = scene_with_hand(0.42, 0.0)()
+    scene["zones"]["handoff"]["x"] = 0.6
+    d = FakeDriver(gripper0=0.2)
+    result = real_robot.carry_to_hand("pill_bottle", driver=d, scene=lambda: scene, realtime=False)
+    assert result["reason"] == "error" and d.commands == []
+    assert d.stopped and d.torque and d.read()[1] == 0.2
+    assert any("handoff zone is outside" in e for e in result["events"])
+
+
+@pytest.mark.parametrize("missing", ["scene", "object", "obstacles", "ceiling"])
+def test_unproven_clearance_holds_the_object_without_tracking(missing):
+    scene = scene_with_hand(0.30, 0.02)()
+    obj = "pill_bottle"
+    if missing == "object":
+        obj = "unknown_held_object"
+    elif missing == "obstacles":
+        del scene["obstacles"]
+    elif missing == "ceiling":
+        scene["obstacles"]["new_obstacle"] = {"h": 0.29, "seen": True}
+    d = FakeDriver(gripper0=0.2)
+    result = real_robot.carry_to_hand(
+        obj, driver=d, scene=None if missing == "scene" else lambda: scene, realtime=False
+    )
+    assert result["reason"] == "error", result["events"]
+    assert any("clearance unavailable" in e for e in result["events"])
+    assert d.commands == [] and d.stopped and d.torque and d.read()[1] == 0.2
+
+
+def test_rise_uses_encoder_feedback_before_travel_or_policy(monkeypatch):
+    start = CARRY_STARTS["pill lifted 8 cm (the demo's hand_over start)"]
+
+    class StalledDriver(FakeDriver):
+        def read(self):
+            return list(start), 0.2
+
+    d = StalledDriver(q0=start, gripper0=0.2)
+    policy_calls = []
+    monkeypatch.setattr(real_robot, "policy_config", lambda: {"use_policy": True, "policy": "unused.zip"})
+    monkeypatch.setattr(real_robot, "_run_policy", lambda *a: policy_calls.append(a))
+    result = real_robot.carry_to_hand(
+        "pill_bottle", driver=d, scene=scene_with_hand(0.30, 0.02), realtime=False
+    )
+    assert result["reason"] == "error", result["events"]
+    assert any("rise did not reach" in e for e in result["events"])
+    assert policy_calls == [] and d.commands and all(g == 0.2 for _, g in d.commands)
+    assert d.stopped and d.torque and "released" not in result["events"]
+
+
+@pytest.mark.parametrize("policy_succeeded", [False, True])
+def test_policy_return_cannot_release_at_an_unreached_fallback(monkeypatch, policy_succeeded):
+    monkeypatch.setattr(real_robot, "policy_config", lambda: {"use_policy": True, "policy": "unused.zip"})
+    scene = scene_with_hand(0.42, 0.0)()
+    calls = []
+
+    def run_policy(driver, scene_fn, path, *, timeout):
+        guarded = scene_fn()
+        assert not guarded["hand"]["seen"]
+        assert guarded["zones"]["handoff"] == scene["zones"]["handoff"]
+        calls.append(guarded)
+        return policy_succeeded
+
+    monkeypatch.setitem(sys.modules, "rl.policy_runner", types.SimpleNamespace(run_policy=run_policy))
+    monkeypatch.setattr(real_robot, "_servo_path", lambda *a, **kw: (None, "blocked"))
+    d = FakeDriver(gripper0=0.2)
+    result = real_robot.carry_to_hand(
+        "pill_bottle", driver=d, scene=lambda: scene, timeout=60, realtime=False
+    )
+    assert result["reason"] == "error" and len(calls) == 1, result["events"]
+    assert any("fallback deadline" in e for e in result["events"])
+    assert "at the handoff zone" not in result["events"] and "released" not in result["events"]
+    assert d.stopped and d.torque and all(g == 0.2 for _, g in d.commands)
+    assert scene["hand"]["seen"]  # the policy wrapper did not mutate the tracker
+
+
+def test_losing_hand_tracking_resets_the_steady_release_timer(monkeypatch):
+    q, ok = ik.solve_grasp((0.28, -0.08, 0.08), real_robot.START_PITCH)
+    assert ok
+    pacer = replay.Pacer(False)
+    scene = scene_with_hand(0.28, -0.08)()
+
+    def source():
+        scene["hand"]["seen"] = not (0.5 <= pacer.now() < 1.5)
+        return scene
+
+    d = FakeDriver(q0=q, gripper0=0.2)
+    session = replay.Session(d, source, pacer, hand_freeze=False)
+    session.start()
+    monkeypatch.setattr(real_robot, "_servo_path", lambda *a, **kw: (None, "holding"))
+    real_robot._track_hand(session, timeout=10)
+    assert 2.5 <= pacer.now() < 2.6
+    assert any(e.startswith("hand steady within") for e in session.events)
+
+
+def test_tracking_release_uses_measured_pose_not_commanded_pose(monkeypatch):
+    # Pretend a policy commanded the zone but a stalled arm still reports home.
+    d = FakeDriver(gripper0=0.2)
+    session = replay.Session(d, scene_with_hand(0.42, 0.0), replay.Pacer(False), hand_freeze=False)
+    session.start()
+    target = real_robot._Target(session)
+    session.q, ok = ik.solve_grasp(target.zone, real_robot.START_PITCH)
+    assert ok
+    monkeypatch.setattr(real_robot, "_servo_path", lambda *a, **kw: (None, "blocked"))
+    with pytest.raises(replay.Abort, match="error"):
+        real_robot._track_hand(session, timeout=0, target=target)
+    assert "at the handoff zone" not in session.events
+    assert d.stopped and d.torque and d.read()[1] == 0.2
