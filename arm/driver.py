@@ -26,7 +26,7 @@ Safety layer implemented here (docs/safety.md, CLAUDE.md "Arm hazards"):
   waiting for the lock.
 * `connect()` never clears `stopped`. An Esc that lands before or anywhere inside the connect window (port
   open, calibration check, goal sync, LeRobot's `configure()`) leaves the driver stopped when `connect()`
-  returns, with torque on and `Goal_Position` re-synced to the present position after `configure()`; the
+  returns, with torque on and `Goal_Position` re-synced immediately before configure re-enables torque; the
   very next `command()` returns False until `resume()`. The `--real` CLIs check `stopped` right after
   connecting and refuse to move.
 * Enabling torque drives each STS3215 straight to its stored `Goal_Position`; stale goals were measured up to
@@ -127,6 +127,7 @@ __all__ = [
     "get_driver",
     "reset_driver",
     "inspect_hardware",
+    "map_inspection_joints",
     "EscWatcher",
     "main",
 ]
@@ -582,8 +583,9 @@ class _DriverBase:
 def _sync_goals(bus: Any, *, check_strain: bool = False) -> dict[str, int]:
     """Goal_Position := Present_Position (raw ticks) for every motor, verified by reading back.
 
-    Mirrors the verified lerobot-tools/sync_goals.py: acknowledged per-motor writes, then the goals are
-    read back. A read-back off by more than STRAIN_TICKS means a lost write and a jump at the next torque
+    Uses acknowledged per-motor writes, then reads the goals back. Each motor's position is read again
+    immediately before its write: a later joint may have sagged while preceding joints were being synced.
+    A read-back off by more than STRAIN_TICKS means a lost write and a jump at the next torque
     enable, so it raises instead of continuing. `check_strain` (connect only) also refuses when a powered
     motor's goal is already far from its position: something else is driving or straining the arm. It must
     stay off for freeze(), where a moving arm legitimately has its goal a few degrees ahead of it.
@@ -595,20 +597,27 @@ def _sync_goals(bus: Any, *, check_strain: bool = False) -> dict[str, int]:
     if check_strain:
         torque = bus.sync_read("Torque_Enable", normalize=False, num_retry=2)
         goal = bus.sync_read("Goal_Position", normalize=False, num_retry=2)
-        strained = sorted(
-            m
-            for m in MOTORS
-            if torque.get(m) and abs(int(goal.get(m, present[m])) - present[m]) > STRAIN_TICKS
-        )
+        for register, values in (("Torque_Enable", torque), ("Goal_Position", goal)):
+            missing = [m for m in MOTORS if m not in values]
+            if missing:
+                raise RuntimeError(f"{register} missing for motors {missing}")
+        strained = sorted(m for m in MOTORS if torque[m] and abs(int(goal[m]) - present[m]) > STRAIN_TICKS)
         if strained:
             raise RuntimeError(
                 f"torque is on and Goal_Position != Present_Position for {strained}; something is driving "
                 "or straining the arm. Refusing to touch it (see lerobot-tools/sync_goals.py)."
             )
     for motor in MOTORS:
+        latest = bus.sync_read("Present_Position", motors=[motor], normalize=False, num_retry=2)
+        if motor not in latest:
+            raise RuntimeError(f"Present_Position missing for motor {motor}")
+        present[motor] = int(latest[motor])
         bus.write("Goal_Position", motor, present[motor], normalize=False, num_retry=2)
     back = bus.sync_read("Goal_Position", normalize=False, num_retry=2)
-    off = {m: (present[m], int(back.get(m, -1))) for m in MOTORS if int(back.get(m, -1)) != present[m]}
+    missing = [m for m in MOTORS if m not in back]
+    if missing:
+        raise RuntimeError(f"Goal_Position missing after sync for motors {missing}")
+    off = {m: (present[m], int(back[m])) for m in MOTORS if int(back[m]) != present[m]}
     far = {m: v for m, v in off.items() if abs(v[1] - v[0]) > STRAIN_TICKS}
     if far:
         raise RuntimeError(f"Goal_Position read-back differs from Present_Position after sync: {far}")
@@ -629,6 +638,77 @@ def _lerobot_robot_factory(**kwargs: Any) -> Any:
 
 
 _INSPECTION_LOCK = threading.RLock()
+_CALIBRATION_FIELDS = ("id", "drive_mode", "homing_offset", "range_min", "range_max")
+
+
+def _valid_encoder_calibration(values: Any) -> bool:
+    return (
+        isinstance(values, dict)
+        and set(values) == set(MOTORS)
+        and all(
+            isinstance(values[name], dict)
+            and all(type(values[name].get(field)) is int for field in _CALIBRATION_FIELDS)
+            and values[name]["id"] == index
+            and values[name]["drive_mode"] in (0, 1)
+            and 0 <= values[name]["range_min"] < values[name]["range_max"] <= 4095
+            for index, name in enumerate(MOTORS, 1)
+        )
+    )
+
+
+def _encoder_calibrations_match(saved: Any, actual: Any) -> bool:
+    return (
+        _valid_encoder_calibration(saved)
+        and _valid_encoder_calibration(actual)
+        and all(saved[m][field] == actual[m][field] for m in MOTORS for field in _CALIBRATION_FIELDS)
+    )
+
+
+def map_inspection_joints(report: dict[str, Any]) -> list[float]:
+    """Map a follower inspection's encoder readings to current VARA radians, without opening hardware.
+
+    Requires a valid, matching encoder calibration and normalized readings consistent with the raw
+    snapshot. This only applies the configured joint map; it does not establish that map's accuracy.
+    """
+    if (
+        not isinstance(report, dict)
+        or report.get("role") != "follower"
+        or report.get("read_only") is not True
+    ):
+        raise ValueError("Expected a read-only follower inspection")
+    calibration = report.get("calibration")
+    if not isinstance(calibration, dict) or calibration.get("matches_hardware") is not True:
+        raise ValueError("Inspection encoder calibration did not match hardware")
+    if not _encoder_calibrations_match(calibration.get("saved"), calibration.get("hardware")):
+        raise ValueError("Inspection encoder calibration is invalid or mismatched")
+    fingerprint = calibration.get("sha256")
+    if (
+        not isinstance(fingerprint, str)
+        or len(fingerprint) != 64
+        or any(c not in "0123456789abcdef" for c in fingerprint)
+    ):
+        raise ValueError("Inspection needs a valid calibration SHA-256")
+    jm = joint_map()
+    if report.get("lerobot_id") != jm["lerobot_id"]:
+        raise ValueError("Inspection follower ID differs from config/joint_map.yaml")
+    mapped = []
+    motors = report.get("motors", {})
+    for name in JOINTS:
+        motor = motors.get(name, {}) if isinstance(motors, dict) else {}
+        raw = motor.get("position_raw") if isinstance(motor, dict) else None
+        value = motor.get("calibrated_position_rad") if isinstance(motor, dict) else None
+        lo, hi = (calibration["saved"][name][k] for k in ("range_min", "range_max"))
+        if type(raw) is not int or not lo <= raw <= hi:
+            raise ValueError(f"{name}: raw position is outside its encoder calibration")
+        expected = (raw - (lo + hi) / 2) * math.tau / 4095
+        try:
+            normalized = float(value) if type(value) in (int, float) else math.nan
+        except OverflowError:
+            normalized = math.nan
+        if not math.isfinite(normalized) or not math.isclose(normalized, expected, abs_tol=1e-9):
+            raise ValueError(f"{name}: normalized encoder reading disagrees with its raw snapshot")
+        mapped.append(_lerobot_to_rad(name, math.degrees(normalized), jm))
+    return mapped
 
 
 def _inspection_robot_factory(*, role: str, port: str, id: str) -> Any:
@@ -687,22 +767,7 @@ def inspect_hardware(
         try:
             bus.connect()
             actual = {name: asdict(value) for name, value in bus.read_calibration().items()}
-            fields = ("id", "drive_mode", "homing_offset", "range_min", "range_max")
-
-            def valid_calibration(values: dict) -> bool:
-                return set(values) == set(MOTORS) and all(
-                    all(type(values[name].get(field)) is int for field in fields)
-                    and values[name]["id"] == index
-                    and values[name]["drive_mode"] in (0, 1)
-                    and 0 <= values[name]["range_min"] < values[name]["range_max"] <= 4095
-                    for index, name in enumerate(MOTORS, 1)
-                )
-
-            matches = (
-                valid_calibration(saved)
-                and valid_calibration(actual)
-                and all(saved[m][field] == actual[m][field] for m in MOTORS for field in fields)
-            )
+            matches = _encoder_calibrations_match(saved, actual)
             registers = {
                 reg: bus.sync_read(reg, normalize=False, num_retry=2)
                 for reg in (
@@ -811,7 +876,7 @@ class Driver(_DriverBase):
         return self._robot
 
     def connect(self) -> None:
-        """Open the bus, require a matching calibration, sync the goals, then configure().
+        """Open the bus, require a matching calibration, and sync before every torque enable.
 
         Written from SOFollower.connect() (lerobot/robots/so_follower/so_follower.py) without calling it:
         that method answers a calibration mismatch with an interactive prompt and its configure() toggles
@@ -819,8 +884,10 @@ class Driver(_DriverBase):
 
         `stopped` is never cleared here. A freeze() that ran before connect (flag only, nothing to hold yet)
         or that arrived during it (from the Esc thread, waiting for the lock, or fired inside one of the
-        steps) is applied at the end: goal := present once more, after configure()'s torque toggle, and the
-        driver stays stopped so the caller's next command() is refused until resume().
+        steps) is applied at the end, and the driver stays stopped so the caller's next command() is refused
+        until resume(). The arm must be supported: configure() temporarily disables torque. Its enable
+        method is guarded so any sag during configuration becomes the new holding pose, not a move back
+        to the pre-configuration pose. The guard is restored even if configuration fails.
         """
         with self.lock:
             if self.connected:
@@ -835,8 +902,8 @@ class Driver(_DriverBase):
             follower_id = self._id or os.environ.get("FOLLOWER_ID") or joint_map()["lerobot_id"]
             robot = self._robot_factory(port=port, id=follower_id, **ROBOT_CONFIG)
             bus = robot.bus
-            bus.connect()  # opens the port, pings the six motors, checks their firmware
             try:
+                bus.connect()  # a failed handshake can leave the serial port open
                 if not bus.is_calibrated:
                     raise RuntimeError(
                         f"calibration in the motors does not match the file for id '{follower_id}' (or the "
@@ -847,18 +914,46 @@ class Driver(_DriverBase):
                 # Enabling torque drives each servo to its stored Goal_Position; stale goals measured
                 # up to 168 degrees away would swing the arm (CLAUDE.md, Arm hazards).
                 present = _sync_goals(bus, check_strain=True)
-                robot.configure()  # torque_disabled(): off, PID/mode/gripper limits, on -> holds `present`
+                self.goal_syncs += 1
+                enable_torque = bus.enable_torque
+
+                def sync_and_enable(motors: Any = None, num_retry: int = 0) -> None:
+                    nonlocal present
+                    # LeRobot 0.6.2 torque_disabled() calls this in its finally, including after a
+                    # configuration exception. The initial sync is stale if an unpowered joint sagged.
+                    present = _sync_goals(bus)
+                    self.goal_syncs += 1
+                    enable_torque(motors, num_retry=num_retry)
+
+                bus.enable_torque = sync_and_enable
+                try:
+                    robot.configure()
+                except BaseException:
+                    try:
+                        # torque_disabled() enters its try/finally only after disable_torque()
+                        # finishes. A failure partway through that call otherwise leaves limp joints.
+                        sync_and_enable()
+                    except Exception:
+                        log.exception("Driver.connect: could not restore holding after configure failed")
+                    raise
+                finally:
+                    bus.enable_torque = enable_torque
             except BaseException:
                 try:
                     bus.disconnect(disable_torque=False)
                 except Exception:
                     log.exception("Driver.connect: closing the port after a failed connect")
+                    try:
+                        # A failed handshake or a disconnect decorator can reject disconnect(). The
+                        # reviewed LeRobot SDK raw close does not send any motor/torque writes.
+                        bus.port_handler.closePort()
+                    except Exception:
+                        log.exception("Driver.connect: raw serial port cleanup failed")
                 raise
             self._robot = robot
             self.connected = True
             self.torque = True
             self.last_command = None
-            self.goal_syncs += 1
             log.info("Driver connected on %s (id %s), holding at raw %s", port, follower_id, present)
             if self.stopped or self._freeze_requested.is_set():
                 log.warning("Driver.connect: a STOP landed before or during connect; the arm stays frozen")
@@ -871,6 +966,12 @@ class Driver(_DriverBase):
                 return
             try:
                 self._robot.bus.disconnect(disable_torque=torque_off)
+            except BaseException:
+                try:
+                    self._robot.bus.port_handler.closePort()
+                except Exception:
+                    log.exception("Driver.disconnect: raw serial port cleanup failed")
+                raise
             finally:
                 if torque_off:
                     self.torque = False

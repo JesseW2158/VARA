@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import math
 import threading
+from types import SimpleNamespace
 
 import pytest
 
@@ -46,6 +47,11 @@ class FakeBus:
         self.lose_writes: set[str] = set()  # motors whose Goal_Position writes silently vanish
         self.gripper_block_raw: int | None = None  # an object stops the jaws at this raw position
         self.max_jump = 0  # largest present-position change caused by a goal write or torque enable
+        self.port_handler = SimpleNamespace(closePort=self.close_port)
+
+    def close_port(self):
+        self.log.append(("port.close",))
+        self.is_connected = False
 
     # LeRobot formulas (motors_bus.py _normalize/_unnormalize)
     def _norm(self, motor: str, raw: int) -> float:
@@ -246,6 +252,7 @@ def test_connect_call_order_and_no_jump():
         *[("write", "Goal_Position", m, False) for m in MOTORS],
         ("configure",),
         ("disable_torque",),
+        *[("write", "Goal_Position", m, False) for m in MOTORS],
         ("enable_torque",),
     ]
     # the goals were read raw and written raw from the present position, before any torque enable
@@ -284,6 +291,186 @@ def test_negative_control_lerobot_connect_order_would_jump():
     stale(robot.bus)
     robot.lerobot_connect()
     assert robot.bus.max_jump >= int(168 * MAX_RES / 360)
+
+
+@pytest.mark.parametrize("stop", [False, True])
+def test_sag_during_configuration_is_held_in_place_before_enable(stop):
+    log: list = []
+    robots: list[FakeRobot] = []
+
+    def factory(**config):
+        robot = FakeRobot(log, **config)
+        robots.append(robot)
+        bus = robot.bus
+        stale(bus)
+
+        def configure():
+            bus.disable_torque()
+            bus.present["shoulder_lift"] -= 250
+            bus.present["elbow_flex"] += 400
+            if stop:
+                d.freeze()
+            bus.enable_torque()
+
+        robot.configure = configure
+        return robot
+
+    d = Driver(robot_factory=factory)
+    d.connect()
+    bus = robots[0].bus
+    assert bus.max_jump == 0
+    assert bus.goal == bus.present
+    assert bus.present["shoulder_lift"] == int(mid("shoulder_lift")) - 250
+    assert bus.present["elbow_flex"] == int(mid("elbow_flex")) + 400
+    assert bus.enable_torque == FakeBus.enable_torque.__get__(bus)
+    assert d.stopped == stop
+    if stop:
+        assert not d.command(d.read()[0], 1.0)
+
+
+def test_each_configuration_torque_enable_resyncs_after_a_new_sag():
+    log: list = []
+    robots: list[FakeRobot] = []
+
+    def factory(**config):
+        robot = FakeRobot(log, **config)
+        robots.append(robot)
+        bus = robot.bus
+
+        def configure():
+            for _ in range(2):
+                bus.disable_torque()
+                bus.present["shoulder_lift"] -= 100
+                bus.enable_torque()
+
+        robot.configure = configure
+        return robot
+
+    d = Driver(robot_factory=factory)
+    d.connect()
+    bus = robots[0].bus
+    assert bus.max_jump == 0
+    assert bus.goal == bus.present
+    assert bus.present["shoulder_lift"] == int(mid("shoulder_lift")) - 200
+
+
+def test_each_goal_write_uses_a_fresh_position_when_later_joints_sag():
+    d, _, robots = build()
+    d.connect()
+    bus = robots[0].bus
+    d.torque_off()
+    original_write = bus.write
+
+    def sag_after_write(*args, **kwargs):
+        original_write(*args, **kwargs)
+        for motor in MOTORS:
+            if not bus.torque[motor]:
+                bus.present[motor] -= 20
+
+    bus.write = sag_after_write
+    d.torque_on()
+    assert bus.max_jump == 0
+    assert bus.goal == bus.present
+    assert bus.present["gripper"] == int(mid("gripper")) - 100
+
+
+@pytest.mark.parametrize("failure", [RuntimeError("bad firmware"), KeyboardInterrupt()])
+@pytest.mark.parametrize("disconnect_fails", [False, True])
+def test_handshake_failure_closes_port_and_preserves_existing_torque(failure, disconnect_fails):
+    log: list = []
+    robots: list[FakeRobot] = []
+
+    def factory(**config):
+        robot = FakeRobot(log, **config)
+        robots.append(robot)
+        bus = robot.bus
+        bus.torque = dict.fromkeys(MOTORS, 1)
+
+        def connect(*args, **kwargs):
+            bus.is_connected = True
+            raise failure
+
+        def broken_disconnect(**kwargs):
+            assert kwargs == {"disable_torque": False}
+            raise RuntimeError("disconnect unavailable after incomplete handshake")
+
+        bus.connect = connect
+        if disconnect_fails:
+            bus.disconnect = broken_disconnect
+        return robot
+
+    d = Driver(robot_factory=factory)
+    with pytest.raises(type(failure)):
+        d.connect()
+    bus = robots[0].bus
+    assert not bus.is_connected and not d.connected
+    assert all(bus.torque.values())
+    assert not goal_writes(log)
+    assert not any(e[0] in {"configure", "disable_torque", "enable_torque"} for e in log)
+
+
+@pytest.mark.parametrize("restores_on_exit", [False, True])
+@pytest.mark.parametrize("previous_cycle", [False, True])
+def test_configuration_failure_restores_holding_and_cleans_up(restores_on_exit, previous_cycle):
+    log: list = []
+    robots: list[FakeRobot] = []
+
+    def factory(**config):
+        robot = FakeRobot(log, **config)
+        robots.append(robot)
+        bus = robot.bus
+
+        def configure():
+            if previous_cycle:
+                bus.disable_torque()
+                bus.enable_torque()
+            bus.disable_torque()
+            bus.present["elbow_flex"] -= 350
+            try:
+                raise RuntimeError("configuration failed")
+            finally:
+                if restores_on_exit:
+                    bus.enable_torque()
+
+        robot.configure = configure
+        return robot
+
+    d = Driver(robot_factory=factory)
+    with pytest.raises(RuntimeError, match="configuration failed"):
+        d.connect()
+    bus = robots[0].bus
+    assert not bus.is_connected and not d.connected
+    assert all(bus.torque.values()) and bus.goal == bus.present and bus.max_jump == 0
+    assert bus.enable_torque == FakeBus.enable_torque.__get__(bus)
+    assert ("bus.disconnect", False) in log
+
+
+def test_failed_goal_sync_during_configure_never_enables_stale_goals():
+    log: list = []
+    robots: list[FakeRobot] = []
+
+    def factory(**config):
+        robot = FakeRobot(log, **config)
+        robots.append(robot)
+        bus = robot.bus
+
+        def configure():
+            bus.disable_torque()
+            bus.present["elbow_flex"] -= 350
+            bus.lose_writes.add("elbow_flex")
+            bus.enable_torque()
+
+        robot.configure = configure
+        return robot
+
+    d = Driver(robot_factory=factory)
+    with pytest.raises(RuntimeError, match="elbow_flex"):
+        d.connect()
+    bus = robots[0].bus
+    assert not bus.is_connected and not d.connected
+    assert bus.max_jump == 0 and bus.torque["elbow_flex"] == 0
+    assert not any(e[0] == "enable_torque" for e in log)
+    assert bus.enable_torque == FakeBus.enable_torque.__get__(bus)
 
 
 def test_uncalibrated_refuses_without_prompt_or_torque():
@@ -335,6 +522,45 @@ def test_lost_goal_write_is_caught_before_torque_enable():
         d.connect()
     assert "enable_torque" not in [e[0] for e in log]
     assert not d.connected
+
+
+@pytest.mark.parametrize("register", ["Torque_Enable", "Goal_Position"])
+def test_missing_strain_check_register_refuses_before_any_motor_write(register):
+    log: list = []
+
+    def factory(**config):
+        robot = FakeRobot(log, **config)
+        original_read = robot.bus.sync_read
+
+        def read(data_name, *args, **kwargs):
+            values = original_read(data_name, *args, **kwargs)
+            if data_name == register:
+                del values["elbow_flex"]
+            return values
+
+        robot.bus.sync_read = read
+        return robot
+
+    d = Driver(robot_factory=factory)
+    with pytest.raises(RuntimeError, match=f"{register} missing"):
+        d.connect()
+    assert not goal_writes(log)
+
+
+def test_missing_goal_readback_is_not_treated_as_a_small_offset():
+    bus = FakeBus([])
+    bus.present["wrist_roll"] = 0
+    original_read = bus.sync_read
+
+    def read(data_name, *args, **kwargs):
+        values = original_read(data_name, *args, **kwargs)
+        if data_name == "Goal_Position":
+            del values["wrist_roll"]
+        return values
+
+    bus.sync_read = read
+    with pytest.raises(RuntimeError, match="Goal_Position missing after sync"):
+        driver._sync_goals(bus)
 
 
 def test_torque_off_blocks_and_torque_on_resyncs_before_enable():
@@ -426,6 +652,23 @@ def test_disconnect_passes_disable_torque_false_unless_asked():
     d.disconnect(torque_off=True)
     assert log[-1] == ("bus.disconnect", True)
     assert not d.torque and not d.connected
+
+
+def test_disconnect_failure_still_releases_the_port_without_dropping_torque():
+    d, log, robots = build()
+    d.connect()
+    bus = robots[0].bus
+
+    def broken_disconnect(**kwargs):
+        assert kwargs == {"disable_torque": False}
+        raise RuntimeError("SDK disconnect failed")
+
+    bus.disconnect = broken_disconnect
+    with pytest.raises(RuntimeError, match="SDK disconnect failed"):
+        d.disconnect()
+    assert not bus.is_connected and not d.connected
+    assert all(bus.torque.values())
+    assert log[-1] == ("port.close",)
 
 
 def test_units_read_degrees_to_radians_and_gripper_pct_to_unit():
