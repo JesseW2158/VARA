@@ -485,6 +485,7 @@ def _run_policy(session: Session, cfg: dict[str, Any], timeout: float, target: _
     session.emit(f"policy: {cfg['policy']}")
 
     def policy_scene() -> dict:
+        session.check_stopped()
         scene = session.scene_dict() or {}
         hand = session.hand()
         target.goal(session, hand, fallback=False)
@@ -497,10 +498,25 @@ def _run_policy(session: Session, cfg: dict[str, Any], timeout: float, target: _
             }
         return scene
 
-    reached = bool(run_policy(session.driver, policy_scene, str(policy_path), timeout=timeout))
+    reached = bool(
+        run_policy(
+            session.driver,
+            policy_scene,
+            str(policy_path),
+            timeout=timeout,
+            safety_scene=session.scene_fn,
+            cancelled=session.cancelled,
+            clock=session.pacer.now,
+            sleep=session.pacer.sleep,
+            on_event=session.emit,
+        )
+    )
     session.refresh()  # the policy moved the arm through the driver
     session.check_stopped()
     session.emit("policy reached the hand" if reached else "policy gave up: tracking with IK")
+    # The policy owns another Pacer on this clock. Discard our old schedule before IK resumes;
+    # otherwise its first late tick resyncs without sleeping and the next command is sent immediately.
+    session.pacer.resync()
     return reached
 
 

@@ -1,38 +1,17 @@
-"""Run the hand-off policy on the arm through the driver (task D7): the real-arm twin of HandoffEnv.step.
+"""Run the optional hand-off policy through the live primitive safety session (D7).
 
-`run_policy(driver, scene, policy_path, *, timeout=8.0, clock=None, sleep=None, on_event=None,
-policy=None) -> bool` is what `arm.real_robot.carry_to_hand` calls when config/rl.yaml says
-`use_policy: true` (`run_policy(session.driver, session.scene_fn, str(policy_path), timeout=timeout)`):
+Every 30 Hz decision observes measured joints, preserves the wrist and gripper, and applies at most a
+2 degree joint step. replay.Session supplies STOP, workspace and hand checks; a policy step is reduced
+until its tip travel fits the same 0.2 m/s (0.1 m/s near a hand) cap used by IK. There is one command per
+policy tick, so slowing a step never extends the policy deadline with a multi-tick waypoint.
 
-- `driver` is `arm.driver.Driver` or `FakeDriver`: every target goes through `driver.command(q, gripper)`,
-  which clips to the limits minus 3 degrees and to 2 degrees per call and refuses while stopped or with
-  torque off (.claude/rules/rl.md: the driver enforces the limits). `scene` is a zero-argument callable
-  returning the latest scene dict (`hand` with `seen`, `x`, `y`, `z`; optional `zones.handoff`) or None.
-  `policy_path` is a PPO zip from rl/train.py, loaded once per path (`PPO.load(path, device="cpu")`,
-  cached in this process; `clear_policy_cache()` drops it).
-- The loop runs at 30 Hz (`rl.handoff_env.DT`): read the joints, take the target 5 cm above the hand when
-  it is seen, else the handoff zone (the scene's `zones.handoff` or config/scene.yaml), build the 16-float
-  observation with `rl.handoff_env.build_observation(q, prev_action, target)` (the tip from `arm.ik.fk` of
-  the readings, never from a simulator), `policy.predict(obs, deterministic=True)` clipped to [-1, 1],
-  scaled to +-2 degrees on joints 0-3 and integrated into a command that starts from the present pose and
-  stays 3 degrees inside the limits, exactly like the env's command. A step whose tip would rise above the
-  workspace ceiling (config/scene.yaml `workspace.z[1]`, 0.30 m) is held instead. The workspace box binds
-  the rest of the motion the way it binds the IK path in arm/real_robot.py: the target is clamped
-  TARGET_INSET_M inside the box (a hand reading below the table or beyond the taped edge is aimed at the
-  nearest point inside), and a step that would carry the tip farther outside the box than it already is
-  (through the floor or a side) is held. Without a readable box the policy does not run (the IK path takes
-  over). The gripper value never changes: every command repeats the last commanded gripper (or the reading
-  at the start), so a held object stays held.
-- Returns True once the tip has been within 3 cm of the target for 10 consecutive steps, False on timeout,
-  when `driver.stopped` is set (checked every step; a refused command counts) or when the policy cannot be
-  loaded (the IK path takes over). `on_event` receives short strings: `policy start: <file>`,
-  `policy success after N steps`, `policy timeout after N steps`, `policy stopped`,
-  `policy unavailable: ...`, `policy held below the ceiling`, `policy held inside the workspace box`,
-  `policy target clamped inside the workspace box` (each hold/clamp note once per run).
-- `clock` and `sleep` default to `time.monotonic`/`time.sleep` on a real driver; on a FakeDriver a virtual
-  clock advances by what the loop sleeps and nothing waits, so a FakeDriver run takes no wall time and a
-  timeout of 8 s is 240 steps. `policy` lets tests pass an object with `predict(obs, deterministic=True)
-  -> (action, state)` instead of a file.
+Success requires ten readings within 3 cm of the target. A timeout or unavailable policy returns False
+for the caller's IK fallback; malformed data or a failed motion freezes with torque on. Nothing here
+opens the gripper. The policy is refused if its initial pose is outside the workspace or joint band.
+
+The optional safety_scene retains the original tracked hand when carry_to_hand substitutes its safe
+fallback target. cancelled, clock and sleep let that caller share its STOP flag and pacing. A FakeDriver
+uses virtual time unless clocks are supplied. policy is an injected predict() object for offline tests.
 """
 
 from __future__ import annotations
@@ -142,14 +121,6 @@ def target_point(scene: dict[str, Any] | None) -> tuple[float, float, float]:
     return handoff_zone(scene)
 
 
-def _box_excess(point: Any, box: dict[str, list[float]]) -> float:
-    """How far (m) `point` lies outside `box` along its worst axis; 0.0 inside."""
-    return max(
-        max(float(box[a][0]) - float(v), float(v) - float(box[a][1]), 0.0)
-        for a, v in zip("xyz", point, strict=True)
-    )
-
-
 def _clamp_into(point: Any, box: dict[str, list[float]]) -> np.ndarray:
     return np.array(
         [min(max(float(v), float(box[a][0])), float(box[a][1])) for a, v in zip("xyz", point, strict=True)]
@@ -184,7 +155,10 @@ def _emitter(on_event: Callable[[str], None] | None) -> Callable[[str], None]:
     def emit(text: str) -> None:
         log.info("%s", text)
         if on_event is not None:
-            on_event(text)
+            try:
+                on_event(text)
+            except Exception:
+                log.exception("policy event observer failed")
 
     return emit
 
@@ -199,6 +173,8 @@ def run_policy(
     sleep: Callable[[float], None] | None = None,
     on_event: Callable[[str], None] | None = None,
     policy: Any = None,
+    safety_scene: Callable[[], dict[str, Any] | None] | None = None,
+    cancelled: Callable[[], bool] | None = None,
 ) -> bool:
     """Track the hand with the policy through the driver; True on success, False otherwise (module doc)."""
     emit = _emitter(on_event)
@@ -213,80 +189,157 @@ def run_policy(
         log.warning("policy %s unavailable: %s", policy_path, exc)
         return False
     try:
-        from arm.replay import load_box, shrunk_box  # lazy: arm/replay.py is not in the RL sandbox bundle
+        # Lazy: arm/replay.py is not part of the independent RL training sandbox bundle.
+        from arm.replay import Abort, Pacer, Session, inside_box, load_box, shrunk_box
 
         box = load_box(SCENE_PATH)
-    except Exception as exc:  # no box, no policy: nothing moved yet and the IK path refuses too
+        target_box = shrunk_box(box, TARGET_INSET_M)
+        now, pause = _timing(driver, clock, sleep)
+        scene_data: dict[str, Any] = {}
+        session = Session(
+            driver,
+            safety_scene if safety_scene is not None else lambda: scene_data,
+            Pacer(not getattr(driver, "is_fake", False), now, pause),
+            emit,
+            hand_freeze=False,
+            cancelled=cancelled,
+        )
+        session.box = session.gate_box = box
+        lim = session.limits
+        lo = np.array([lim[joint][0] for joint in ik.JOINTS]) + MARGIN_RAD
+        hi = np.array([lim[joint][1] for joint in ik.JOINTS]) - MARGIN_RAD
+    except Exception as exc:  # bad configuration: nothing has touched the driver
         emit(f"policy unavailable: no workspace box ({type(exc).__name__}: {exc})")
         return False
-    target_box = shrunk_box(box, TARGET_INSET_M)
-    now, pause = _timing(driver, clock, sleep)
-    lim = ik.limits()
-    lo = np.array([lim[joint][0] for joint in ik.JOINTS]) + MARGIN_RAD
-    hi = np.array([lim[joint][1] for joint in ik.JOINTS]) - MARGIN_RAD
-    ceiling = ceiling_z()
-    max_steps = int(math.ceil(seconds / DT)) + 1  # a tick budget: a stalled clock cannot loop forever
+    ceiling = float(box["z"][1])
+    max_steps = int(math.ceil(seconds / DT)) + 1  # stalled clocks still have a finite tick budget
     prev_action = np.zeros(ACTION_SIZE)
-    q_cmd: np.ndarray | None = None
-    gripper_hold = 0.0
     streak = 0
     steps = 0
     held_warned = False
     box_warned = False
     clamp_warned = False
     start = now()
-    next_tick = start
+    last_sent: float | None = None
     emit(f"policy start: {name}")
-    while True:
-        if getattr(driver, "stopped", False):
+
+    def expired() -> bool:
+        return now() - start >= seconds - 1e-9 or steps >= max_steps
+
+    try:
+        if driver.stopped:
             emit("policy stopped")
             return False
-        if now() - start >= seconds - 1e-9 or steps >= max_steps:  # 1e-9: summed ticks round either way
-            emit(f"policy timeout after {steps} steps")
+        if not driver.torque:
+            emit("policy unavailable: torque is off")
             return False
-        q_read, gripper_read = driver.read()
-        q = np.asarray(q_read, dtype=np.float64).reshape(len(ik.JOINTS))
-        if q_cmd is None:
-            q_cmd = q.copy()  # integrate from the present pose, as the env integrates from its start pose
-            last = getattr(driver, "last_command", None)
-            gripper_hold = float(last[1]) if last else float(gripper_read)
-        raw_target = np.array(target_point(scene() if scene is not None else None))
-        target = _clamp_into(raw_target, target_box)
-        if not clamp_warned and not np.allclose(target, raw_target, rtol=0.0, atol=1e-12):
-            emit("policy target clamped inside the workspace box")
-            clamp_warned = True
-        tip = np.array(ik.fk_tip(q))
-        obs = build_observation(q, prev_action, target, tip=tip)
-        raw, _state = model.predict(obs, deterministic=True)
-        action = np.clip(np.asarray(raw, dtype=np.float64).reshape(ACTION_SIZE), -1.0, 1.0)
-        q_next = q_cmd.copy()
-        q_next[:4] = np.clip(q_cmd[:4] + action * MAX_STEP_RAD, lo[:4], hi[:4])
-        if ik.fk_tip(q_next)[2] > ceiling:
-            q_next = q_cmd.copy()
-            action = np.zeros(ACTION_SIZE)
-            if not held_warned:
-                emit("policy held below the ceiling")
-                held_warned = True
-        elif _box_excess(ik.fk_tip(q_next), box) > _box_excess(ik.fk_tip(q_cmd), box) + 1e-9:
-            # never deeper outside the box than the arm already is: the floor and sides bind like the ceiling
-            q_next = q_cmd.copy()
-            action = np.zeros(ACTION_SIZE)
-            if not box_warned:
-                emit("policy held inside the workspace box")
-                box_warned = True
-        if not driver.command([float(v) for v in q_next], gripper_hold):
-            emit("policy stopped")
+        session.check_stopped()
+        session.start()
+        _finite_reading(session.q, session.g)
+        if (
+            not inside_box(session.tip, box)
+            or np.any(np.array(session.q) < lo)
+            or np.any(np.array(session.q) > hi)
+        ):
+            emit("policy unavailable: initial pose is outside the workspace or joint safety band")
             return False
-        last = getattr(driver, "last_command", None)
-        q_cmd = np.asarray(last[0], dtype=np.float64) if last else q_next
-        prev_action = action
-        steps += 1
-        dist = float(np.linalg.norm(tip - target))
-        streak = streak + 1 if dist < SUCCESS_RADIUS else 0
-        if streak >= SUCCESS_STEPS:
-            emit(f"policy success after {steps} steps")
-            return True
-        next_tick += DT
-        delay = next_tick - now()
-        if delay > 0:
-            pause(delay)
+        while True:
+            session.check_stopped()
+            if expired():
+                emit(f"policy timeout after {steps} steps")
+                return False
+            q_read, gripper_read = driver.read()
+            q = _finite_reading(q_read, gripper_read)
+            observed_scene = scene() if scene is not None else None
+            if observed_scene is not None and not isinstance(observed_scene, dict):
+                raise ValueError("the policy scene source must return a dict or None")
+            scene_data = observed_scene or {}
+            # Validate tracking data even if the proposed target or command would be held still.
+            session.hand()
+            session.check_stopped()
+            raw_target = np.array(target_point(observed_scene))
+            target = _clamp_into(raw_target, target_box)
+            if not clamp_warned and not np.allclose(target, raw_target, rtol=0.0, atol=1e-12):
+                emit("policy target clamped inside the workspace box")
+                clamp_warned = True
+            tip = np.array(ik.fk_tip(q))
+            if not np.all(np.isfinite(tip)):
+                raise ValueError("non-finite measured tip")
+            if not inside_box(tip, box):
+                raise ValueError("measured tip left the workspace box")
+            obs = build_observation(q, prev_action, target, tip=tip)
+            raw, _state = model.predict(obs, deterministic=True)
+            action = np.asarray(raw, dtype=np.float64).reshape(ACTION_SIZE)
+            if not np.all(np.isfinite(action)):
+                raise ValueError("non-finite policy action")
+            action = np.clip(action, -1.0, 1.0)
+            q_cmd = np.asarray(session.q)
+            q_next = q_cmd.copy()
+            q_next[:4] = np.clip(q_cmd[:4] + action * MAX_STEP_RAD, lo[:4], hi[:4])
+            tip_next = ik.fk_tip(q_next)
+            if tip_next[2] > ceiling:
+                q_next = q_cmd.copy()
+                if not held_warned:
+                    emit("policy held below the ceiling")
+                    held_warned = True
+            elif not inside_box(tip_next, box):
+                q_next = q_cmd.copy()
+                if not box_warned:
+                    emit("policy held inside the workspace box")
+                    box_warned = True
+            q_next = _speed_limited_step(session, q_next)
+            # A late prediction may not issue an expired command or cause catch-up bursts. Session's
+            # regular pacer handles ordinary ticks; this also spaces sends after an inference stall.
+            if last_sent is not None:
+                delay = last_sent + DT - now()
+                if delay > 1e-9:
+                    pause(delay)
+            session.check_stopped()
+            if expired():
+                emit(f"policy timeout after {steps} steps")
+                return False
+            last_sent = now()
+            session.command(q_next, where="policy")
+            prev_action = (np.asarray(session.q[:4]) - q_cmd[:4]) / MAX_STEP_RAD
+            steps += 1
+            dist = float(np.linalg.norm(tip - target))
+            streak = streak + 1 if dist < SUCCESS_RADIUS else 0
+            if streak >= SUCCESS_STEPS:
+                session.check_stopped()
+                emit(f"policy success after {steps} steps")
+                return True
+    except Abort as exc:
+        emit("policy stopped" if exc.reason == "stopped" else f"policy aborted: {exc.reason}")
+        return False
+    except Exception as exc:
+        driver.freeze()
+        emit(f"policy error: {type(exc).__name__}: {exc}; frozen")
+        return False
+
+
+def _finite_reading(joints: Any, gripper: Any) -> np.ndarray:
+    q = np.asarray(joints, dtype=np.float64).reshape(len(ik.JOINTS))
+    if not np.all(np.isfinite(q)) or not math.isfinite(float(gripper)):
+        raise ValueError("non-finite driver reading")
+    if not 0.0 <= float(gripper) <= 1.0:
+        raise ValueError("driver gripper reading is outside [0, 1]")
+    return q
+
+
+def _speed_limited_step(session: Any, requested: np.ndarray) -> np.ndarray:
+    """Fit one policy tick to Session's Cartesian cap, recomputing FK after every reduction."""
+    current = np.asarray(session.q, dtype=np.float64)
+    delta = requested - current
+    fraction = 1.0
+    for _ in range(12):
+        candidate = current + fraction * delta
+        tip = session.ik.fk_tip(candidate)
+        step = math.dist(session.tip, tip)
+        if not math.isfinite(step):
+            raise ValueError("non-finite policy target tip")
+        cap = session.tip_cap(tip)
+        if step <= cap * (1.0 + 1e-9):
+            return candidate
+        fraction *= 0.99 * cap / step
+    # Holding the current command is safe and bounded even with a pathological kinematic model.
+    return current

@@ -444,8 +444,15 @@ def test_policy_config_falls_back_to_ik_and_uses_a_runner_when_present(monkeypat
 
     calls = []
 
-    def run_policy(driver, scene_fn, policy_path, *, timeout=8.0):
+    def run_policy(
+        driver, scene_fn, policy_path, *, timeout=8.0, safety_scene, cancelled, clock, sleep, on_event
+    ):
         calls.append((driver, scene_fn, policy_path, timeout))
+        assert safety_scene is scene and cancelled is real_robot.cancelled
+        before = clock()
+        sleep(0.1)
+        assert clock() == pytest.approx(before + 0.1)
+        on_event("policy test reached target")
         return True
 
     monkeypatch.setitem(sys.modules, "rl.policy_runner", types.SimpleNamespace(run_policy=run_policy))
@@ -457,6 +464,7 @@ def test_policy_config_falls_back_to_ik_and_uses_a_runner_when_present(monkeypat
     assert driver is d and guarded_scene() == scene()
     assert policy_path == str(ROOT / "rl" / "policies" / "handoff_best.zip") and timeout == 7.0
     assert "policy reached the hand" in result["events"] and "handoff_done" in result["events"]
+    assert "policy test reached target" in result["events"]
     assert d.commands[-1][0] == pytest.approx(HOME, abs=1e-6)
     rl_yaml.write_text("use_policy: false\n", encoding="utf-8")
     assert real_robot.policy_config()["use_policy"] is False

@@ -881,10 +881,12 @@ def test_policy_return_cannot_release_at_an_unreached_fallback(monkeypatch, poli
     scene = scene_with_hand(0.42, 0.0)()
     calls = []
 
-    def run_policy(driver, scene_fn, path, *, timeout):
+    def run_policy(driver, scene_fn, path, *, timeout, safety_scene, cancelled, clock, sleep, on_event):
         guarded = scene_fn()
         assert not guarded["hand"]["seen"]
         assert guarded["zones"]["handoff"] == scene["zones"]["handoff"]
+        assert safety_scene()["hand"]["seen"]
+        assert cancelled is real_robot.cancelled
         calls.append(guarded)
         return policy_succeeded
 

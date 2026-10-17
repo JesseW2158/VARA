@@ -873,8 +873,8 @@ def test_run_policy_never_carries_the_tip_out_of_the_workspace_box(axis, sign, f
     assert events.count("policy held inside the workspace box") == 1, events
 
 
-def test_run_policy_from_outside_the_box_may_only_come_back():
-    """An arm already outside the box is not frozen there: steps back in pass, steps further out hold."""
+def test_run_policy_refuses_an_initial_pose_outside_the_box():
+    """Recovery from outside the workspace belongs to the bounded live primitive, never the policy."""
     box = workspace_box()
     lim = ik.limits()
     q = np.array(ik.home_q())
@@ -892,12 +892,19 @@ def test_run_policy_from_outside_the_box_may_only_come_back():
         q = best_q
     z_start = ik.fk_tip(q)[2]
     assert z_start < box["z"][0] - 0.005  # below the floor
-    down = FakeDriver(q0=[float(v) for v in q])
-    pr.run_policy(down, lambda: None, "unused.zip", timeout=1.0, policy=GreedyPolicy(2, -1.0))
-    assert min(ik.fk_tip(c[0])[2] for c in down.commands) >= z_start - 1e-9
-    up = FakeDriver(q0=[float(v) for v in q])
-    pr.run_policy(up, lambda: None, "unused.zip", timeout=1.0, policy=GreedyPolicy(2, 1.0))
-    assert ik.fk_tip(up.commands[-1][0])[2] > box["z"][0]  # climbed back in
+    for direction in (-1.0, 1.0):
+        driver = FakeDriver(q0=[float(v) for v in q])
+        events = []
+        assert not pr.run_policy(
+            driver,
+            lambda: None,
+            "unused.zip",
+            timeout=1.0,
+            policy=GreedyPolicy(2, direction),
+            on_event=events.append,
+        )
+        assert not driver.commands and not driver.stopped and driver.torque
+        assert events[-1].startswith("policy unavailable: initial pose")
 
 
 def test_run_policy_clamps_the_target_inside_the_box():
