@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VARA voice</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <style>
+    /* Compact layout: this page lives in a 420 px tall iframe on the dashboard and also
+       works on its own at /voice. No API key is ever in this page; it asks the
+       orchestrator for a short-lived token (POST /voice/token). */
+    body.voice-page { padding: 10px 12px 16px; font-size: 16px; }
+    .voice-top { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 10px; }
+    .voice-top h1 { font-size: 22px; letter-spacing: 0.04em; }
+    .voice-controls { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 8px; }
+    button.talk {
+      font-size: 20px; font-weight: 700; padding: 12px 22px; border-radius: 12px;
+      background: #1f3b63; border-color: var(--accent); touch-action: none; user-select: none; -webkit-user-select: none;
+    }
+    button.talk.active { background: var(--accent); color: #fff; }
+    button.stop.small { font-size: 18px; padding: 10px 18px; margin-left: auto; }
+    .level { height: 6px; background: #0c0e12; border-radius: 3px; overflow: hidden; margin-bottom: 8px; }
+    .level div { height: 100%; width: 0; background: var(--good); transition: width 0.08s linear; }
+    .error { color: #fff; background: #5a2222; border: 1px solid var(--critical); border-radius: 8px; padding: 8px 10px; margin-bottom: 8px; font-size: 15px; }
+    .voice-log { list-style: none; margin: 0; padding: 0; max-height: 200px; overflow: auto; font-size: 15px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); }
+    .voice-log li { display: grid; grid-template-columns: 64px minmax(0, 1fr); gap: 8px; padding: 4px 8px; border-bottom: 1px solid var(--line); }
+    /* transcripts and error bodies come from outside and may be one unbroken token: wrap them in place */
+    .voice-log .text, .error { overflow-wrap: anywhere; }
+    .voice-log .when { color: var(--muted); font-family: var(--mono); font-size: 12px; padding-top: 2px; }
+    .voice-log .who { font-weight: 700; margin-right: 6px; font-family: var(--mono); font-size: 13px; text-transform: uppercase; }
+    .voice-log li.user .who { color: var(--accent); }
+    .voice-log li.assistant .who { color: var(--good); }
+    .voice-log li.tool .who { color: var(--warning); }
+    .voice-log li.err .who { color: var(--critical); }
+    .voice-log li.sys .who { color: var(--muted); }
+    .small { font-size: 14px; margin: 8px 0 0; }
+  </style>
+</head>
+<body class="voice-page">
+  <header class="voice-top">
+    <h1>Voice</h1>
+    <span id="voice-status" class="pill off">disconnected</span>
+    <span id="voice-model" class="muted small"></span>
+  </header>
+
+  <div class="voice-controls">
+    <button id="btn-connect" type="button">Connect</button>
+    <button id="btn-disconnect" type="button" disabled>Disconnect</button>
+    <button id="btn-talk" type="button" class="talk" disabled>Hold to talk (T)</button>
+    <button id="btn-voice-stop" type="button" class="stop small" title="Freeze the arm (Esc)">STOP</button>
+  </div>
+
+  <div class="level"><div id="voice-level"></div></div>
+  <div id="voice-error" class="error" hidden></div>
+  <ol id="voice-log" class="voice-log"></ol>
+
+  <p class="muted small">Push to talk: hold T or the button, speak, release. Esc or STOP freezes the arm; saying "stop" also works but Esc is the safety path.</p>
+
+  <script src="/static/voice.js"></script>
+</body>
+</html>

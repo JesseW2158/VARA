@@ -1,0 +1,15 @@
+{
+  "action": "learn",
+  "spec": {
+    "name": "juice_box_to_tray",
+    "description": "Put the juice box into the tray.",
+    "params": {},
+    "success": {
+      "in_zone": {
+        "object": "juice_box",
+        "zone": "tray"
+      }
+    },
+    "english": "The juice box ends inside the tray."
+  }
+}

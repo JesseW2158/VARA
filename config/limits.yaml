@@ -1,0 +1,12 @@
+# Joint limits in radians as [low, high], for the joint vector [shoulder_pan, shoulder_lift, elbow_flex,
+# wrist_flex, wrist_roll]. Everything that moves the arm (arm/driver.py, arm/replay.py validate, arm/ik.py)
+# clamps to these minus 3 degrees.
+#
+# PLACEHOLDER: these are the MuJoCo ranges from sim/model/so101_new_calib.xml ("new calibration", every
+# joint's zero is mid-range). A6 (joint map and accuracy check) replaces them with the calibrated ranges
+# measured on our follower arm and must redo that after any recalibration.
+shoulder_pan: [-1.9199, 1.9199]
+shoulder_lift: [-1.7453, 1.7453]
+elbow_flex: [-1.69, 1.69]
+wrist_flex: [-1.6581, 1.6581]
+wrist_roll: [-2.7438, 2.8412]

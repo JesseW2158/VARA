@@ -1,0 +1,15 @@
+{
+  "action": "learn",
+  "spec": {
+    "name": "pill_bottle_to_tray",
+    "description": "Put the pill bottle into the tray.",
+    "params": {},
+    "success": {
+      "in_zone": {
+        "object": "pill_bottle",
+        "zone": "tray"
+      }
+    },
+    "english": "The pill bottle ends inside the tray."
+  }
+}

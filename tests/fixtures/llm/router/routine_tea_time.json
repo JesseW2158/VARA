@@ -1,0 +1,12 @@
+{
+  "action": "define_routine",
+  "name": "tea_time",
+  "steps": [
+    {
+      "skill": "hand_over",
+      "args": {
+        "object": "tea_tin"
+      }
+    }
+  ]
+}

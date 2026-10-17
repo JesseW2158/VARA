@@ -1,8 +1,8 @@
 # Measured once per table setup. Units: meters and radians. Placeholders until B4, B5 and A10 measure them.
 workspace: {x: [0.10, 0.40], y: [-0.25, 0.25], z: [0.02, 0.30]}
 zones:
-  tray: {x: 0.30, y: 0.22, r: 0.07, wall: 0.035, slots: [[0.28, 0.20], [0.32, 0.20], [0.28, 0.24], [0.32, 0.24]]}
-  handoff: {x: 0.30, y: 0.00, z: 0.10}
+  tray: {x: 0.30, y: 0.22, r: 0.07, wall: 0.035, slots: [[0.275, 0.195], [0.325, 0.195], [0.275, 0.245], [0.325, 0.245]]}
+  handoff: {x: 0.28, y: -0.08, z: 0.10}  # moved off the cereal box's -y face (sim layout; A15 re-tapes it)
 camera:
   Hc: 0.65            # lens height above the table (B4)
   c: [0.20, -0.05]    # table point directly under the lens (B4)
@@ -15,4 +15,4 @@ calib_markers:        # tape-measured centers of calibration markers 0-7 (B5)
   5: [0.46, -0.34]
   6: [0.46, 0.17]
   7: [0.46, -0.17]
-home_q: [0.0, -1.75, 1.6, 0.75, 0.0]   # tucked pose that hides no marker from the camera (A10)
+home_q: [0.0, -1.35, 0.02, 1.45, 0.0]  # folded up against the base: tip (0.11, 0, 0.27), jaws level. Placeholder until A10/B4 agree a pose (the kit value put the gripper inside the tea tin)

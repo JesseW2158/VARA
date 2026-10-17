@@ -1,0 +1,5 @@
+{
+  "action": "queue",
+  "task": "Pour me a glass of water",
+  "reason": "liquids cannot be handled"
+}

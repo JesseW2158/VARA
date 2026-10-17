@@ -1,0 +1,214 @@
+{
+  "name": "pass_not_moved_juice_box",
+  "spec": {
+    "name": "pills_to_tray_leave_juice",
+    "description": "Put the pill bottle in the tray without disturbing the juice box.",
+    "params": {},
+    "success": {
+      "all": [
+        {
+          "in_zone": {
+            "object": "pill_bottle",
+            "zone": "tray"
+          }
+        },
+        {
+          "not_moved": {
+            "object": "juice_box",
+            "max": 0.02
+          }
+        }
+      ]
+    },
+    "english": "The pill bottle is in the tray and the juice box has not moved."
+  },
+  "args": {},
+  "events": [],
+  "before": {
+    "t": 1792210000.0,
+    "objects": {
+      "pill_bottle": {
+        "marker": 10,
+        "x": 0.18,
+        "y": -0.12,
+        "yaw": 0.0,
+        "h": 0.07,
+        "size": [
+          0.035,
+          0.035
+        ],
+        "seen": true
+      },
+      "juice_box": {
+        "marker": 11,
+        "x": 0.24,
+        "y": -0.04,
+        "yaw": 0.3,
+        "h": 0.105,
+        "size": [
+          0.063,
+          0.04
+        ],
+        "seen": true
+      },
+      "tea_tin": {
+        "marker": 12,
+        "x": 0.15,
+        "y": 0.03,
+        "yaw": 0.0,
+        "h": 0.09,
+        "size": [
+          0.04,
+          0.04
+        ],
+        "seen": true
+      }
+    },
+    "obstacles": {
+      "cereal_box": {
+        "marker": 30,
+        "x": 0.24,
+        "y": 0.11,
+        "yaw": 0.0,
+        "h": 0.2,
+        "size": [
+          0.19,
+          0.06
+        ],
+        "seen": true
+      }
+    },
+    "hand": {
+      "marker": 40,
+      "x": 0.3,
+      "y": 0.02,
+      "z": 0.03,
+      "seen": false
+    },
+    "zones": {
+      "tray": {
+        "x": 0.3,
+        "y": 0.22,
+        "r": 0.07,
+        "wall": 0.035,
+        "slots": [
+          [
+            0.275,
+            0.195
+          ],
+          [
+            0.325,
+            0.195
+          ],
+          [
+            0.275,
+            0.245
+          ],
+          [
+            0.325,
+            0.245
+          ]
+        ]
+      },
+      "handoff": {
+        "x": 0.3,
+        "y": 0.0,
+        "z": 0.1
+      }
+    }
+  },
+  "after": {
+    "t": 1792210042.0,
+    "objects": {
+      "pill_bottle": {
+        "marker": 10,
+        "x": 0.28,
+        "y": 0.2,
+        "yaw": 0.3,
+        "h": 0.07,
+        "size": [
+          0.035,
+          0.035
+        ],
+        "seen": true
+      },
+      "juice_box": {
+        "marker": 11,
+        "x": 0.247,
+        "y": -0.033,
+        "yaw": 0.3,
+        "h": 0.105,
+        "size": [
+          0.063,
+          0.04
+        ],
+        "seen": true
+      },
+      "tea_tin": {
+        "marker": 12,
+        "x": 0.15,
+        "y": 0.03,
+        "yaw": 0.0,
+        "h": 0.09,
+        "size": [
+          0.04,
+          0.04
+        ],
+        "seen": true
+      }
+    },
+    "obstacles": {
+      "cereal_box": {
+        "marker": 30,
+        "x": 0.24,
+        "y": 0.11,
+        "yaw": 0.0,
+        "h": 0.2,
+        "size": [
+          0.19,
+          0.06
+        ],
+        "seen": true
+      }
+    },
+    "hand": {
+      "marker": 40,
+      "x": 0.3,
+      "y": 0.02,
+      "z": 0.03,
+      "seen": false
+    },
+    "zones": {
+      "tray": {
+        "x": 0.3,
+        "y": 0.22,
+        "r": 0.07,
+        "wall": 0.035,
+        "slots": [
+          [
+            0.275,
+            0.195
+          ],
+          [
+            0.325,
+            0.195
+          ],
+          [
+            0.275,
+            0.245
+          ],
+          [
+            0.325,
+            0.245
+          ]
+        ]
+      },
+      "handoff": {
+        "x": 0.3,
+        "y": 0.0,
+        "z": 0.1
+      }
+    }
+  },
+  "expected": true
+}

@@ -1,0 +1,378 @@
+/* VARA dashboard styles. Dark theme, sized to read from 2 m on a laptop or monitor.
+   Colors are tokens on :root; the four RL series colors were validated with the
+   dataviz palette checker on the card surface (#1d2128). */
+
+:root {
+  color-scheme: dark;
+  --bg: #0f1115;
+  --surface: #171a1f;
+  --card: #1d2128;
+  --line: #2c323b;
+  --text: #f0efec;
+  --muted: #a7acb5;
+  --accent: #3987e5;
+  --good: #0ca30c;
+  --warning: #fab219;
+  --serious: #ec835a;
+  --critical: #d03b3b;
+  --series-1: #3987e5;
+  --series-2: #d95926;
+  --series-3: #199e70;
+  --series-4: #c98500;
+  --radius: 12px;
+  --font: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --mono: ui-monospace, "Cascadia Mono", Consolas, "Liberation Mono", monospace;
+}
+
+* { box-sizing: border-box; }
+
+/* The hidden attribute must beat every display rule below (flex boxes included). */
+[hidden] { display: none !important; }
+
+html, body { margin: 0; padding: 0; }
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font);
+  font-size: 18px;
+  line-height: 1.35;
+  padding: 12px 16px 32px;
+}
+
+h1, h2, h3 { margin: 0; line-height: 1.2; }
+h2 { font-size: 20px; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; }
+h2 .sub { text-transform: none; letter-spacing: 0; font-weight: 400; font-size: 15px; margin-left: 8px; }
+
+button {
+  font: inherit;
+  color: var(--text);
+  background: #262b34;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 8px 16px;
+  cursor: pointer;
+}
+button:hover { background: #2f3540; }
+button:disabled { opacity: 0.5; cursor: default; }
+button.stop {
+  background: var(--critical);
+  border-color: var(--critical);
+  color: #fff;
+  font-size: 30px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  padding: 12px 40px;
+  border-radius: 14px;
+}
+button.stop:hover { background: #e24a4a; }
+button.maint { color: var(--muted); font-size: 15px; padding: 6px 12px; }
+button.maint.armed { background: var(--critical); border-color: var(--critical); color: #fff; }
+
+input[type="text"] {
+  font: inherit;
+  color: var(--text);
+  background: #0c0e12;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 10px 12px;
+  width: 100%;
+}
+
+pre, code, .mono { font-family: var(--mono); }
+pre {
+  margin: 0;
+  padding: 10px;
+  background: #0c0e12;
+  border-radius: 8px;
+  overflow: auto;
+  font-size: 14px;
+  max-height: 320px;
+}
+
+.muted { color: var(--muted); }
+.result { color: var(--muted); font-size: 16px; }
+.result.ok { color: var(--good); }
+.result.bad { color: var(--serious); }
+
+/* Text from the server or the user can be one unbroken token: a 600-character routing text with no
+   spaces widened the headline, and so the page, to 7871 px. Such text wraps inside its own box. */
+.headline, .spec-english, .spec-label .name, .card .hint, .card .reason, .card .stats, .timeline .body,
+.skill .name, .skill .english, .queue-list li, .result, .rl-meta { overflow-wrap: anywhere; }
+
+/* ---- top bar ---- */
+.topbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px 20px;
+  padding: 8px 0 12px;
+  border-bottom: 1px solid var(--line);
+}
+.brand { display: flex; align-items: baseline; gap: 10px; }
+.brand h1 { font-size: 32px; letter-spacing: 0.06em; }
+.brand .tagline { color: var(--muted); font-size: 16px; }
+
+.pills { display: flex; flex-wrap: wrap; gap: 8px; }
+.pill {
+  display: inline-block;
+  padding: 4px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  font-size: 16px;
+  white-space: nowrap;
+}
+.pill.idle { border-color: var(--good); }
+.pill.busy { border-color: var(--accent); }
+.pill.stopped { border-color: var(--critical); background: var(--critical); color: #fff; font-weight: 700; }
+.pill.off { border-color: var(--serious); color: var(--serious); }
+.pill.on { border-color: var(--good); }
+
+.countdown {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 4px 14px;
+  border-radius: 10px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+}
+.countdown .label { color: var(--muted); font-size: 15px; }
+.countdown .value { font-family: var(--mono); font-size: 34px; font-weight: 700; min-width: 3ch; text-align: right; }
+.countdown.warn .value { color: var(--warning); }
+.countdown.over .value { color: var(--critical); }
+.countdown.done .value { color: var(--good); }
+
+.controls { display: flex; align-items: center; gap: 12px; margin-left: auto; flex-wrap: wrap; }
+.controls .hint { color: var(--muted); font-size: 15px; }
+
+/* ---- stopped banner, headline, spec banner ---- */
+.stopped-banner {
+  margin-top: 12px;
+  padding: 14px 18px;
+  background: var(--critical);
+  color: #fff;
+  font-size: 30px;
+  font-weight: 800;
+  border-radius: var(--radius);
+  text-align: center;
+  animation: pulse 1.2s ease-in-out infinite;
+}
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.75; } }
+
+.headline {
+  margin-top: 12px;
+  padding: 10px 16px;
+  font-size: 26px;
+  font-weight: 600;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  min-height: 52px;
+}
+.headline .task { color: var(--muted); font-family: var(--mono); font-size: 18px; margin-right: 12px; }
+.headline.good { border-color: var(--good); }
+.headline.bad { border-color: var(--serious); }
+.headline.stopped { border-color: var(--critical); }
+
+.spec-banner {
+  margin-top: 12px;
+  padding: 14px 18px;
+  background: #15202e;
+  border: 2px solid var(--accent);
+  border-radius: var(--radius);
+}
+.spec-label { color: var(--muted); font-size: 16px; text-transform: uppercase; letter-spacing: 0.05em; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.spec-label .tag {
+  background: var(--accent);
+  color: #fff;
+  text-transform: none;
+  letter-spacing: 0;
+  font-size: 14px;
+  font-weight: 700;
+  padding: 2px 10px;
+  border-radius: 999px;
+}
+.spec-label .name { font-family: var(--mono); text-transform: none; letter-spacing: 0; }
+.spec-english { font-size: 30px; font-weight: 700; margin: 6px 0 8px; }
+.spec-banner details summary { cursor: pointer; color: var(--muted); font-size: 15px; }
+
+/* ---- main grid ---- */
+.grid {
+  display: grid;
+  grid-template-columns: minmax(260px, 1fr) minmax(480px, 2.1fr) minmax(300px, 1.2fr);
+  gap: 16px;
+  margin-top: 16px;
+}
+.grid.lower { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.col, .panel {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+  min-width: 0;
+}
+.col h2, .panel h2 { margin-bottom: 10px; }
+
+/* feeds */
+.feed { margin-bottom: 12px; }
+.feed-box {
+  position: relative;
+  background: #000;
+  border-radius: 8px;
+  overflow: hidden;
+  aspect-ratio: 4 / 3;
+}
+.feed-box img { width: 100%; height: 100%; object-fit: contain; display: block; opacity: 0; transition: opacity 0.3s; }
+.feed-box.live img { opacity: 1; }
+.feed-box .nofeed {
+  position: absolute; inset: 0;
+  display: flex; align-items: center; justify-content: center;
+  color: var(--muted); font-size: 22px;
+}
+.feed-box.live .nofeed { display: none; }
+
+.command form { display: flex; gap: 8px; }
+.command .result { margin-top: 8px; min-height: 22px; }
+
+/* candidate cards */
+.cards {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+.card {
+  background: var(--card);
+  border: 2px solid var(--line);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+  min-height: 190px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  position: relative;
+}
+/* Header: number left, status right. The status never wraps inside itself (white-space: nowrap);
+   when it does not fit beside the number it drops to its own line (flex-wrap), and only an absurd
+   one is clipped with an ellipsis (the full text is in its title). Measured at a 1366 px viewport:
+   a card is 160 px wide inside its padding, the number box 74 px, and the longest statuses
+   ("rejected by check_source", "rewriting after rejection") are 144 and 135 px at 13 px lowercase,
+   so they fit on one line; uppercase at 14 px needed 197 px and wrapped letter by letter. */
+.card .top { display: flex; flex-wrap: wrap; align-items: flex-end; justify-content: space-between; gap: 4px 8px; min-width: 0; }
+.card .num { font-size: 36px; font-weight: 800; line-height: 1; flex: none; }
+.card .num small { display: block; font-size: 12px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 2px; }
+.card .status { color: var(--muted); font-size: 13px; text-align: right; flex: 1 0 auto; max-width: 100%; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* The LOCAL badge has its own row: inside the header it squeezed the status into a letter-by-letter wrap. */
+.card .badges { display: flex; justify-content: flex-end; gap: 6px; }
+.card .hint { color: var(--muted); font-size: 16px; min-height: 2.6em; }
+.card .trials { font-size: 26px; letter-spacing: 3px; line-height: 1; min-height: 28px; }
+.card .trials .tick { color: var(--good); }
+.card .trials .cross { color: var(--critical); }
+.card .trials .pending { color: var(--line); }
+/* Shown when the score has no per-trial array: trial 1's mark, then "4/5" instead of invented marks. */
+.card .trials .count { font-size: 17px; letter-spacing: 0; color: var(--muted); margin-left: 8px; vertical-align: 4px; }
+.card .stats { color: var(--muted); font-size: 15px; display: flex; gap: 12px; flex-wrap: wrap; }
+.card .verdict { font-size: 24px; font-weight: 800; }
+.card .verdict.pass { color: var(--good); }
+.card .verdict.fail { color: var(--critical); }
+.card .reason { font-size: 16px; color: var(--serious); word-break: break-word; }
+.card.rejected { border-style: dashed; }
+.card.scored.pass { border-color: #1e5a1e; }
+.card.scored.fail { border-color: #5a2222; }
+.card.winner {
+  border-color: var(--good);
+  box-shadow: 0 0 0 3px rgba(12, 163, 12, 0.35), 0 0 24px rgba(12, 163, 12, 0.25);
+}
+.card .ribbon {
+  position: absolute; top: -12px; right: 12px;
+  background: var(--good); color: #fff;
+  font-size: 14px; font-weight: 800; letter-spacing: 0.08em;
+  padding: 2px 10px; border-radius: 999px;
+}
+.badge {
+  display: inline-block;
+  font-size: 13px;
+  font-weight: 700;
+  padding: 1px 8px;
+  border-radius: 999px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  vertical-align: middle;
+}
+.badge.local { background: var(--warning); color: #000; }
+.badge.starter { background: #2c323b; color: var(--text); }
+.badge.new { background: var(--accent); color: #fff; }
+
+/* timeline */
+.timeline {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 640px;
+  overflow: auto;
+  font-size: 15px;
+}
+.timeline li {
+  display: grid;
+  grid-template-columns: 72px minmax(0, 1fr);
+  gap: 8px;
+  padding: 5px 0;
+  border-bottom: 1px solid var(--line);
+}
+.timeline .when { color: var(--muted); font-family: var(--mono); font-size: 13px; padding-top: 2px; }
+.timeline .stage { font-family: var(--mono); font-weight: 700; margin-right: 6px; }
+.timeline .task { color: var(--muted); font-family: var(--mono); font-size: 13px; margin-right: 6px; }
+.timeline li.good .stage { color: var(--good); }
+.timeline li.bad .stage { color: var(--serious); }
+.timeline li.stopped .stage { color: var(--critical); }
+.timeline li.spec .stage { color: var(--accent); }
+.timeline li.latest { background: rgba(57, 135, 229, 0.08); }
+
+/* library, queue */
+.panel-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
+.skills, .queue-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+.skill {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 4px 12px;
+  padding: 10px 12px;
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+.skill.newest { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(57, 135, 229, 0.35); }
+.skill .name { font-size: 22px; font-weight: 700; font-family: var(--mono); }
+.skill .english { grid-column: 1 / -1; color: var(--muted); font-size: 16px; }
+.skill .stats { color: var(--muted); font-size: 15px; text-align: right; white-space: nowrap; }
+.skill .stats b { color: var(--text); }
+.queue-list li { padding: 8px 12px; background: var(--card); border: 1px solid var(--line); border-radius: 10px; }
+.queue-list .reason { color: var(--muted); font-size: 15px; }
+.empty { color: var(--muted); font-style: italic; }
+
+/* RL panel */
+.rl-meta { display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 8px; font-size: 17px; }
+.rl-meta .carry { font-weight: 700; }
+.rl-meta .carry.rl { color: var(--good); }
+.chart-box { position: relative; height: 260px; background: var(--card); border-radius: 10px; padding: 8px; }
+.chart-box canvas { width: 100% !important; height: 100% !important; }
+.chart-box .fallback { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; text-align: center; padding: 16px; color: var(--muted); }
+.chart-box .fallback pre { background: transparent; font-size: 14px; }
+video { width: 100%; margin-top: 10px; border-radius: 10px; background: #000; max-height: 300px; }
+
+/* voice iframe */
+.voice iframe { width: 100%; height: 420px; border: 1px solid var(--line); border-radius: 10px; background: var(--bg); }
+
+/* ---- responsive ---- */
+@media (max-width: 1280px) {
+  .grid { grid-template-columns: minmax(240px, 1fr) minmax(0, 2fr); }
+  .grid .timeline-col { grid-column: 1 / -1; }
+}
+@media (max-width: 980px) {
+  body { font-size: 16px; }
+  .grid, .grid.lower { grid-template-columns: minmax(0, 1fr); }
+  .cards { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .controls { margin-left: 0; }
+  .spec-english { font-size: 24px; }
+  .headline { font-size: 22px; }
+}

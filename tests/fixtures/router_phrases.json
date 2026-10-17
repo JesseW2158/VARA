@@ -1,0 +1,203 @@
+[
+  {
+    "text": "Hand me my pills",
+    "action": "run",
+    "skill": "hand_over",
+    "args": {
+      "object": "pill_bottle"
+    }
+  },
+  {
+    "text": "Clear the table. Put everything in the tray.",
+    "action": "learn",
+    "spec_name": "clear_table",
+    "success": {
+      "all": [
+        {
+          "in_zone": {
+            "object": "*",
+            "zone": "tray"
+          }
+        }
+      ]
+    },
+    "params": {}
+  },
+  {
+    "text": "Fold my laundry",
+    "action": "queue",
+    "note": "queue: cloth"
+  },
+  {
+    "text": "When I say good morning, hand me my pill bottle, then my juice box",
+    "action": "define_routine",
+    "name": "good_morning",
+    "steps": [
+      {
+        "skill": "hand_over",
+        "args": {
+          "object": "pill_bottle"
+        }
+      },
+      {
+        "skill": "hand_over",
+        "args": {
+          "object": "juice_box"
+        }
+      }
+    ]
+  },
+  {
+    "text": "Good morning",
+    "action": "run",
+    "skill": "good_morning",
+    "args": {}
+  },
+  {
+    "text": "put the juice box in the tray",
+    "action": "learn",
+    "spec_name": "juice_box_to_tray",
+    "success": {
+      "in_zone": {
+        "object": "juice_box",
+        "zone": "tray"
+      }
+    },
+    "params": {}
+  },
+  {
+    "text": "clear the table",
+    "action": "learn",
+    "spec_name": "clear_table",
+    "success": {
+      "all": [
+        {
+          "in_zone": {
+            "object": "*",
+            "zone": "tray"
+          }
+        }
+      ]
+    },
+    "params": {}
+  },
+  {
+    "text": "Can you pass me the juice box?",
+    "action": "run",
+    "skill": "hand_over",
+    "args": {
+      "object": "juice_box"
+    }
+  },
+  {
+    "text": "Give me the tea tin please",
+    "action": "run",
+    "skill": "hand_over",
+    "args": {
+      "object": "tea_tin"
+    }
+  },
+  {
+    "text": "I need my medicine",
+    "action": "run",
+    "skill": "hand_over",
+    "args": {
+      "object": "pill_bottle"
+    }
+  },
+  {
+    "text": "When I say tea time, hand me the tea tin",
+    "action": "define_routine",
+    "name": "tea_time",
+    "steps": [
+      {
+        "skill": "hand_over",
+        "args": {
+          "object": "tea_tin"
+        }
+      }
+    ]
+  },
+  {
+    "text": "Put the pill bottle in the tray",
+    "action": "learn",
+    "spec_name": "pill_bottle_to_tray",
+    "success": {
+      "in_zone": {
+        "object": "pill_bottle",
+        "zone": "tray"
+      }
+    },
+    "params": {}
+  },
+  {
+    "text": "Put everything in the tray except the tea tin",
+    "action": "learn",
+    "success": {
+      "all": [
+        {
+          "in_zone": {
+            "object": "pill_bottle",
+            "zone": "tray"
+          }
+        },
+        {
+          "in_zone": {
+            "object": "juice_box",
+            "zone": "tray"
+          }
+        },
+        {
+          "not_moved": {
+            "object": "tea_tin",
+            "max": 0.02
+          }
+        }
+      ]
+    },
+    "params": {}
+  },
+  {
+    "text": "Tidy up, everything goes in the tray",
+    "action": "learn",
+    "success": {
+      "all": [
+        {
+          "in_zone": {
+            "object": "*",
+            "zone": "tray"
+          }
+        }
+      ]
+    },
+    "params": {}
+  },
+  {
+    "text": "Pour me a glass of water",
+    "action": "queue",
+    "note": "queue: liquids"
+  },
+  {
+    "text": "Bring me the remote control",
+    "action": "queue",
+    "note": "queue: unknown object"
+  },
+  {
+    "text": "Hold the juice box up to my mouth",
+    "action": "queue",
+    "note": "queue: motion toward the face"
+  },
+  {
+    "text": "Put the tea tin inside the pill bottle",
+    "action": "queue",
+    "note": "queue: physically impossible"
+  },
+  {
+    "text": "stop",
+    "action": "stop"
+  },
+  {
+    "text": "Stop right now!",
+    "action": "stop"
+  }
+]

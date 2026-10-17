@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VARA dashboard</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <!-- Chart.js pinned to 4.4.1 (Dec 2023). Update the version, integrity hash and
+       web/static/README.md together. "defer" keeps the download off the parser's path, but
+       DOMContentLoaded still waits for it, so app.js (a plain tag at the end of body) starts
+       without waiting for that event and its loadRl() looks for Chart again on every poll:
+       a slow or dead CDN delays the RL chart only, never the cards, STOP or Esc. -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"
+          integrity="sha384-dug+JxfBvklEQdJ4AYuBBAIScUz0bVN73xpy273gcAwHjb3qI0fXmuYNaNfdyYJG"
+          crossorigin="anonymous" defer></script>
+</head>
+<body data-state="unknown">
+
+<header class="topbar">
+  <div class="brand">
+    <h1>VARA</h1>
+    <span class="tagline">teachable home-assistant arm</span>
+  </div>
+  <div class="pills">
+    <span id="pill-state" class="pill">state: connecting</span>
+    <span id="pill-mode" class="pill">mode: ?</span>
+    <span id="pill-carry" class="pill">carry: ?</span>
+    <span id="pill-events" class="pill off">events: connecting</span>
+  </div>
+  <div id="countdown" class="countdown" hidden>
+    <span class="label">command to arm moving</span>
+    <span id="countdown-value" class="value">75 s</span>
+  </div>
+  <div class="controls">
+    <button id="btn-stop" class="stop" type="button" title="Freeze the arm in place (Esc)">STOP</button>
+    <span class="hint">or press Esc anywhere</span>
+    <button id="btn-resume" type="button" title="Leave stopped; the arm goes home at 30 deg/s">Resume</button>
+    <button id="btn-calibrate" type="button" title="Re-run the table calibration check">Check calibration</button>
+    <span id="calib-result" class="result"></span>
+    <button id="btn-torque-off" type="button" class="maint" title="Maintenance only: cuts torque so the arm sags. Refused while a task runs. Click twice.">Torque off</button>
+    <span id="maint-result" class="result"></span>
+  </div>
+</header>
+
+<div id="stopped-banner" class="stopped-banner" hidden>STOPPED - arm frozen with torque on. Press Resume to send it home.</div>
+
+<section id="headline" class="headline">Waiting for a command.</section>
+
+<section id="spec-banner" class="spec-banner" hidden>
+  <div class="spec-label">
+    <span>Success test</span>
+    <span class="tag">written before any code</span>
+    <span id="spec-name" class="name"></span>
+  </div>
+  <div id="spec-english" class="spec-english"></div>
+  <details>
+    <summary>spec JSON</summary>
+    <pre id="spec-json"></pre>
+  </details>
+</section>
+
+<main class="grid">
+  <section class="col feeds-col">
+    <div class="feed">
+      <h2>Overhead</h2>
+      <div id="feed-overhead" class="feed-box">
+        <img alt="overhead camera with marker overlays" data-src="/video/overhead">
+        <div class="nofeed">no feed</div>
+      </div>
+    </div>
+    <div class="feed">
+      <h2>Wrist</h2>
+      <div id="feed-wrist" class="feed-box">
+        <img alt="wrist camera" data-src="/video/wrist">
+        <div class="nofeed">no feed</div>
+      </div>
+    </div>
+    <div class="command">
+      <h2>Command</h2>
+      <form id="command-form" autocomplete="off">
+        <input id="command-text" type="text" placeholder="e.g. put the juice box in the tray" aria-label="command text">
+        <button type="submit">Send</button>
+      </form>
+      <div id="command-result" class="result"></div>
+    </div>
+  </section>
+
+  <section class="col candidates-col">
+    <h2>Candidates <span class="sub">6 programs, 5 randomized trials each, one sandbox per program</span></h2>
+    <div id="cards" class="cards"></div>
+  </section>
+
+  <section class="col timeline-col">
+    <h2>Events</h2>
+    <ol id="timeline" class="timeline"></ol>
+  </section>
+</main>
+
+<section class="grid lower">
+  <section class="panel library">
+    <h2>Skill library</h2>
+    <div class="panel-actions">
+      <button id="btn-reset-demo" type="button" title="Archive learned skills and restore the two starter skills">Reset demo</button>
+      <button id="btn-load-backup" type="button" title="Copy rehearsal skills from skills/_backup into the library">Load backup</button>
+      <span id="library-result" class="result"></span>
+    </div>
+    <ul id="skills" class="skills"></ul>
+  </section>
+
+  <section class="panel queue">
+    <h2>Queue</h2>
+    <ul id="queue" class="queue-list"></ul>
+  </section>
+
+  <section class="panel rl">
+    <h2>RL hand-off reach <span class="sub">four Grok-written rewards, PPO in parallel sandboxes</span></h2>
+    <div class="rl-meta">
+      <span id="rl-carry" class="carry">carry: ?</span>
+      <span id="rl-chosen" class="muted">chosen variant: ?</span>
+    </div>
+    <div class="chart-box">
+      <canvas id="rl-chart" aria-label="success rate per reward variant over training steps" role="img"></canvas>
+      <div id="rl-fallback" class="fallback">loading curves</div>
+    </div>
+    <video id="rl-video" controls muted loop playsinline preload="metadata" data-src="/static/rl_sim.mp4"></video>
+    <div id="rl-video-fallback" class="muted" hidden>no simulation video yet (web/static/rl_sim.mp4)</div>
+  </section>
+
+  <section class="panel voice">
+    <h2>Voice <span class="sub">push to talk, hold T</span></h2>
+    <iframe id="voice-frame" src="/voice" title="voice page" allow="microphone"></iframe>
+  </section>
+</section>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

@@ -9,3 +9,9 @@ out/
 .claude/settings.local.json
 CLAUDE.local.md
 .DS_Store
+rl/runs/
+sim/model/*.part
+web/static/rl/*
+!web/static/rl/.gitkeep
+web/static/rl_sim.mp4
+MUJOCO_LOG.TXT

@@ -1,0 +1,22 @@
+{
+  "hand_me_my_pills": "hand_over_pill_bottle",
+  "clear_the_table_put_everything_in_the_tray": "learn_clear_table",
+  "fold_my_laundry": "queue_laundry",
+  "when_i_say_good_morning_hand_me_my_pill_bottle_then_my_juice_box": "routine_good_morning",
+  "good_morning": "run_good_morning",
+  "put_the_juice_box_in_the_tray": "learn_juice_box_to_tray",
+  "clear_the_table": "learn_clear_table",
+  "can_you_pass_me_the_juice_box": "hand_over_juice_box",
+  "give_me_the_tea_tin_please": "hand_over_tea_tin",
+  "i_need_my_medicine": "hand_over_pill_bottle",
+  "when_i_say_tea_time_hand_me_the_tea_tin": "routine_tea_time",
+  "put_the_pill_bottle_in_the_tray": "learn_pill_bottle_to_tray",
+  "put_everything_in_the_tray_except_the_tea_tin": "learn_tray_all_but_tea_tin",
+  "tidy_up_everything_goes_in_the_tray": "learn_clear_table",
+  "pour_me_a_glass_of_water": "queue_water",
+  "bring_me_the_remote_control": "queue_remote",
+  "hold_the_juice_box_up_to_my_mouth": "queue_face",
+  "put_the_tea_tin_inside_the_pill_bottle": "queue_impossible",
+  "stop": "stop",
+  "stop_right_now": "stop"
+}

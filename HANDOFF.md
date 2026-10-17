@@ -1,0 +1,213 @@
+# VARA implementation handoff (written 2026-10-17, 13:10 local, by the Claude Code coordinator session)
+
+This file is for whoever picks the work up next (a person or another coding agent). It says what exists,
+how it was verified, what is still running, what is open, and what must never be done without the team.
+Read `CLAUDE.md` first (goal, commands, hard rules, arm hazards); it still binds everything below.
+
+## 1. Where things stand in one paragraph
+
+Every software module in the CLAUDE.md repo map has been implemented against the contracts in
+`docs/interfaces.md` / `schemas/` / `tests/contract/`, using fakes wherever the real arm, cameras, xAI or
+Daytona would be needed. Each module was written by one agent, then attacked by an independent verifier
+(re-running the acceptance commands, writing probe scripts, mutation-testing the tests, blocking sockets and
+devices), then fixed and re-verified. About 33,900 lines of Python exist in 27 test files plus the packages;
+the last whole-tree run reported by a verifier was 741 passed with several lanes mid-edit. **Nothing has been
+committed yet**: the working tree holds all of it as untracked files on `master` (single kit commit
+`514540b`). Four background workflows are still running (section 6); the final whole-tree verification,
+docs ticks and task-sized commits come after they finish.
+
+## 2. Environment (verified on this laptop)
+
+- Python venv: `.venv` built with `uv` (Python 3.12.15) because `python3.12 -m venv` fails here. Use
+  `.venv/Scripts/python.exe` for everything; there is no `pip` in it (`uv pip install --python
+  .venv/Scripts/python.exe ...`). Installed: mujoco 3.16, numpy 2.2, opencv-python-headless 4.13, fastapi
+  0.143, uvicorn 0.54, httpx 0.28, openai 3.33, daytona 0.225.0, jsonschema 4.26, gymnasium 1.4,
+  stable-baselines3 2.9, torch 2.11 CPU, lerobot 0.6.2 editable from `C:\Users\jesse\lerobot`.
+- Commands: `.venv/Scripts/python.exe -m pytest -q`, `.venv/Scripts/python.exe -m ruff check .`,
+  `.venv/Scripts/python.exe -m ruff format .`. The repo is LF everywhere (`core.autocrlf=true`); check new
+  files for carriage returns. Timing-sensitive tests slow down when many test runs share the CPU.
+- Daytona 0.225 and xAI realtime API names were verified by introspection and docs; see
+  `docs/implementation-brief.md` section 4 (agents/sandbox_pool.py, orchestrator /voice/token).
+- No arm, camera, `.env` or API key exists in the coordinator session. `FAKE=1` (or the individual
+  `FAKE_LLM`, `FAKE_SANDBOX`, `FAKE_ROBOT`, `FAKE_CAMERA`) runs everything offline.
+
+## 3. The brief every agent worked from
+
+`docs/implementation-brief.md` (copied from the coordinator's scratchpad) is the binding design: repo-wide
+conventions (section 1), measured geometry (2), shared config (3), public interfaces per module (4), model
+files (5), fakes and the end-to-end path (6), reporting format (7), decisions after the foundation stage (8),
+the glue stage (9), verified facts from the integration stage (9.8) and the open items list (9.9). Sections 8
+and 9 override 2 and 4 where they differ. The contracts always win over the brief.
+
+## 4. What was built, by stage
+
+### Stage 1, foundation (verified, all green)
+
+- `sim/model/`: upstream SO-101 MJCF (`so101_new_calib.xml`) edited: base at `pos="-0.0388353 0 0"` so the
+  contract frame is the MuJoCo frame; gripper collision meshes replaced by fitted boxes (`gripper_housing`,
+  `finger_fixed`, `finger_moving`); sites `tip` (closed-jaw midpoint) and `grasp` (2.46 cm along the closing
+  direction; the jaw is asymmetric so picks target `grasp`); `arm_only.xml`; `build_scene.py` generates
+  `scene_ours.xml` from `config/*` (table, tray floor + 4 walls, free bodies per object, mocap obstacles and
+  hand). `tests/test_model.py` checks structure, gravity hold, grasp clearance.
+- `arm/ik.py`: damped least squares with finite-difference Jacobian, planar reach pre-check, pitch ladder
+  (-75, -60, -45, -30, -15, 0 deg) because the 0.251 m arm cannot point straight down at the tray; `fk`,
+  `fk_tip`, `fk_grasp`, `jaw_axes`, `solve`, `solve_exact`, `solve_grasp`, `grasp_offset()`; < 2 ms per solve on
+  demo targets. `config/limits.yaml` (MJCF ranges; A6 replaces them) and `config/joint_map.yaml` (sign 1 /
+  offset 0 placeholders, gripper closed_pct 0 / open_pct 100, `lerobot_id: my_awesome_follower_arm`).
+- `arm/driver.py`: `Driver` (LeRobot 0.6.2 `lerobot.robots.so_follower`, goal sync before every torque
+  enable, strain refusal, `disable_torque_on_disconnect=False`, clips to limits-3 deg and 2 deg per call,
+  non-finite targets raise, `freeze`/`resume`/`torque_off`/`torque_on`, `close_gripper_hold` holding at the
+  contact reading minus 3 on the 0-100 scale), `FakeDriver`, `get_driver()`, `EscWatcher`, `--real --jog` CLI.
+  `get_driver()` returns an UNCONNECTED real driver; `--real` CLIs connect after the human confirms.
+- `sim/candidate_check.py` (`check_source`, re-exported by `agents/candidates.py`), `sim/success.py`
+  (`evaluate`, `already_true`, `resolve_object`; obstacles resolvable by name, `$zone` substitution),
+  `arm/replay.py::validate` + `bridge`, `load_limits`, `load_box`. `tests/contract/` runs with nothing skipped.
+- `sim/restricted.py`: the trimmed-builtins namespace AI code runs in (restricted `__import__` serving only
+  `math`, `print` to stderr, `load_entry(src, entry)` after `check_source`). The only execution points of
+  AI-written code are `sim.run_candidate`'s child process and `rl.train`'s workers.
+- `web/`: dashboard (`index.html`, `static/app.js`, `static/style.css`) and voice page (`voice.html`,
+  `static/voice.js`) per B9/A14, Chart.js 4.4.1 pinned with SRI, verified in headless Edge against a stub
+  orchestrator; later polished (no DOMContentLoaded gate, caps, deadlines, STOP re-sends).
+
+### Stage 2, integration (verified; last two chains finishing, see section 6)
+
+- `arm/sim_robot.py` (A8): MuJoCo `SimRobot` implementing the Robot API verbatim; grasp recipe on the
+  `grasp` site, held object re-posed after every step, contact bookkeeping with body-name phrases
+  ("gripper hit cereal_box", "held juice_box hit tray"), self-contacts counted, 2 deg/tick cap, every
+  recorded trajectory passes `validate` (box-leaving sweeps are re-planned as Cartesian lines),
+  `SimTimeLimit(BaseException)` at 60 simulated seconds, `run_skill` through `sim.restricted`,
+  `run_entry` guard against candidates calling `reset`/`set_skill`. Measured `ROLL_OFFSET = -1.529` with
+  `wrist_roll = angle + shoulder_pan + ROLL_OFFSET` (the brief's minus sign was wrong). One place_in_tray is
+  ~11 s simulated, 0.5 s wall.
+- `skills/_starter/hand_over.json`, `place_in_tray.json` (A12): trusted, measured `sim: 5/5` through the
+  runner for juice_box, pill_bottle and tea_tin.
+- `sim/run_candidate.py` + `sim/scoring.py` (C4): the CLI from CLAUDE.md, one spawn child streaming a JSON
+  line per trial, per-trial wall-clock timeout with kill (no orphans), stdout holds only the score line,
+  `out/traj.json`, `final_scene.json`, `score.json`, `trials.json`; `perturb_scene`, `summarize`, `rank`.
+  A fix pass for minor findings (KeyboardInterrupt in a candidate, huge error text, NaN scene values,
+  non-UTF-8 files) is running now.
+- `arm/replay.py::replay` + `arm/real_robot.py` (A9/A10/A13): 30 Hz streaming, bridging at 1 deg/tick,
+  tip-speed caps 0.2 and 0.1 m/s near the hand by sub-stepping, grip check against `held_min`, 10 cm hand
+  freeze, close refused near the hand, `home`, `freeze`, `carry_to_hand` (IK tracking at 10 Hz, steady-hand
+  release, handoff-zone fallback, optional RL policy), `--real`/`--fake` CLIs. A second fix pass is running
+  for two findings: hand tracking that could push a held object into the table for far hand positions,
+  and an Esc during `Driver.connect()` being discarded by the CLI (the driver side is being fixed separately).
+- `agents/llm.py`, `agents/router.py`, `agents/candidates.py`, `agents/prompts/*.md` (C1-C3, C7 repair):
+  xAI client with json_schema-then-text fallback, budgeted retries, key scrubbing, llm.jsonl logging; fake
+  layout `tests/fixtures/llm/` (aliases, 16 router replies, 6+6+6 candidates, 4 rewards); router with the
+  predicate rules, already-done check, keyword fallback, 20 phrases in `tests/fixtures/router_phrases.json`
+  (`python -m agents.router --eval --fake` = 20/20); six-hint candidate generation, repair, routine candidate.
+- `vision/` (B1-B8): synthetic pinhole camera (f = 450 px; the brief's 600 px could not see its own
+  calibration markers), `FakeCamera` rendering real ArUco markers with height parallax, `markers`,
+  `calibrate` (homography, height correction, `config/homography.npy`), `SceneTracker` at 10 Hz with
+  median-5 filter and 0.5 s seen timeout (real chain on the fake camera: < 1 mm, < 3 deg), `FakeSceneTracker`,
+  `verify`/`take_after`, `scripts/make_markers.py`, `scripts/touch_markers.py` (I2, `--fake` works).
+- `rl/handoff_env.py`, `rl/rewards/baseline.py`, `rl/train.py`, `rl/evaluate.py` (D1/D2): Gymnasium env
+  with the 16-float observation (tip from forward kinematics of the measured joints), randomizations,
+  env-level fall penalty (-50, decided; the formula alone made the policy learn to fall), SB3 PPO trainer with
+  the reward loaded through `sim.restricted` inside each worker, progress.csv/checkpoints/summary.json.
+  A 131k-step check reached 25/50 successes; the 500k D2 run is part of the RL glue chain.
+
+### Stage 3, glue (running now)
+
+Skill library (`agents/library.py`), RL glue (`rl/rewards/write_rewards.py`, `rl/train_parallel.py`,
+`rl/policy_runner.py`, `rl/render_video.py`, D2 baseline run + D-GO evaluation), sandbox pool and planner
+(`agents/sandbox_pool.py`, `agents/planner.py`, `scripts/daytona_smoke.py`), orchestrator and end-to-end
+script (`agents/orchestrator.py`, `scripts/e2e_fake.py`, `tests/test_orchestrator.py`,
+`tests/test_scaffold.py`), fixture-candidate tuning against the runner, hardening of router/web/vision/test
+pinning, driver hardening, and a four-lens read-only audit. Their specs are brief sections 9.1-9.6 and 9.9.
+
+## 5. Decisions and measured facts you must not re-derive
+
+- Frame: origin under the pan axis; `fk(home_q)` = (0.1155, 0, 0.2745) with `home_q = [0, -1.35, 0.02,
+  1.45, 0]` (the kit's placeholder put the gripper inside the tea tin).
+- Reach: upper arm 0.116 + forearm 0.135 = 0.251 m; straight-down picks only near the base; the tray needs
+  -45 to -30 deg; transit at z 0.28 only near pitch 0 and within ~0.38 m; the workspace box contains
+  unreachable corners (`move_to` returns False there by design).
+- Scene layout (config/fake_scene.json and config/scene.yaml): cereal box at (0.28, 0.07), handoff zone
+  and parked hand at (0.28, -0.08), tea tin at (0.16, -0.02), tray slots 5 cm apart
+  `[[0.275, 0.195], [0.325, 0.195], [0.275, 0.245], [0.325, 0.245]]`. With the kit's box at (0.24, 0.11) every
+  tray slot was in the box's bearing cone and the stretched forearm clipped it on every release pose. Slot 2
+  still collides (SimRobot skips it); the z 0.28 transit above slot 4 is IK-infeasible. A15 re-tapes the
+  real table; after any change run `python -m sim.model.build_scene` and re-score the starters.
+- Driver: `command()` returns bool (False while stopped/torque off), non-finite raises, unconnected raises;
+  `close_gripper_hold`; `limits()`/`joint_map()` raise on malformed config.
+- Grasp: open fully (1.0) before descending; attach test on the grasp center within 1.0 cm, 20-80 % height,
+  20 deg yaw; tea tin lands on its side in the tray in sim because the contract's release height plus the
+  forced tilt drops it 4 cm (real-table risk; lower tray wall or nearer tray).
+- Runner: `SAFE_BUILTINS` needs the restricted `__import__` or `import math` fails at exec; per-trial
+  results in `out/trials.json`; the orchestrator puts `trial_results`, `runner`, `hint` into
+  `candidate_scored` details (dashboard reads them).
+- Router rules: learn specs use concrete names and `params: {}`, `in_zone` only with `tray`, no obstacle
+  names in predicates, unseen objects -> queue.
+- Vision: items never detected are omitted from the published scene; `take_after` needs `before` to resolve
+  "*"; `calibration_error` raises without markers in view (orchestrator catches it).
+- RL: env-level fall penalty stays; D4 prompts must name `info["fell"]`, `info["step"]`, `info["success"]`;
+  policies start from home +-5 deg (widen before D7).
+
+## 6. Workflows running at the time of writing
+
+| Workflow | Items | State |
+| --- | --- | --- |
+| vara-integration | runner fix pass; replay second fix pass | last two chains |
+| vara-glue-a | library; RL glue incl. D2 500k run and D-GO number | implementing |
+| vara-glue-b | pool+planner; orchestrator+e2e; fixture tuning; router/web/vision hardening; test pinning | implementing |
+| vara-glue-c | driver hardening; four read-only auditors | implementing |
+
+Agent transcripts and per-agent reports (`journal.jsonl`, one `result` line per agent) live under
+`C:\Users\jesse\.claude\projects\C--Users-jesse-GitHub-VARA\8a8822bb-1a8e-4bea-8e33-2fdce982b538\subagents\workflows\<run id>\`.
+Each engineer's final message lists files written, exact commands with last lines, assumptions, unfinished
+work, and where the brief or contract looked wrong; each verifier's verdict lists reproduced commands and
+problems with severity. Read those before changing a module.
+
+## 7. Still to do after the workflows finish (the final hardening stage)
+
+1. Apply the verifier findings in brief section 9.9 that touch files that were in flux: rise-first
+   `carry_to_hand` in both `arm/sim_robot.py` and `arm/real_robot.py` (then re-score the starters, rule in
+   `.claude/rules/arm.md`), `pick()` while holding re-reads the pose, tip-speed re-measure on straight legs,
+   `place()` default release on tall objects; `arm/replay.py` adopting the driver's new gripper helpers and
+   failing loud on a non-dict scene; `rl/train.py` OverflowError guard, reward time budget, `--out ""`.
+2. Fold in the four audit lenses' findings (safety, secrets/isolation, discipline, docs/CLI).
+3. Whole-tree gates: `pytest -q` with nothing skipped, `ruff check .`, `ruff format --check .`,
+   `python scripts/e2e_fake.py "put the juice box in the tray"` ending in `saved`, every hardware-free
+   Done-when in `docs/tasks/*.md`, no CRLF files, `git add config/homography.npy` and
+   `rl/policies/handoff_best.zip` (binaries), `.env.example` updated with every variable the code reads.
+4. Tick the progress boxes in `docs/tasks/*.md` only for tasks whose hardware-free Done-when passed; write
+   the D-GO number and decision at the top of `docs/tasks/D-rl.md`.
+5. Commit in task-sized commits, message `<ID>: <title>`, ending with
+   `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>`; never push without asking.
+
+## 8. Needs hardware, keys or the team (not done, by design)
+
+- Arm: A1-A3 (install, ports, calibration/teleop), A4 `--real --jog`, A6 joint map and 1.5 cm accuracy check,
+  A9 real replay 4/5, A10 carry test, A11 gripper measurements and object choice, A12 real replays, A13 Esc
+  latency on hardware, A15 demo choreography, I2 touch markers, I3 first real learn, M gates.
+- Camera: B1 30-minute soak, B3 printing, B4 mount and `Hc`/`c`, B5 live calibration, B6 live accuracy,
+  B8 one wrist still per grasp (planned in the orchestrator's replay hook).
+- Keys: C1 `--ping`, C2 live `--eval`, C5/C6 Daytona snapshot and pool, D3/D5 Daytona training, A14 live
+  voice session; whether xAI accepts the router's oneOf/pattern JSON schema as `json_schema` output is
+  unverified (a 4xx takes the plain-text path by design).
+- D6 video needs a working OpenGL context (the RL glue agent reports whether it works here); D7 needs M4.
+
+## 9. Contract disagreements found (do not change contracts without the team)
+
+- `tests/fixtures/trajectory_ok.json` has shoulder_lift -1.75 rad, outside `config/limits.yaml` with the
+  3 deg margin; the contract test passes only with its own +-1.9 limits. Never use it as a replayable path.
+- `docs/interfaces.md` scene example still shows the kit's 4 cm tray slots and the old handoff zone.
+- `docs/tasks/A-arm.md` A4 snippet is stale for LeRobot 0.6.2 (import path, id, 6-name JOINTS).
+- The brief's `set_roll` formula sign and the 600 px synthetic camera were wrong (fixed in code, see 5).
+- `in_zone` with the `handoff` zone (no radius) raises; the router never emits it.
+- `tests/test_ik.py` demo-target timing: reachable targets 20 ms, unreachable ones 60 ms (CPU-load tolerance).
+
+## 10. Rules of engagement that were followed and must stay
+
+- AI-written code executes only through `sim.restricted.load_entry` inside `sim.run_candidate`'s child or
+  `rl.train`'s workers; never in the orchestrator process.
+- The real arm moves only through `arm.replay.replay()` over a `validate()`-accepted trajectory or the
+  primitives in `arm/real_robot.py`, only with `--real`, after a typed confirmation and a 3 s countdown,
+  with Esc watched. STOP freezes with torque on.
+- Keys come from `.env` via `load_dotenv()` in entry points only; never printed, logged, returned, or sent
+  to the browser (the voice page gets a 300 s token from `POST /voice/token`).
+- Tests never touch the network, serial ports or cameras; verifiers ran the suites with all three blocked.
+- Sandboxes are created only by `agents/sandbox_pool.py` (cap 7), `rl/train_parallel.py` (cap 4) and
+  `scripts/daytona_smoke.py`, and deleted on shutdown.

@@ -1,0 +1,25 @@
+# Maps LeRobot follower readings to our joint vector. Only arm/driver.py reads this file.
+#
+# LeRobot (use_degrees=True) reports each arm joint in degrees and the gripper on a 0 to 100 scale; our code
+# uses radians and a gripper value from 0.0 (closed) to 1.0 (open). Per joint:
+#   q_rad = radians(sign * lerobot_deg + offset_deg)
+#   lerobot_deg = (degrees(q_rad) - offset_deg) / sign
+# Gripper:
+#   gripper = (pct - closed_pct) / (open_pct - closed_pct), clipped to [0, 1]
+#
+# PLACEHOLDERS: sign 1 and offset_deg 0.0 for every joint, gripper 0 to 100, until A6 measures them against the
+# MuJoCo model (send +20 degrees on one joint, compare with +0.349 rad in the viewer) and A11 records the
+# gripper's closed and open readings. Redo A6 after any recalibration: LeRobot's 0 is the midpoint of each
+# joint's calibrated range, so the offsets depend on the calibration file.
+#
+# lerobot_robot_type is the registry name for `--robot.type`. The demo laptop's LeRobot 0.6.2 (Seeed fork,
+# module lerobot.robots.so_follower) registers SOFollowerRobotConfig under both "so101_follower" and
+# "so100_follower" (config_so_follower.py), so this value works there and on upstream releases.
+lerobot_id: my_awesome_follower_arm
+lerobot_robot_type: so101_follower
+shoulder_pan: {sign: 1, offset_deg: 0.0}
+shoulder_lift: {sign: 1, offset_deg: 0.0}
+elbow_flex: {sign: 1, offset_deg: 0.0}
+wrist_flex: {sign: 1, offset_deg: 0.0}
+wrist_roll: {sign: 1, offset_deg: 0.0}
+gripper: {closed_pct: 0, open_pct: 100}

@@ -1,0 +1,31 @@
+{
+  "action": "learn",
+  "spec": {
+    "name": "tray_all_but_tea_tin",
+    "description": "Put the pill bottle and the juice box into the tray and leave the tea tin where it is.",
+    "params": {},
+    "success": {
+      "all": [
+        {
+          "in_zone": {
+            "object": "pill_bottle",
+            "zone": "tray"
+          }
+        },
+        {
+          "in_zone": {
+            "object": "juice_box",
+            "zone": "tray"
+          }
+        },
+        {
+          "not_moved": {
+            "object": "tea_tin",
+            "max": 0.02
+          }
+        }
+      ]
+    },
+    "english": "The pill bottle and the juice box end inside the tray, and the tea tin stays where it is."
+  }
+}
