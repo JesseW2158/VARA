@@ -50,8 +50,8 @@ folder of its own, the repo's are used.
 
     python -m agents.orchestrator [--port 8000] [--real] [--bench-demo]
 
-`--real` asks the human to confirm the arm is clear, connects the driver (and watches Esc, which freezes
-the arm like `/stop`), then serves; without it and without FAKE_ROBOT/FAKE the server runs but any stage
+`--real` watches Esc, asks the human to confirm the arm is clear, counts down 3 s, then connects and serves.
+Esc freezes the arm like `/stop`; without `--real` and without FAKE_ROBOT/FAKE the server runs but any stage
 that would move the arm ends the task with `error` `{"error": "arm not connected: start with --real"}`.
 `--bench-demo` forces FAKE=1 and DEMO_MODE=1 and runs five learns of "clear the table" through FastAPI's
 TestClient, printing the seconds from the command to `executing` (or `queued`) for each.
@@ -1579,30 +1579,41 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.bench_demo:
         return bench_demo(runs=args.runs)
     watcher = None
-    if args.real:
-        driver = driver_mod.get_driver()
-        if getattr(driver, "is_fake", False):
-            print("FAKE_ROBOT is set: --real connects the in-memory arm only.")
-        else:
-            print("This powers the SO-101 follower arm. Make sure the arm and the table are clear.")
-            if input("Type yes to connect the arm: ").strip().lower() != "yes":
-                print("not confirmed; nothing connected")
-                return 1
-        driver.connect()
-        watcher = driver_mod.EscWatcher(lambda: orch.stop("Esc pressed"))
-        watcher.start()
-        print("arm connected; Esc in this console or STOP on the dashboard freezes it")
-    elif not _fake("FAKE_ROBOT"):
-        print(
-            "the arm stays disconnected (start with --real to use it); tasks that would move it end as error"
-        )
-    import uvicorn
-
+    driver = None
     try:
+        if args.real:
+            driver = driver_mod.get_driver()
+            # The lifespan has not started yet: STOP must already reach the driver during connect().
+            orch.driver = driver
+            watcher = driver_mod.EscWatcher(lambda: orch.stop("Esc pressed"))
+            watcher.start()
+            if getattr(driver, "is_fake", False):
+                print("FAKE_ROBOT is set: --real connects the in-memory arm only.")
+            elif not real_robot.confirm_arm_clear(3, watcher):
+                return 1
+            if watcher.pressed or driver.stopped or real_robot.cancelled() or orch.stop_event.is_set():
+                print("startup stopped; nothing connected")
+                return 1
+            driver.connect()
+            if watcher.pressed or driver.stopped or real_robot.cancelled() or orch.stop_event.is_set():
+                orch.stop("stopped while connecting")
+                print("startup stopped; arm frozen with torque on")
+                return 1
+            print("arm connected; Esc in this console or STOP on the dashboard freezes it")
+        elif not _fake("FAKE_ROBOT"):
+            print(
+                "the arm stays disconnected (start with --real to use it); "
+                "tasks that would move it end as error"
+            )
+        import uvicorn
+
         uvicorn.run(app, host=args.host, port=args.port, log_level="info")
     finally:
         if watcher is not None:
             watcher.stop()
+        # The lifespan normally disconnects. Also cover an abort or exception before it starts.
+        if driver is not None and getattr(driver, "connected", False):
+            driver.disconnect()  # torque stays on
     return 0
 
 

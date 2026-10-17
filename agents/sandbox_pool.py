@@ -731,6 +731,8 @@ class SandboxPool:
         slot = _Slot(sandbox=sandbox, role=role, number=number)
         with self._lock:
             self._slots.append(slot)
+            # creates finish in any order; keep sandbox 1..N order for status, logs and the dashboard
+            self._slots.sort(key=lambda s: s.number)
         for attempt in (1, 2):
             try:
                 self._ensure_bundle(slot)

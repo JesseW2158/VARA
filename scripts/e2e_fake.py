@@ -1,7 +1,7 @@
 """Fake end-to-end run of the orchestrator (S0 item 7): one command through FastAPI's TestClient.
 
-    python scripts/e2e_fake.py "put the juice box in the tray" [--reset] [--timeout 240]
-    python scripts/e2e_fake.py --reset            # only restore the two starter skills
+    python scripts/e2e_fake.py "put the juice box in the tray" [--in-place] [--reset] [--timeout 240]
+    python scripts/e2e_fake.py --reset            # only restore the two starter skills in skills/
 
 `FAKE=1` is forced before the orchestrator is imported (DEMO_MODE is left as the environment has it), so no
 model, sandbox, arm or camera is touched. The script POSTs `/command`, follows `runs/<task_id>/events.jsonl`
@@ -9,9 +9,15 @@ and prints one `stage  summary` line per event until an end stage (`saved`, `que
 `error`; `not_saved` is printed and followed, since the orchestrator then re-plans once). It exits 0 only
 when the last stage is `saved`, or `done` with `ok` not false. For "put the juice box in the tray" the
 expected trace is routing -> spec_ready -> writing_code x6 -> simulating -> candidate_scored x6 -> selected
--> validating -> executing -> verifying -> saved, and `skills/juice_box_to_tray.json` is left in place (the
-name is printed); `--reset` then POSTs `/reset_demo`, which archives it and restores exactly the two starters.
-`VARA_SKILLS_DIR` and `VARA_RUNS_DIR` move the library and the run folders (the scaffold test uses copies).
+-> validating -> executing -> verifying -> saved, and the learned `juice_box_to_tray.json` is printed.
+
+The library is a copy by default: a fake-learned skill in the real skills/ would make the next live
+"put the juice box in the tray" replay it instead of learning on stage, and tests/test_scaffold.py and
+tests/test_orchestrator.py fail while it is there. With a command, skills/ is copied to
+`runs/e2e_fake/<UTC stamp>/skills` (runs/ is gitignored) and the run uses the copy. `--in-place` uses skills/
+itself; `--reset` then POSTs `/reset_demo`, which archives the learned skill and restores exactly the two
+starters. `--reset` without a command always works on skills/. An explicit `VARA_SKILLS_DIR` (the scaffold
+test's copies) wins over both; `VARA_RUNS_DIR` moves the run folders.
 """
 
 from __future__ import annotations
@@ -19,6 +25,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import sys
 import time
 from collections.abc import Mapping, Sequence
@@ -117,10 +124,27 @@ def follow(client: Any, runs_dir: Path, task_id: str, timeout: float) -> str | N
     return None
 
 
+def copy_library() -> Path:
+    """skills/ copied to runs/e2e_fake/<UTC stamp>/skills, so a fake learn never lands in the real library."""
+    runs = Path(os.environ.get("VARA_RUNS_DIR") or ROOT / "runs")
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+    dest = runs / "e2e_fake" / stamp / "skills"
+    n = 1
+    while dest.exists():  # two runs in the same second
+        n += 1
+        dest = runs / "e2e_fake" / f"{stamp}-{n}" / "skills"
+    shutil.copytree(ROOT / "skills", dest)
+    print(f"skills library: a copy in {dest} (--in-place uses skills/)", flush=True)
+    return dest
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="fake end-to-end run through the orchestrator")
     parser.add_argument("text", nargs="?", default=None, help=f'the command (default: "{DEFAULT_TEXT}")')
     parser.add_argument("--reset", action="store_true", help="POST /reset_demo afterwards (or alone)")
+    parser.add_argument(
+        "--in-place", action="store_true", help="learn into skills/ itself instead of a copy under runs/"
+    )
     parser.add_argument("--timeout", type=float, default=240.0, help="seconds to wait for an end stage")
     args = parser.parse_args(argv)
     if args.text is None and not args.reset:
@@ -129,6 +153,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     reconfigure = getattr(sys.stdout, "reconfigure", None)
     if reconfigure is not None:  # the hints hold a pi; a cp1252 console must not crash the run
         reconfigure(encoding="utf-8", errors="replace")
+
+    if args.text is not None and not args.in_place and not os.environ.get("VARA_SKILLS_DIR"):
+        os.environ["VARA_SKILLS_DIR"] = str(copy_library())  # before the orchestrator reads it
 
     from fastapi.testclient import TestClient
 

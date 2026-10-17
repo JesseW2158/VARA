@@ -874,3 +874,116 @@ def test_video_streams_send_two_parts_within_two_seconds(env, monkeypatch) -> No
         server.should_exit = True
         thread.join(15)
     assert not thread.is_alive()
+
+
+@pytest.fixture
+def real_cli(env, monkeypatch):
+    """Exercise real CLI ordering with an in-memory driver and no keyboard or HTTP server."""
+    orch = Orchestrator()
+    driver = driver_mod.FakeDriver()
+    driver.is_fake = False
+    driver.connected = False
+    calls = []
+
+    class Watcher:
+        def __init__(self, callback):
+            self.callback = callback
+            self.pressed = False
+
+        def start(self):
+            calls.append("watching")
+
+        def stop(self):
+            calls.append("watcher stopped")
+
+    watcher = Watcher(lambda: orch.stop("Esc pressed"))
+    original_connect = driver.connect
+
+    def connect():
+        assert calls[0] == "watching"
+        assert orch.driver is driver
+        calls.append("connect")
+        original_connect()
+
+    monkeypatch.setattr(orchestrator, "orch", orch)
+    monkeypatch.setattr(driver_mod, "get_driver", lambda: driver)
+    monkeypatch.setattr(driver_mod, "EscWatcher", lambda callback: watcher)
+    monkeypatch.setattr(driver, "connect", connect)
+    monkeypatch.setattr(orchestrator.real_robot, "cancelled", lambda: False)
+    monkeypatch.setattr("builtins.input", lambda prompt: "yes")
+    monkeypatch.setattr(orchestrator.real_robot.time, "sleep", lambda seconds: calls.append(seconds))
+    monkeypatch.setattr(uvicorn, "run", lambda *args, **kwargs: calls.append("serve"))
+    return orch, driver, watcher, calls
+
+
+def test_real_cli_watches_countdown_and_connect_then_serves_same_driver(real_cli, monkeypatch):
+    orch, driver, watcher, calls = real_cli
+
+    def serve(*args, **kwargs):
+        assert driver.connected and orch.driver is driver
+        assert sum(item for item in calls if isinstance(item, float)) == pytest.approx(3.0)
+        with TestClient(orchestrator.app):
+            assert orch.driver is driver
+            watcher.callback()
+            assert driver.stopped and orch.state == "stopped"
+        calls.append("serve")
+
+    monkeypatch.setattr(uvicorn, "run", serve)
+    assert orchestrator.main(["--real"]) == 0
+    assert calls.count("connect") == 1
+    assert calls[-2:] == ["serve", "watcher stopped"]
+    assert not driver.connected and driver.torque
+    assert driver.commands == []
+
+
+@pytest.mark.parametrize("stop_at", ["declined", "countdown", "before_connect", "cancelled"])
+def test_real_cli_abort_never_connects_or_serves(real_cli, monkeypatch, stop_at):
+    orch, driver, watcher, calls = real_cli
+    if stop_at == "declined":
+        monkeypatch.setattr("builtins.input", lambda prompt: "no")
+    elif stop_at == "countdown":
+        watcher.pressed = True
+    elif stop_at == "before_connect":
+        driver.freeze()
+    else:
+        monkeypatch.setattr(orchestrator.real_robot, "cancelled", lambda: True)
+    assert orchestrator.main(["--real"]) == 1
+    assert "connect" not in calls and "serve" not in calls
+    assert calls[-1] == "watcher stopped"
+    assert not driver.connected and driver.commands == []
+
+
+@pytest.mark.parametrize("signal", ["esc", "driver", "cancel"])
+def test_real_cli_stop_during_connect_freezes_and_closes_before_serving(real_cli, monkeypatch, signal):
+    orch, driver, watcher, calls = real_cli
+    original_connect = driver.connect
+
+    def connect():
+        original_connect()
+        if signal == "esc":
+            watcher.pressed = True
+            watcher.callback()
+        elif signal == "driver":
+            driver.freeze()
+        else:
+            monkeypatch.setattr(orchestrator.real_robot, "cancelled", lambda: True)
+
+    monkeypatch.setattr(driver, "connect", connect)
+    assert orchestrator.main(["--real"]) == 1
+    assert "serve" not in calls and calls[-1] == "watcher stopped"
+    assert driver.stopped and orch.state == "stopped"
+    assert not driver.connected and driver.torque
+    assert driver.commands == []
+
+
+def test_real_cli_cleans_up_when_server_start_fails(real_cli, monkeypatch):
+    orch, driver, watcher, calls = real_cli
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("server startup failed")
+
+    monkeypatch.setattr(uvicorn, "run", fail)
+    with pytest.raises(RuntimeError, match="server startup failed"):
+        orchestrator.main(["--real"])
+    assert not driver.connected and driver.torque
+    assert calls[-1] == "watcher stopped"
