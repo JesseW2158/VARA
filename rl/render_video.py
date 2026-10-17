@@ -5,11 +5,11 @@
 
 Frames come from `HandoffEnv(render_mode="rgb_array")`, an offscreen `mujoco.Renderer` of the side camera
 with the target in green and the tip in red, one environment step per frame (30 Hz, so `--fps 30` plays in
-real time), written with `cv2.VideoWriter` (mp4v, 640x480) under a text overlay (episode, step, distance,
+real time), encoded with PyAV (H.264/yuv420p, 640x480) under a text overlay (episode, step, distance,
 successes). Every episode's target drifts at `--drift` m/s in a random direction, bouncing off the target
 box (the env's own 30 % drift probability is too low for a demo clip). Exit codes: 0 written, 2 bad
 arguments or a missing policy, 3 the renderer or the video writer could not initialize (no OpenGL/GLFW,
-no mp4v codec): the reason is printed and the dashboard shows its fallback text. `render_video(...)` is the
+no H.264 encoder): the reason is printed and the dashboard shows its fallback text. `render_video(...)` is the
 function behind the CLI and raises `RendererUnavailable` instead of exiting; the tests never need a working
 renderer.
 """
@@ -18,8 +18,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import pathlib
 import sys
+import tempfile
 from collections.abc import Sequence
 from typing import Any
 
@@ -40,6 +42,42 @@ FONT = cv2.FONT_HERSHEY_SIMPLEX
 
 class RendererUnavailable(RuntimeError):
     """The offscreen renderer or the video writer could not start (exit code 3 in the CLI)."""
+
+
+class _VideoWriter:
+    """Encode browser-compatible MP4; publish only after the stream is flushed."""
+
+    def __init__(self, path: pathlib.Path, fps: int, width: int, height: int) -> None:
+        try:
+            import av
+        except ImportError as exc:
+            raise RendererUnavailable("H.264 encoding requires av from requirements-rl.txt") from exc
+        self.av = av
+        self.closed = False
+        self.container = av.open(str(path), mode="w", options={"movflags": "+faststart"})
+        try:
+            self.stream = self.container.add_stream("libx264", rate=fps)
+            self.stream.width = width
+            self.stream.height = height
+            self.stream.pix_fmt = "yuv420p"
+            self.stream.options = {"crf": "20", "preset": "fast"}
+        except Exception:
+            self.container.close()
+            raise
+
+    def write(self, frame: np.ndarray) -> None:
+        for packet in self.stream.encode(self.av.VideoFrame.from_ndarray(frame, format="bgr24")):
+            self.container.mux(packet)
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        try:
+            for packet in self.stream.encode():
+                self.container.mux(packet)
+        finally:
+            self.container.close()
 
 
 def _drift(env: HandoffEnv, rng: np.random.Generator, speed: float) -> None:
@@ -74,19 +112,25 @@ def render_video(
     """Write `seconds` of the policy chasing a drifting target to `out_path`; returns what was written.
 
     Raises ValueError for bad numbers, FileNotFoundError for a missing policy and RendererUnavailable
-    when the offscreen renderer or the mp4v writer cannot start.
+    when the offscreen renderer or the H.264 writer cannot start. Existing output is preserved on failure.
     """
-    if not (float(seconds) > 0) or int(fps) < 1:
-        raise ValueError("seconds must be positive and fps at least 1")
+    if not math.isfinite(float(seconds)) or float(seconds) <= 0:
+        raise ValueError("seconds must be finite and positive")
+    if not math.isfinite(float(fps)) or int(fps) != fps or fps < 1:
+        raise ValueError("fps must be a positive integer")
+    if not math.isfinite(float(drift)) or float(drift) < 0:
+        raise ValueError("drift must be finite and non-negative")
+    total = max(1, int(round(float(seconds) * int(fps))))
+    rng = np.random.default_rng(int(seed))
     out = pathlib.Path(out_path)
     out.parent.mkdir(parents=True, exist_ok=True)
     model = policy if policy is not None else load_policy(policy_path)
     env = HandoffEnv(render_mode="rgb_array")
-    writer: Any = None
-    total = max(1, int(round(float(seconds) * int(fps))))
+    writer: _VideoWriter | None = None
     frames = episodes = successes = 0
     width = height = 0
-    rng = np.random.default_rng(int(seed))
+    staging = tempfile.TemporaryDirectory(prefix=".render-", dir=out.parent)
+    pending = pathlib.Path(staging.name) / "clip.mp4"
     try:
         obs, info = env.reset(seed=int(seed))
         _drift(env, rng, float(drift))
@@ -99,9 +143,10 @@ def render_video(
         if frame is None:
             raise RendererUnavailable("HandoffEnv.render() returned no frame")
         height, width = int(frame.shape[0]), int(frame.shape[1])
-        writer = cv2.VideoWriter(str(out), cv2.VideoWriter_fourcc(*"mp4v"), float(fps), (width, height))
-        if not writer.isOpened():
-            raise RendererUnavailable(f"cv2.VideoWriter could not open {out} with the mp4v codec")
+        try:
+            writer = _VideoWriter(pending, int(fps), width, height)
+        except Exception as exc:
+            raise RendererUnavailable(f"H.264 video encoder could not initialize: {exc}") from exc
         writer.write(_annotate(frame, episodes + 1, info, successes))
         frames = 1
         while frames < total:
@@ -114,10 +159,18 @@ def render_video(
                 successes += int(info["success"])
                 obs, info = env.reset(seed=int(seed) + episodes)
                 _drift(env, rng, float(drift))
+        writer.close()
+        writer = None
+        pending.replace(out)
     finally:
-        if writer is not None:
-            writer.release()
-        env.close()
+        try:
+            if writer is not None:
+                writer.close()
+        finally:
+            try:
+                env.close()
+            finally:
+                staging.cleanup()
     return {
         "out": str(out),
         "frames": frames,
@@ -135,7 +188,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         prog="python -m rl.render_video", description="Record the hand-off policy chasing a drifting target"
     )
     parser.add_argument("--policy", default=str(DEFAULT_POLICY), help="policy.zip from rl/train.py")
-    parser.add_argument("--out", default=str(DEFAULT_OUT), help="MP4 to write (mp4v)")
+    parser.add_argument("--out", default=str(DEFAULT_OUT), help="MP4 to write (H.264/yuv420p)")
     parser.add_argument("--seconds", type=float, default=10.0)
     parser.add_argument("--fps", type=int, default=30, help="frames per second; 30 plays in real time")
     parser.add_argument("--seed", type=int, default=0)

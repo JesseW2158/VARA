@@ -2,3 +2,5 @@
 #   pip install torch --index-url https://download.pytorch.org/whl/cpu
 gymnasium
 stable-baselines3
+# H.264/yuv420p video for dashboard playback (OpenCV's mp4v fails in Edge).
+av>=15
