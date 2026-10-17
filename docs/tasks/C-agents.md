@@ -15,7 +15,7 @@ Lane C owns the learning loop and the glue: route a request and write its succes
 - [ ] C9 · Real execution and saving · Sat 6:00 AM (M1)
 - [ ] C8 · Planner for saved skills · Sat 12:30 PM
 - [ ] C6 · Sandbox pool · Sat 1:30 PM
-- [ ] C7 · Selection, repair and budgets · Sat 2:30 PM (M2)
+- [x] C7 · Selection, repair and budgets · Sat 2:30 PM (local scoring and fixture-model acceptance)
 - [x] C11 · Orchestrator hardening · Sat 3:00 PM
 - [x] C10 · Routines · Sat 5:00 PM (fake definition + replay verified; real integration remains I3)
 
@@ -118,6 +118,11 @@ Check class and method names against the [Daytona Python SDK](https://pypi.org/p
 Rank passing candidates per Contracts. In normal mode, if none pass, send the model the three best failures (code, score line, `fail_reason`) with "fix these failures", get six new candidates and score again; if none pass after that, the task becomes `queue`. With `DEMO_MODE=1`, enforce the budget table exactly: no repair round, the 75 s cap from command to arm moving, and `queued` on expiry.
 
 **Done when:** the repair round fixes at least one test task that failed the first time, and `python -m agents.orchestrator --bench-demo` shows 5 of 5 demo-mode runs reaching the arm, or `queued`, within 75 s.
+
+**Verified 2026-10-17:** an actual local MuJoCo first round rejected all six colliding programs;
+the repair pipeline produced six passing programs and saved the learned skill. Five isolated
+clear-table demo runs executed and saved within 8.6–11.8 s. See the verification record for artifacts.
+These checks use fixture model replies and a fake arm; C1/C5/C6 live-service gates remain open.
 
 ## C8 · Planner for saved skills (`agents/planner.py`)
 
