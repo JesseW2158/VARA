@@ -153,6 +153,8 @@ The latest camera check on 2026-10-17 opened configured camera 2 and wrist camer
 open failure; camera 0 was previously identified as the laptop webcam. Current captures show a low
 table-level view from camera 2 and a mostly dark/occluded wrist view, with no markers detected in either.
 Mount and measure the overhead camera, clear the wrist view, and complete the 30-minute camera soak.
+The longer attempt subsequently recorded late frames and was stopped early. An independent-reader
+diagnostic localized irregular timing to camera 2; B1 remains open pending a stable setup and full soak.
 The checked-in homography is synthetic; physical table calibration and STOP checks remain required
 before Cartesian replay. See the [verification record](docs/verification-2026-10-17.md) for evidence.
 

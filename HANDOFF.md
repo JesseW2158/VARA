@@ -4,25 +4,31 @@
 
 **Read this before the historical handoffs.** The user requested continued parallel work and an
 immediate durable handoff. The remaining software changes have passed the full gate and were saved
-in ten task-sized local commits; this documentation checkpoint is the eleventh. No remote push.
+in eleven task-sized local commits; a final B1 documentation commit records the camera failure. No remote push.
 
 **Final software gate: 1,406 tests passed, no skips, in 310.96 seconds.** Ruff check passes; format
 check reports 90 files already formatted. Whitespace/LF checks pass. `docs/interfaces.md`, schemas,
 contract tests, synthetic homography and selected policy ZIP were not changed. Final fake juice-box
 learn reached `saved`. Full evidence: [verification record](docs/verification-2026-10-17.md).
 
-### Running now: physical camera stability check
+### Physical camera stability check: failed acceptance
 
-- Unified exec session **59704** is running the real `vision.cameras --check 1800` (30 minutes),
-  configured camera 2 and wrist camera 1. It opens cameras only; it cannot move an arm.
-- Log: `runs/setup/camera-soak-20261017/camera-check.log`. On completion, the wrapper writes
-  `runs/setup/camera-soak-20261017/result.json`. Check the existing process/result before restarting.
-- Do not mark B1 complete until the full duration passes with both feeds and zero failed/late frames.
-  A five-second precursor passed: 148 frames per feed, about 29 fps, zero failures/late frames.
-- Camera 2 now opens, superseding its earlier open failure. Current captures in
-  `runs/setup/cameras/current/` show camera 2 looking across the table from a low position and a mostly
-  dark/occluded wrist view. Neither detected markers. The user replied **"Still preparing the table"**
-  to the calibration-measurement request. Camera transport stability does not establish calibration.
+- The attempted 30-minute check already accumulated 27 late-frame gaps on each feed by 185 seconds
+  (5,240 frames each, zero failed reads). It cannot pass B1's zero-drop criterion, so it was stopped
+  early after 193.77 wall seconds. It did **not** complete the requested 1,800 seconds.
+- Evidence: `runs/setup/camera-soak-20261017/camera-check.log` and `result.json` (forced-stop exit
+  4294967295). Unified exec session 59704 is complete. No camera-soak child remains from that run.
+- The independent-reader diagnostic completed (session 66460): in 60 seconds camera 2 delivered
+  1,013 frames with 172 late gaps and maximum read time 0.375 s; wrist camera 1 delivered 1,802 frames,
+  about 30 fps, zero late gaps. Neither had failed reads. Artifacts:
+  `runs/setup/camera-soak-20261017/independent-readers.json` and `independent-readers.log`.
+  Both cameras were released. This isolates irregular timing to camera 2 during that run; its cause
+  (USB/exposure/driver/host load/ongoing setup) is not established. No process from this pass remains running.
+- The earlier five-second precursor passed: 148 frames per feed, about 29 fps, zero failures/late
+  frames. Camera 2 now opens, superseding its initial open failure.
+- Current captures in `runs/setup/cameras/current/` show camera 2 looking across the table from a
+  low position and a mostly dark/occluded wrist view. Neither detected markers. The user replied
+  **"Still preparing the table"**. No physical table calibration has been performed.
 
 ### Implemented and reviewed in this pass
 
@@ -51,7 +57,8 @@ learn reached `saved`. Full evidence: [verification record](docs/verification-20
 
 ### External prerequisites and next actions
 
-1. Recover the running camera check, record its exact result, and update B1 only if acceptance passes.
+1. B1 remains open: inspect camera-2 timing after mounting/wiring/lighting is stable, then rerun
+   `.venv/Scripts/python.exe -m vision.cameras --check 1800`. Do not count the interrupted run as passed.
 2. The user is preparing the table. Mount camera 2 overhead, clear the wrist view, print markers at
    actual size, and measure camera Hc/c and marker 0-7 centers in `config/scene.yaml`.
    Follow [table calibration](docs/table-calibration.md), including five independent check points.
@@ -65,7 +72,7 @@ learn reached `saved`. Full evidence: [verification record](docs/verification-20
    cleaning up all created cloud resources. Fixtures do not satisfy those live gates.
 5. `.env` and `.env.example` now select OVERHEAD_CAM=2 through a user/external change. Preserve it.
    The example's camera-index change is intentionally left unstaged/uncommitted; our model-options
-   hunk was committed separately. No other pending code changes are expected after this checkpoint.
+   hunk was committed separately. All our code/documentation changes are committed; only the unowned example-camera edit remains.
 
 All three worker agents have now reached usage limits. Their earlier completed work is included.
 The last requested additional mapping review did not receive a final agent report; root inspected

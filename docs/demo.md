@@ -79,6 +79,9 @@ as the laptop webcam. Evidence is in `runs/setup/cameras/configured-check-202610
 `runs/setup/cameras/current/`. Camera 2 currently looks across the table from a low position; the wrist
 view is mostly dark/occluded. Neither capture detected markers. Mount and measure the overhead camera,
 clear the wrist view, and complete the 30-minute soak before claiming B1/B4 acceptance.
+The later soak attempt failed early with late frames. Independent readers then measured 172 late
+frames from camera 2 over one minute and none from the wrist feed. Stabilize the physical setup and
+repeat the full soak; the short initial pass does not override that failure.
 
 The checked-in homography is synthetic. Print `runs/setup/markers/markers-a4.pdf` at actual size (100%),
 then measure the marker edges with a ruler before mounting them; that local PDF contains 13 markers

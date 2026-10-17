@@ -157,6 +157,18 @@ updated environment setting. Evidence is `runs/setup/cameras/configured-check-20
 the wrist image is mostly dark/occluded. No markers were detected in either capture. Mount the overhead
 camera and clear the wrist view. These short checks do not establish the B1 thirty-minute soak.
 
+The subsequent 30-minute attempt failed its zero-drop criterion early: both feeds accumulated 27
+late-frame gaps by 185 seconds (5,240 frames each, zero failed reads). It was stopped after 193.77 wall
+seconds, rather than represented as a completed soak. The result records the forced-stop exit code
+4294967295. Evidence: `runs/setup/camera-soak-20261017/camera-check.log` and `result.json`.
+
+A separate 60-second diagnostic used independent reader threads. Camera 2 delivered 1,013 frames,
+172 late gaps and a maximum read delay of 0.375 seconds; wrist camera 1 delivered 1,802 frames with
+zero late gaps, about 30 fps. Neither had failed reads. This points to irregular camera-2 timing during
+this run; it does not establish whether USB bandwidth, exposure, driver behavior, host load or ongoing
+physical setup caused it. Evidence: `runs/setup/camera-soak-20261017/independent-readers.json` and its
+log/script. Both cameras were released. B1 remains open; repeat after the physical setup is stable.
+
 Implementation changes:
 
 - Driver startup re-reads each motor immediately before syncing its goal, and synchronizes again
