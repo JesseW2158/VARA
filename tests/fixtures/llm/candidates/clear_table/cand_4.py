@@ -1,4 +1,4 @@
-"""Clear the table by going around the obstacles: rise, move out to x = 0.32 m, then sideways to the tray."""
+"""Clear the table via a raised outside waypoint, shortest first, clearing existing tray contents."""
 
 OUT_X = 0.32
 CRUISE_SPEED = 0.12
@@ -18,14 +18,14 @@ def run(robot, args):
     tray = scene["zones"]["tray"]
     tallest = max([o["h"] for o in scene["obstacles"].values()] + [0.0])
     transit = tallest + 0.08
-    for name in sorted(objs, key=lambda n: objs[n]["y"]):
-        if not objs[name]["seen"]:
-            continue
+    todo = [name for name in objs if objs[name]["seen"]]
+    release = tray["wall"] + max([objs[name]["h"] for name in todo] + [0.0]) + 0.01
+    for name in sorted(todo, key=lambda n: objs[n]["h"]):
         if not robot.pick(name, transit_z=transit):
             return False
         if not carry_around(robot, objs[name], tray, transit):
             return False
-        if not robot.place_in_zone("tray", transit_z=transit):
+        if not robot.place(tray["x"] - 0.02, tray["y"], release_z=release, approach=0.05, transit_z=transit):
             return False
     robot.home()
     return True

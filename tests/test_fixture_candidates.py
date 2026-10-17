@@ -10,6 +10,8 @@ six at once, 5 trials each with seed 7, in one module-scoped fixture (about 35 s
 demo laptop against a 60 s budget; the fixture prints the time it took). The fast tests check every
 fixture under tests/fixtures/llm/ with `check_source` and keep the programs short. Nothing here touches
 xAI, Daytona, the arm or a camera, and nothing is written into the repo (outputs go to pytest's tmp dir).
+The clear-table fixtures likewise run all three objects against the unchanged cereal-box scene:
+2 to 4 of 6 must pass, including both strategies that clear the occupied tray when releasing.
 """
 
 from __future__ import annotations
@@ -29,6 +31,7 @@ from sim.candidate_check import check_source
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 LLM_FIXTURES = ROOT / "tests" / "fixtures" / "llm"
 JUICE_DIR = LLM_FIXTURES / "candidates" / "juice_box_to_tray"
+CLEAR_DIR = LLM_FIXTURES / "candidates" / "clear_table"
 REPAIR_DIR = LLM_FIXTURES / "repair" / "juice_box_to_tray"
 ROUTER_FIXTURE = LLM_FIXTURES / "router" / "learn_juice_box_to_tray.json"
 SCENE_PATH = ROOT / "config" / "fake_scene.json"
@@ -67,7 +70,9 @@ def rel(path: pathlib.Path) -> str:
 class Run:
     """One `python -m sim.run_candidate` subprocess scoring cand_<index>.py, and what it left behind."""
 
-    def __init__(self, index: int, task: pathlib.Path, out: pathlib.Path) -> None:
+    def __init__(
+        self, index: int, task: pathlib.Path, out: pathlib.Path, candidate_dir: pathlib.Path = JUICE_DIR
+    ) -> None:
         self.index = index
         self.out = out
         self.argv = [
@@ -75,7 +80,7 @@ class Run:
             "-m",
             "sim.run_candidate",
             "--candidate",
-            str(JUICE_DIR / f"cand_{index}.py"),
+            str(candidate_dir / f"cand_{index}.py"),
             "--task",
             str(task),
             "--scene",
@@ -137,6 +142,18 @@ def juice_runs(tmp_path_factory) -> dict[int, Run]:
     return runs
 
 
+@pytest.fixture(scope="module")
+def clear_runs(tmp_path_factory) -> dict[int, Run]:
+    base = tmp_path_factory.mktemp("clear_table_candidates")
+    task = ROOT / "tests" / "fixtures" / "task_spec_clear_table.json"
+    runs = {i: Run(i, task, base / f"cand_{i}", CLEAR_DIR) for i in INDICES}
+    for run in runs.values():
+        run.start()
+    for run in runs.values():
+        run.finish()
+    return runs
+
+
 # ---------------------------------------------------------------- the runner's verdicts
 
 
@@ -192,6 +209,34 @@ def test_cand_5_is_a_valid_program_that_runs_every_trial(juice_runs):
     score = juice_runs[5].score
     assert score["error"] is None, score
     assert all(t["error"] is None for t in juice_runs[5].trials())
+
+
+def test_clear_table_has_two_to_four_passing_strategies(clear_runs):
+    """A15: demonstrate meaningful selection while retaining the obstacle and all three objects."""
+    for index, run in clear_runs.items():
+        assert run.returncode == 0, (index, run.tail())
+        SCORE_VALIDATOR.validate(run.score)
+        assert len(run.trials()) == TRIALS
+    passing = [i for i, run in clear_runs.items() if run.score["passed"]]
+    assert 2 <= len(passing) <= 4, {i: run.score for i, run in clear_runs.items()}
+    assert not clear_runs[1].score["passed"]
+    assert "cereal_box" in clear_runs[1].score["fail_reason"]
+
+
+@pytest.mark.parametrize("index", (3, 4))
+def test_clear_table_clears_occupied_tray_without_forearm_collision(clear_runs, index):
+    """The old greedy third slot touched cereal_box even though every object reached the tray."""
+    run = clear_runs[index]
+    score = run.score
+    assert score["passed"] is True, (score, run.tail())
+    assert score["successes"] == TRIALS
+    assert (score["collisions"], score["limit_hits"], score["ik_failures"]) == (0, 0, 0)
+    assert score["error"] is None
+    assert all(t["success"] and t["first_collision"] is None for t in run.trials())
+    scene = json.loads(SCENE_PATH.read_text(encoding="utf-8"))
+    after = json.loads((run.out / "final_scene.json").read_text(encoding="utf-8"))
+    for name, obstacle in scene["obstacles"].items():
+        assert after["obstacles"][name] == obstacle
 
 
 # ---------------------------------------------------------------- fast static checks
