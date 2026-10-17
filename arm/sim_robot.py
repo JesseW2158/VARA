@@ -87,14 +87,22 @@ limits cannot satisfy. Sim time advances 1/30 s per tick; `close_gripper` costs 
 `carry_to_hand()` requires a held object. It moves the grasp center above the hand (or the handoff zone
 when the hand is unseen), with the bottom of the held object 5 cm above the hand point: first a vertical
 rise to a clearance height (the held object's longest half-extent plus CARRY_CLEARANCE above the tallest
-object or obstacle still on the table, capped 1 cm under the box ceiling), then a travel at that height to
-above the hand point, then a straight descent; a rise or travel the arm cannot reach is skipped (no
-`ik_failures` for the sim's own choice) and the carry falls back to the direct move. Then it opens, backs
+object or obstacle still on the table), then a travel at that height to above the hand point, then a
+straight descent. A height above the safe ceiling, an invalid rise or an unreachable travel aborts while
+holding the object and counts an `ik_failures`; there is no direct-move fallback. Then it opens, backs
 off 5 cm up, goes home, appends the event `handoff_done` and records only
 `{"kind": "live", "primitive": "carry_to_hand", "object": name}`: the real primitive does the carry itself
 and ends at home, so the sim motion of the carry is not recorded as path segments. The sim assumes the
 user takes the released object (the real primitive waits for the hand): it leaves the scene, reported at
 its last pose with `seen` false, which is what `moved` treats as "the user took it".
+
+Incoming `seen` flags remain authoritative: simulation cannot rediscover an unseen marker. An unseen
+object is neither a pick target nor a grasp candidate, and snapshots retain its last observed pose.
+Its physical body, and every unseen obstacle, remain at their last known locations for collision checks
+and clearance planning: a lost marker can mean occlusion, not removal. Only a handoff completed within
+this simulation proves that an object was taken and permits parking its body away from the workspace.
+The scene contract carries no removal provenance across independent runs, so reloading a post-handoff
+snapshot conservatively restores that unseen object's collision body at its last reported location.
 
 Scene note (measured, tests/test_sim_robot.py): config/fake_scene.json now has the cereal box at
 (0.28, 0.07), the tea tin at (0.16, -0.02) and the handoff zone and hand at (0.28, -0.08); on that layout
@@ -187,6 +195,8 @@ HAND_CLEARANCE = 0.05  # m, bottom of the held object above the hand point in ca
 HAND_BACKOFF = 0.05  # m, rise after releasing into the hand
 CARRY_CLEARANCE = 0.02  # m, between the held object's longest half-extent and the tallest thing on the table
 CEILING_MARGIN = 0.01  # m, the carry travels at most this far under the top of the workspace box
+CARRY_RISE_DONE = 0.005  # m, the measured grasp center may finish this far below the carry height
+CARRY_LINE_TOL = 0.006  # m, permitted sideways rise deviation / travel-height deficit, as on the live arm
 PLACE_FLOOR_CLEARANCE = 0.005  # m, place() keeps the held object's lowest point this far above the table
 RETIME_PASSES = 3  # a split step of a curved tip path can still be a hair long: measure again
 HOME_RAISE_Z = (0.20, 0.25, 0.15, 0.12)  # intermediate tip heights tried when home() leaves the box
@@ -532,16 +542,20 @@ class SimRobot:
 
     def scene(self) -> dict:
         """Current scene state (schemas/scene.json) rebuilt from the physics: objects from their free
-        joints, obstacles and the hand from the mocap bodies, zones copied from the input scene."""
+        joints, obstacles and the hand from the mocap bodies, zones copied from the input scene.
+        Unseen markers retain the input visibility and last observed pose, never a synthetic detection.
+        """
         d = self._data
         src = self._scene_in
         objects: dict[str, dict] = {}
         for name, item in src["objects"].items():
             taken = self._taken.get(name)
-            if taken is None:
+            if taken is not None:
+                x, y, yaw = taken
+            elif item["seen"]:
                 x, y, _z, yaw = self._object_pose(name)
             else:
-                x, y, yaw = taken
+                x, y, yaw = float(item["x"]), float(item["y"]), float(item["yaw"])
             objects[name] = {
                 "marker": int(item["marker"]),
                 "x": x,
@@ -549,7 +563,7 @@ class SimRobot:
                 "yaw": yaw,
                 "h": float(item["h"]),
                 "size": [float(item["size"][0]), float(item["size"][1])],
-                "seen": taken is None,
+                "seen": bool(item["seen"]) and taken is None,
             }
         obstacles: dict[str, dict] = {}
         for name, item in src["obstacles"].items():
@@ -561,7 +575,7 @@ class SimRobot:
                 "yaw": _yaw_of_quat(d.mocap_quat[k]),
                 "h": float(item["h"]),
                 "size": [float(item["size"][0]), float(item["size"][1])],
-                "seen": True,
+                "seen": bool(item["seen"]),
             }
         hand_in = src["hand"]
         hand = {
@@ -657,7 +671,7 @@ class SimRobot:
         self._check_time()
         if not isinstance(name, str) or name not in self._objects or name not in self._scene_in["objects"]:
             return False
-        if name in self._taken:
+        if name in self._taken or not self._scene_in["objects"][name]["seen"]:
             return False
         approach_m = _finite(approach)
         if approach_m is None:
@@ -782,13 +796,16 @@ class SimRobot:
     def carry_to_hand(self) -> bool:
         """With a held object: rise to the carry clearance height, travel above the hand (or the handoff
         zone when the hand is unseen), descend, open, back off 5 cm up, home, event `handoff_done`, one
-        `live` segment recorded. False without a held object or when the hand pose is unreachable."""
+        `live` segment recorded. A failed clearance, rise or travel returns False while still holding the
+        object; failed backoff/home never logs handoff_done. False without a held object.
+        """
         self._check_time()
         if self._held is None:
             return False
         name = self._held
         hand = self._scene_in["hand"]
-        if hand["seen"]:
+        hand_target = (float(hand["x"]), float(hand["y"]), float(hand["z"]) + HAND_CLEARANCE)
+        if hand["seen"] and self._in_box(hand_target):
             point = (float(hand["x"]), float(hand["y"]), float(hand["z"]))
         else:
             zone = self._scene_in["zones"]["handoff"]
@@ -796,19 +813,27 @@ class SimRobot:
         target = (point[0], point[1], point[2] + HAND_CLEARANCE + self._object_half_height(name))
         self._suspended += 1
         try:
-            above = self._carry_high((target[0], target[1]), target[2])
-            if not self._move(GRASP_SITE, target, -math.pi / 2, LEG_SPEED, straight=above):
+            if not self._carry_high((target[0], target[1]), target[2]):
+                self._stats["ik_failures"] += 1
+                return False
+            if not self._move(GRASP_SITE, target, -math.pi / 2, LEG_SPEED, straight=True):
+                return False
+            if math.dist(ik.fk_grasp(self._physical_q())[0], target) > CARRY_LINE_TOL:
+                self._stats["ik_failures"] += 1
                 return False
             self.open_gripper()
             self._take(name)
-            self._move(
+            if not self._move(
                 GRASP_SITE,
                 (target[0], target[1], target[2] + HAND_BACKOFF),
                 -math.pi / 2,
                 LEG_SPEED,
                 straight=True,
-            )
+            ):
+                return False
             self.home()
+            if not np.allclose(self._q_cmd, self._home_q, atol=1e-6):
+                return False
         finally:
             self._suspended -= 1
         self._events.append("handoff_done")
@@ -817,26 +842,51 @@ class SimRobot:
 
     def _carry_high(self, xy: tuple[float, float], target_z: float) -> bool:
         """The carry's rise and travel: up to the clearance height at the current xy, then across to above
-        `xy`, each leg only when the arm reaches it (planned, not counted). True when the grasp center ends
-        above `xy`, so the caller may descend on a straight line."""
+        `xy`. False on unavailable clearance, a failed rise or failed travel; the caller must not descend.
+        The same clearance/line tolerances as the live primitive apply to the planned and measured rise.
+        """
         tz = self._carry_clearance()
-        (gx, gy, gz), _ = ik.fk_grasp(self._q_cmd)
-        if target_z >= tz:
+        if tz is None:
             return False
-        if gz < tz - 0.005:
+        tz = max(tz, target_z)
+        if not math.isfinite(tz) or tz > float(self._box["z"][1]) - CEILING_MARGIN:
+            return False
+        (gx, gy, gz), _ = ik.fk_grasp(self._q_cmd)
+        if gz < tz - CARRY_RISE_DONE:
             rise = self._plan(GRASP_SITE, (gx, gy, tz), -math.pi / 2, LEG_SPEED, self._q_cmd, straight=True)
-            if rise is not None:
-                self._run_path(rise)
-                gz = ik.fk_grasp(self._q_cmd)[0][2]
-        travel = self._plan(GRASP_SITE, (xy[0], xy[1], max(tz, gz)), -math.pi / 2, LEG_SPEED, self._q_cmd)
-        if travel is None:
+            if rise is None:
+                return False
+            for q in rise:
+                point, _ = ik.fk_grasp(q)
+                if math.hypot(point[0] - gx, point[1] - gy) > CARRY_LINE_TOL or point[2] < gz - 0.01:
+                    return False
+            self._run_path(rise)
+            measured, _ = ik.fk_grasp(self._physical_q())
+            if (
+                measured[2] < tz - CARRY_RISE_DONE
+                or math.hypot(measured[0] - gx, measured[1] - gy) > CARRY_LINE_TOL
+            ):
+                return False
+            gz = ik.fk_grasp(self._q_cmd)[0][2]
+        travel = self._plan(
+            GRASP_SITE, (xy[0], xy[1], max(tz, gz)), -math.pi / 2, LEG_SPEED, self._q_cmd, straight=True
+        )
+        if travel is None or any(ik.fk_grasp(q)[0][2] < tz - CARRY_LINE_TOL for q in travel):
             return False
         self._run_path(travel)
+        measured, _ = ik.fk_grasp(self._physical_q())
+        if (
+            measured[2] < tz - CARRY_LINE_TOL
+            or math.hypot(measured[0] - xy[0], measured[1] - xy[1]) > CARRY_LINE_TOL
+        ):
+            return False
         return True
 
-    def _carry_clearance(self) -> float:
+    def _carry_clearance(self) -> float | None:
         """Grasp-center height at which the held object (its longest half-extent, whatever its tilt) clears
-        the tallest object or obstacle still on the table by CARRY_CLEARANCE, capped under the box top."""
+        the tallest object or obstacle still on the table by CARRY_CLEARANCE. None when that height cannot
+        fit below the safe ceiling; clamping it would hide a clearance failure from candidate scoring.
+        """
         tallest = max([float(item["h"]) for item in self._scene_in["obstacles"].values()] + [0.0])
         for name in self._scene_in["objects"]:
             if name != self._held and name not in self._taken:
@@ -844,7 +894,10 @@ class SimRobot:
         info = self._objects[self._held]
         half = info["half"]
         reach = math.hypot(half[0], half[1]) if info["cylinder"] else float(np.linalg.norm(half))
-        return min(tallest + reach + CARRY_CLEARANCE, float(self._box["z"][1]) - CEILING_MARGIN)
+        height = tallest + reach + CARRY_CLEARANCE
+        return (
+            height if math.isfinite(height) and height <= float(self._box["z"][1]) - CEILING_MARGIN else None
+        )
 
     def run_skill(self, name: str, args: dict | None) -> bool:
         """Run the saved skill `skills_dir/<name>.json` through sim.restricted; False (with an event) when
@@ -1390,7 +1443,8 @@ class SimRobot:
         closing = math.atan2(c[1], c[0])
         best: tuple[float, str] | None = None
         for name, info in self._objects.items():
-            if name == self._held or name in self._taken or name not in self._scene_in["objects"]:
+            item = self._scene_in["objects"].get(name)
+            if name == self._held or name in self._taken or item is None or not item["seen"]:
                 continue
             x, y, z, yaw = self._object_pose(name)
             dist = math.hypot(x - gx, y - gy)

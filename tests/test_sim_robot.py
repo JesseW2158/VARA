@@ -160,6 +160,91 @@ def test_reset_rejects_bad_scenes(robot):
     robot.reset(FAKE_SCENE)
 
 
+@pytest.mark.parametrize("group,name", [("objects", "pill_bottle"), ("obstacles", "cereal_box")])
+def test_unseen_markers_remain_unseen_after_reset_and_motion(robot, group, name):
+    scene = copy.deepcopy(FAKE_SCENE)
+    scene[group][name]["seen"] = False
+    robot.reset(scene)
+    assert robot.scene()[group][name] == scene[group][name]
+    assert robot.move_to(0.25, 0.0, 0.15)
+    after = robot.final_scene()
+    assert after[group][name] == scene[group][name]
+    SCENE_VALIDATOR.validate(after)
+    # Serialization and another simulation cannot manufacture a new camera detection either.
+    robot.reset(json.loads(json.dumps(after)))
+    assert robot.scene()[group][name] == scene[group][name]
+    robot.reset(FAKE_SCENE)
+    assert robot.scene()[group][name]["seen"] is True
+
+
+def test_pick_unseen_object_refuses_before_releasing_a_held_object(robot):
+    scene = copy.deepcopy(FAKE_SCENE)
+    scene["objects"]["pill_bottle"]["seen"] = False
+    robot.reset(scene)
+    assert robot.pick("juice_box", transit_z=TRANSIT_Z)
+    stats, trajectory = robot.stats, robot.trajectory()
+    assert robot.pick("pill_bottle", transit_z=TRANSIT_Z) is False
+    assert robot.stats == stats and robot.trajectory() == trajectory
+    assert robot._held == "juice_box"
+    assert robot.place_in_zone("tray", transit_z=TRANSIT_Z)
+    assert in_tray(robot.final_scene(), "juice_box")
+
+
+def test_unseen_object_remains_a_collision_body_but_cannot_be_grasped(robot):
+    scene = copy.deepcopy(FAKE_SCENE)
+    scene["objects"]["pill_bottle"]["seen"] = False
+    robot.reset(scene)
+    descend_to(robot, "pill_bottle", 0.0, 0.0, 0.5)
+    assert robot.close_gripper() is False
+    assert robot._held is None
+    assert robot.stats["collisions"] >= 1
+    assert "pill_bottle" in robot.stats["first_collision"]
+    # Physics can push the stale collision body, but it cannot update an unseen camera pose.
+    assert robot.final_scene()["objects"]["pill_bottle"] == scene["objects"]["pill_bottle"]
+    assert grips(robot)[-1] == {"kind": "grip", "action": "close", "expect_held": False}
+
+
+def test_unseen_obstacle_still_rejects_a_colliding_candidate(robot):
+    scene = copy.deepcopy(FAKE_SCENE)
+    scene["obstacles"]["cereal_box"]["seen"] = False
+    robot.reset(scene)
+    assert robot.pick("juice_box")
+    robot.place_in_zone("tray")
+    assert robot.stats["collisions"] >= 1
+    assert "cereal_box" in robot.stats["first_collision"]
+    assert robot.final_scene()["obstacles"]["cereal_box"] == scene["obstacles"]["cereal_box"]
+
+
+def test_post_handoff_snapshot_cannot_resurrect_the_taken_object(robot):
+    robot.reset(FAKE_SCENE)
+    assert robot.run_skill("hand_over", {"object": "pill_bottle"})
+    snapshot = json.loads(json.dumps(robot.final_scene()))
+    taken = snapshot["objects"]["pill_bottle"]
+    assert taken["seen"] is False
+    robot.reset(snapshot)
+    assert robot.final_scene()["objects"]["pill_bottle"] == taken
+    assert robot.run_skill("hand_over", {"object": "pill_bottle"}) is False
+    assert robot.stats["sim_s"] == 0.0 and robot.events == []
+    # A snapshot cannot distinguish occlusion from removal: retain the stale collision body.
+    x, y, _z, yaw = robot._object_pose("pill_bottle")
+    assert (x, y, yaw) == pytest.approx((taken["x"], taken["y"], taken["yaw"]))
+
+
+def test_sequential_handoffs_keep_both_objects_taken(robot):
+    robot.reset(FAKE_SCENE)
+    for name in ("pill_bottle", "juice_box"):
+        assert robot.run_skill("hand_over", {"object": name})
+        assert robot.final_scene()["objects"][name]["seen"] is False
+    after = robot.final_scene()
+    assert not after["objects"]["pill_bottle"]["seen"]
+    assert not after["objects"]["juice_box"]["seen"]
+    assert after["objects"]["tea_tin"]["seen"]
+    assert robot.events == ["handoff_done", "handoff_done"]
+    assert robot.stats["collisions"] == 0, robot._collision_log
+    assert robot.stats["limit_hits"] == 0 and robot.stats["ik_failures"] == 0
+    assert validate(robot) == []
+
+
 def test_public_surface_is_the_robot_api_plus_runner_helpers(robot):
     allowed = {
         "scene",
@@ -556,6 +641,118 @@ def test_carry_to_hand_with_the_hand_seen_goes_above_it(robot):
     assert robot.pick("pill_bottle", transit_z=TRANSIT_Z) and robot.carry_to_hand()
     assert robot.events == ["handoff_done"]
     assert robot.stats["collisions"] == 0, robot._collision_log
+
+
+@pytest.mark.parametrize("failure", ["no_plan", "incomplete_plan", "no_feedback"])
+def test_failed_carry_rise_keeps_the_object_and_never_travels(robot, monkeypatch, failure):
+    robot.reset(FAKE_SCENE)
+    assert robot.pick("pill_bottle", transit_z=TRANSIT_Z)
+    trajectory = robot.trajectory()
+    calls = []
+    plan = robot._plan
+
+    def faulty_plan(*args, **kwargs):
+        calls.append((args, kwargs))
+        if failure == "no_plan":
+            return None
+        if failure == "incomplete_plan":
+            return [robot._q_cmd.copy()]
+        return plan(*args, **kwargs)
+
+    monkeypatch.setattr(robot, "_plan", faulty_plan)
+    if failure == "no_feedback":
+        monkeypatch.setattr(robot, "_run_path", lambda path: None)
+    assert robot.carry_to_hand() is False
+    assert len(calls) == 1 and calls[0][1]["straight"] is True
+    assert robot._held == "pill_bottle" and robot.events == []
+    assert robot.stats["ik_failures"] == 1
+    assert robot.trajectory() == trajectory
+    assert robot.final_scene()["objects"]["pill_bottle"]["seen"] is True
+
+
+def test_failed_carry_travel_does_not_fall_back_to_a_direct_sweep(robot, monkeypatch):
+    robot.reset(FAKE_SCENE)
+    assert robot.pick("pill_bottle", transit_z=TRANSIT_Z)
+    plan = robot._plan
+    calls = []
+
+    def block_travel(*args, **kwargs):
+        calls.append((args, kwargs))
+        return plan(*args, **kwargs) if len(calls) == 1 else None
+
+    monkeypatch.setattr(robot, "_plan", block_travel)
+    assert robot.carry_to_hand() is False
+    assert len(calls) == 2 and all(kwargs["straight"] for _args, kwargs in calls)
+    assert robot._held == "pill_bottle" and robot.events == []
+    assert robot.stats["ik_failures"] == 1
+    assert all(segment["kind"] != "live" for segment in robot.trajectory()["segments"])
+
+
+def test_carry_clearance_above_the_ceiling_is_refused_without_motion(robot):
+    scene = copy.deepcopy(FAKE_SCENE)
+    scene["obstacles"]["cereal_box"]["h"] = 0.35
+    robot.reset(scene)
+    assert robot.pick("pill_bottle")
+    sim_s, trajectory = robot.stats["sim_s"], robot.trajectory()
+    assert robot.carry_to_hand() is False
+    assert robot.stats["sim_s"] == sim_s
+    assert robot.trajectory() == trajectory
+    assert robot._held == "pill_bottle" and robot.events == []
+    assert robot.stats["ik_failures"] == 1
+
+
+def test_carry_descent_requires_measured_arrival_before_release(robot, monkeypatch):
+    robot.reset(FAKE_SCENE)
+    assert robot.pick("pill_bottle", transit_z=TRANSIT_Z)
+    run_path = robot._run_path
+    calls = 0
+
+    def stall_descent(path):
+        nonlocal calls
+        calls += 1
+        if calls != 3:  # rise and travel work; the descent's actuator does not follow its command
+            run_path(path)
+
+    monkeypatch.setattr(robot, "_run_path", stall_descent)
+    assert robot.carry_to_hand() is False
+    assert calls == 3
+    assert robot._held == "pill_bottle" and robot.events == []
+    assert robot.stats["ik_failures"] == 1
+
+
+@pytest.mark.parametrize("failure", ["backoff", "home"])
+def test_carry_does_not_report_completion_when_return_motion_fails(robot, monkeypatch, failure):
+    robot.reset(FAKE_SCENE)
+    assert robot.pick("pill_bottle", transit_z=TRANSIT_Z)
+    if failure == "home":
+        monkeypatch.setattr(robot, "_plan_home", lambda: None)
+    else:
+        plan = robot._plan
+        calls = 0
+
+        def block_backoff(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            return None if calls == 4 else plan(*args, **kwargs)
+
+        monkeypatch.setattr(robot, "_plan", block_backoff)
+    assert robot.carry_to_hand() is False
+    assert robot.events == [] and robot.stats["ik_failures"] == 1
+    assert all(segment["kind"] != "live" for segment in robot.trajectory()["segments"])
+    assert robot.final_scene()["objects"]["pill_bottle"]["seen"] is False
+
+
+def test_seen_hand_outside_workspace_uses_the_handoff_zone(robot):
+    scene = copy.deepcopy(FAKE_SCENE)
+    scene["hand"].update(seen=True, x=0.65, y=-0.4)
+    robot.reset(scene)
+    assert robot.run_skill("hand_over", {"object": "pill_bottle"})
+    taken = robot.final_scene()["objects"]["pill_bottle"]
+    zone = scene["zones"]["handoff"]
+    assert not taken["seen"]
+    assert math.hypot(taken["x"] - zone["x"], taken["y"] - zone["y"]) < 0.01
+    assert robot.stats["collisions"] == 0 and robot.stats["ik_failures"] == 0
+    assert robot.events == ["handoff_done"]
 
 
 def test_sim_time_limit_is_raised_after_60_s(robot):
