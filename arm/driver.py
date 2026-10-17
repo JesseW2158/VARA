@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import logging
 import math
 import os
@@ -57,6 +58,8 @@ import sys
 import threading
 import time
 from collections.abc import Callable, Sequence
+from dataclasses import asdict
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -123,6 +126,7 @@ __all__ = [
     "FakeDriver",
     "get_driver",
     "reset_driver",
+    "inspect_hardware",
     "EscWatcher",
     "main",
 ]
@@ -622,6 +626,162 @@ def _lerobot_robot_factory(**kwargs: Any) -> Any:
 
         SOFollower, SOFollowerRobotConfig = _old.SO101Follower, _old.SO101FollowerConfig
     return SOFollower(SOFollowerRobotConfig(**kwargs))
+
+
+_INSPECTION_LOCK = threading.RLock()
+
+
+def _inspection_robot_factory(*, role: str, port: str, id: str) -> Any:
+    if role == "follower":
+        return _lerobot_robot_factory(port=port, id=id, **ROBOT_CONFIG)
+    from lerobot.teleoperators.so_leader import SOLeader, SOLeaderTeleopConfig
+
+    return SOLeader(SOLeaderTeleopConfig(port=port, id=id, use_degrees=True))
+
+
+def _serial_identity(port: str) -> dict[str, Any]:
+    from serial.tools import list_ports
+
+    for entry in list_ports.comports():
+        if entry.device.casefold() == port.casefold():
+            return {
+                "serial_number": entry.serial_number,
+                "description": entry.description,
+                "vid": entry.vid,
+                "pid": entry.pid,
+            }
+    return {}
+
+
+def inspect_hardware(
+    *,
+    port: str,
+    role: str = "follower",
+    robot_id: str | None = None,
+    robot_factory: Callable[..., Any] | None = None,
+) -> dict[str, Any]:
+    """Read an SO-101 board without configuring motors, syncing goals, or changing torque.
+
+    Unlike Driver.connect(), only the bus is opened. The reviewed LeRobot bus handshake pings
+    motors and reads firmware. Closing the raw port also avoids the leader's torque-off disconnect.
+    Encoder calibration is reported separately from the unmeasured VARA joint-to-model map.
+    Normalized joint readings here are LeRobot-centered radians, NOT MuJoCo joint coordinates.
+    """
+    if role not in ("follower", "leader"):
+        raise ValueError("role must be follower or leader")
+    if not isinstance(port, str) or not port.strip():
+        raise ValueError("port is required")
+    robot_id = robot_id or (
+        os.environ.get("FOLLOWER_ID") or joint_map()["lerobot_id"]
+        if role == "follower"
+        else os.environ.get("LEADER_ID") or "my_awesome_leader_arm"
+    )
+    with _INSPECTION_LOCK:
+        robot = (robot_factory or _inspection_robot_factory)(role=role, port=port, id=robot_id)
+        bus = robot.bus
+        saved = {name: asdict(value) for name, value in robot.calibration.items()}
+        calibration_path = Path(robot.calibration_fpath)
+        fingerprint = (
+            hashlib.sha256(calibration_path.read_bytes()).hexdigest() if calibration_path.is_file() else None
+        )
+        try:
+            bus.connect()
+            actual = {name: asdict(value) for name, value in bus.read_calibration().items()}
+            fields = ("id", "drive_mode", "homing_offset", "range_min", "range_max")
+
+            def valid_calibration(values: dict) -> bool:
+                return set(values) == set(MOTORS) and all(
+                    all(type(values[name].get(field)) is int for field in fields)
+                    and values[name]["id"] == index
+                    and values[name]["drive_mode"] in (0, 1)
+                    and 0 <= values[name]["range_min"] < values[name]["range_max"] <= 4095
+                    for index, name in enumerate(MOTORS, 1)
+                )
+
+            matches = (
+                valid_calibration(saved)
+                and valid_calibration(actual)
+                and all(saved[m][field] == actual[m][field] for m in MOTORS for field in fields)
+            )
+            registers = {
+                reg: bus.sync_read(reg, normalize=False, num_retry=2)
+                for reg in (
+                    "Present_Position",
+                    "Goal_Position",
+                    "Torque_Enable",
+                    "Present_Voltage",
+                    "Present_Temperature",
+                )
+            }
+            for reg, values in registers.items():
+                if set(values) != set(MOTORS):
+                    raise RuntimeError(f"Incomplete {reg}: expected all six motors")
+                if not all(type(v) is int for v in values.values()):
+                    raise RuntimeError(f"Invalid raw {reg}: expected integer register values")
+            if any(v not in (0, 1) for v in registers["Torque_Enable"].values()):
+                raise RuntimeError("Invalid Torque_Enable: expected 0 or 1")
+            for reg in ("Present_Voltage", "Present_Temperature"):
+                if any(not 0 <= v <= 255 for v in registers[reg].values()):
+                    raise RuntimeError(f"Invalid one-byte register {reg}")
+            issues = [] if matches else ["Encoder calibration is missing, invalid or does not match hardware"]
+            motors = {}
+            for name in MOTORS:
+                present = int(registers["Present_Position"][name])
+                goal = int(registers["Goal_Position"][name])
+                motors[name] = {
+                    "position_raw": present,
+                    "goal_raw": goal,
+                    "goal_error_raw": goal - present,
+                    "torque_enabled": bool(registers["Torque_Enable"][name]),
+                    "voltage_v": float(registers["Present_Voltage"][name]) / 10.0,
+                    "temperature_c": float(registers["Present_Temperature"][name]),
+                    "encoder_in_range": 0 <= present <= 4095,
+                }
+                if not 0 <= present <= 4095 or not 0 <= goal <= 4095:
+                    issues.append(f"{name}: position or stored goal is outside 0..4095 encoder ticks")
+                if motors[name]["torque_enabled"] and abs(goal - present) > STRAIN_TICKS:
+                    issues.append(
+                        f"{name}: powered goal differs from position by more than {STRAIN_TICKS} ticks"
+                    )
+                if matches:
+                    lo, hi = saved[name]["range_min"], saved[name]["range_max"]
+                    motors[name]["within_calibrated_range"] = lo <= present <= hi
+                    if not lo <= present <= hi:
+                        issues.append(f"{name}: position is outside its saved encoder calibration range")
+                    # LeRobot DEGREES is centered on the calibrated range, using 4095 ticks/turn.
+                    # Homing offset is already applied by the servo. Derive from this exact raw read.
+                    if name == GRIPPER:
+                        value = (_clamp(present, lo, hi) - lo) / (hi - lo)
+                        motors[name]["calibrated_gripper"] = 1 - value if saved[name]["drive_mode"] else value
+                    else:
+                        motors[name]["calibrated_position_rad"] = (present - (lo + hi) / 2) * math.tau / 4095
+            volts = [m["voltage_v"] for m in motors.values()]
+            if role == "leader" and any(v > 8 for v in volts):
+                issues.append("Leader voltage exceeds its 8 V motor limit; the Pro kit leader requires 5 V")
+            if any(v < 4 for v in volts):
+                issues.append("Supply voltage is below 4 V")
+            return {
+                "captured_at": datetime.now(timezone.utc).isoformat(),
+                "read_only": True,
+                "role": role,
+                "port": port,
+                "usb": _serial_identity(port),
+                "lerobot_id": robot_id,
+                "calibration": {
+                    "path": str(calibration_path),
+                    "sha256": fingerprint,
+                    "matches_hardware": matches,
+                    "saved": saved,
+                    "hardware": actual,
+                },
+                "model_mapping": "not_assessed: A6 requires measured joint directions, offsets and tip poses",
+                "issues": issues,
+                "motors": motors,
+            }
+        finally:
+            # Covers a handshake failure after the port opens too. No robot.disconnect(): the
+            # leader's implementation turns torque off, as does bus.disconnect() by default.
+            bus.port_handler.closePort()
 
 
 class Driver(_DriverBase):

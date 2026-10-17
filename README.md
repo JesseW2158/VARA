@@ -38,3 +38,8 @@ have LeRobot calibration files. VARA's joint-to-simulation offsets still require
 and the overhead camera needs physical calibration before Cartesian replay. Follow
 [the arm tasks](docs/tasks/A-arm.md) and [safety rules](docs/safety.md) for hardware bring-up. RL
 deployment remains disabled in `config/rl.yaml` until its real-arm gates pass.
+
+Capture both arms' current registers without motion using
+`python -m arm.inspect_hardware --follower-port COM8 --leader-port COM7 --out runs/hardware/check-01.json`.
+See [hardware calibration notes](docs/hardware-calibration.md) for report interpretation and the
+newly detected leader calibration mismatch.

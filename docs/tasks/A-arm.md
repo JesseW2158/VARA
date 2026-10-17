@@ -122,6 +122,11 @@ For each of the 5 arm joints, start at a measured, supported reference pose and 
 
 **Done when:** all 5 poses agree within 1.5 cm. A joint off by a constant needs its `offset_deg` fixed.
 
+The [read-only hardware report](../hardware-calibration.md) records encoder calibration and its
+fingerprint without moving the arms. It supports A6 evidence collection; it does not replace the
+five physical measurements. The 2026-10-17 check found the leader's saved calibration differs from
+its hardware, so reconcile that separately before teleoperation.
+
 ## A7 · Inverse kinematics (`arm/ik.py`)
 
 **Needs:** A5. **By:** Sat 3:00 AM. **Files:** `arm/ik.py`, `tests/test_ik.py`.
