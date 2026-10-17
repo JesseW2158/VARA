@@ -138,27 +138,36 @@ def open_camera(
     Raises RuntimeError when the device does not open. Settings the driver refuses are logged, not fatal.
     """
     cap = cv2.VideoCapture(int(index), cv2.CAP_DSHOW) if os.name == "nt" else cv2.VideoCapture(int(index))
-    if not cap.isOpened():
+    try:
+        if not cap.isOpened():
+            raise RuntimeError(f"camera {index} did not open (check OVERHEAD_CAM/WRIST_CAM and the USB port)")
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*fourcc))
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, int(width))
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, int(height))
+        cap.set(cv2.CAP_PROP_FPS, int(fps))
+        # Exposure flicker and focus hunting move detections; the property semantics differ by backend:
+        # DSHOW: 0.25 manual / 0.75 auto exposure; V4L2: 1 manual / 3 auto.
+        for prop, value in (
+            (cv2.CAP_PROP_AUTOFOCUS, 0),
+            (cv2.CAP_PROP_AUTO_EXPOSURE, 0.25 if os.name == "nt" else 1),
+        ):
+            try:
+                if not cap.set(prop, value):
+                    log.info("camera %s: property %s not supported", index, prop)
+            except cv2.error:  # pragma: no cover - backend-specific
+                log.info("camera %s: property %s raised", index, prop)
+        got = (
+            cap.get(cv2.CAP_PROP_FRAME_WIDTH),
+            cap.get(cv2.CAP_PROP_FRAME_HEIGHT),
+            cap.get(cv2.CAP_PROP_FPS),
+        )
+        log.info(
+            "camera %s open: %sx%s at %s fps requested, driver reports %s", index, width, height, fps, got
+        )
+        return cap
+    except BaseException:
         cap.release()
-        raise RuntimeError(f"camera {index} did not open (check OVERHEAD_CAM/WRIST_CAM and the USB port)")
-    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*fourcc))
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, int(width))
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, int(height))
-    cap.set(cv2.CAP_PROP_FPS, int(fps))
-    # Exposure flicker and focus hunting move detections; the property semantics differ by backend:
-    # DSHOW: 0.25 manual / 0.75 auto exposure; V4L2: 1 manual / 3 auto.
-    for prop, value in (
-        (cv2.CAP_PROP_AUTOFOCUS, 0),
-        (cv2.CAP_PROP_AUTO_EXPOSURE, 0.25 if os.name == "nt" else 1),
-    ):
-        try:
-            if not cap.set(prop, value):
-                log.info("camera %s: property %s not supported", index, prop)
-        except cv2.error:  # pragma: no cover - backend-specific
-            log.info("camera %s: property %s raised", index, prop)
-    got = (cap.get(cv2.CAP_PROP_FRAME_WIDTH), cap.get(cv2.CAP_PROP_FRAME_HEIGHT), cap.get(cv2.CAP_PROP_FPS))
-    log.info("camera %s open: %sx%s at %s fps requested, driver reports %s", index, width, height, fps, got)
-    return cap
+        raise
 
 
 class _Stats:
@@ -582,48 +591,63 @@ def get_camera(name: str) -> Camera | FakeCamera:
 
 
 def _check(seconds: float, names: Sequence[str]) -> int:
+    if not math.isfinite(seconds) or seconds <= 0 or not names:
+        print("Camera check needs a finite positive duration and at least one feed.", file=sys.stderr)
+        return 2
     cams: list[Camera | FakeCamera] = []
-    for name in names:
-        try:
-            cam = get_camera(name)
-        except Exception as exc:
-            print(f"{name}: cannot open ({exc})", file=sys.stderr)
-            continue
-        if isinstance(cam, FakeCamera):
-            cam.pace = True
-        cams.append(cam)
-    if not cams:
-        return 1
-    t0 = time.monotonic()
-    next_report = t0 + 1.0
+    bad, completed = False, False
+    t0, elapsed = None, 0.0
     try:
-        while time.monotonic() - t0 < seconds:
-            for cam in cams:
-                cam.read()
-            now = time.monotonic()
-            if now >= next_report:
-                next_report += 1.0
-                line = " | ".join(
-                    f"{cam.name}: {cam.frames} frames, {cam.fps:.1f} fps, "
-                    f"{cam.failures} fail, {cam.late} late"
-                    for cam in cams
-                )
-                print(f"[{now - t0:6.1f} s] {line}", flush=True)
+        for name in names:
+            try:
+                cam = get_camera(name)
+            except Exception as exc:
+                print(f"{name}: cannot open ({exc})", file=sys.stderr)
+                bad = True
+                continue
+            cams.append(cam)
+            if isinstance(cam, FakeCamera):
+                cam.pace = True
+        if not bad:
+            t0 = time.monotonic()
+            next_report = t0 + 1.0
+            while time.monotonic() - t0 < seconds:
+                for cam in cams:
+                    if cam.read() is None:
+                        bad = True
+                now = time.monotonic()
+                if now >= next_report:
+                    next_report += 1.0
+                    line = " | ".join(
+                        f"{cam.name}: {cam.frames} frames, {cam.fps:.1f} fps, "
+                        f"{cam.failures} fail, {cam.late} late"
+                        for cam in cams
+                    )
+                    print(f"[{now - t0:6.1f} s] {line}", flush=True)
+            completed = True
     except KeyboardInterrupt:
-        pass
+        print("Camera check interrupted before completion.", file=sys.stderr)
+        bad = True
+    except Exception as exc:
+        print(f"Camera check failed ({exc}).", file=sys.stderr)
+        bad = True
     finally:
+        if t0 is not None:
+            elapsed = time.monotonic() - t0
         for cam in cams:
-            cam.release()
-    bad = 0
+            try:
+                cam.release()
+            except (Exception, KeyboardInterrupt) as exc:
+                print(f"{cam.name}: release failed ({exc})", file=sys.stderr)
+                bad = True
     for cam in cams:
         s = cam.stats()
-        elapsed = time.monotonic() - t0
         print(
             f"{cam.name}: {s['frames']} frames in {elapsed:.1f} s, {s['fps']} fps, "
             f"{s['failures']} failed reads, {s['late']} late frames"
         )
-        bad += int(s["failures"]) + int(s["late"])
-    return 0 if bad == 0 else 1
+        bad |= bool(s["failures"] or s["late"] or s["frames"] < 2)
+    return 0 if completed and elapsed >= seconds and not bad else 1
 
 
 def main(argv: Sequence[str] | None = None) -> int:
