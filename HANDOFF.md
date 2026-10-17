@@ -1,5 +1,29 @@
 # VARA implementation handoff
 
+## Active camera follow-up (2026-10-17)
+
+The user asked to continue and update this handoff throughout the work. Starting from HEAD e460eb7;
+only the user/external `.env.example` camera-index edit was pending. The previous 1,406-test full gate
+remains the baseline; do not rerun it unless a new change warrants it.
+
+Root is investigating the camera-2 timing failure with bounded, non-motion diagnostics. New worker
+`/root/camera_review` is reviewing DirectShow/OpenCV configuration semantics and reader behavior
+without hardware access. Prior workers exhausted their usage allowances; this new attempt has not
+reported a result yet. Table preparation and API credentials remain external prerequisites; preserve
+`.env` and all physical configuration measurements. No robot movement is planned without calibration.
+
+**Confirmed physical configuration bug:** on both cameras, requesting FOURCC first returned MJPG,
+but the later height setting silently switched it to YUY2; FPS left it there. Every property setter
+reported success. Evidence: `runs/setup/camera-format-20261017/before.json`. OpenCV 4.13 DirectShow
+source confirms later geometry/FPS changes can recreate the stream without the requested format.
+The camera worker has changed the order to FPS, width, height, FOURCC and added format readback logs;
+focused tests are running. Root is now comparing physical format/timing after this fix.
+
+Worker `/root/table_capture` is adding a read-only observed-pixel capture helper and a five-spot
+measurement workflow to `docs/table-calibration.md`; it opens no devices during development/tests.
+Neither worker edits `.env`, saved homography, joint maps or protected contracts. New changes in this
+follow-up are uncommitted until checks pass.
+
 ## Current completion checkpoint (2026-10-17, Codex)
 
 **Read this before the historical handoffs.** The user requested continued parallel work and an

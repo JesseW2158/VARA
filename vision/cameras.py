@@ -141,29 +141,57 @@ def open_camera(
     try:
         if not cap.isOpened():
             raise RuntimeError(f"camera {index} did not open (check OVERHEAD_CAM/WRIST_CAM and the USB port)")
-        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*fourcc))
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, int(width))
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, int(height))
-        cap.set(cv2.CAP_PROP_FPS, int(fps))
+        # DirectShow recreates its capture graph when FPS or size changes. Set FOURCC last:
+        # an earlier MJPG request can otherwise be silently replaced with the default format.
+        for prop, value in (
+            (cv2.CAP_PROP_FPS, int(fps)),
+            (cv2.CAP_PROP_FRAME_WIDTH, int(width)),
+            (cv2.CAP_PROP_FRAME_HEIGHT, int(height)),
+            (cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*fourcc)),
+        ):
+            if not cap.set(prop, value):
+                log.warning("camera %s: requested stream property %s=%s refused", index, prop, value)
         # Exposure flicker and focus hunting move detections; the property semantics differ by backend:
-        # DSHOW: 0.25 manual / 0.75 auto exposure; V4L2: 1 manual / 3 auto.
+        # DSHOW rounds to a boolean (0 manual / 1 auto); V4L2 defaults to raw 1 manual / 3 auto.
+        # Disabling auto exposure retains the current exposure; it does not select a suitable value.
         for prop, value in (
             (cv2.CAP_PROP_AUTOFOCUS, 0),
-            (cv2.CAP_PROP_AUTO_EXPOSURE, 0.25 if os.name == "nt" else 1),
+            (cv2.CAP_PROP_AUTO_EXPOSURE, 0 if os.name == "nt" else 1),
         ):
             try:
                 if not cap.set(prop, value):
                     log.info("camera %s: property %s not supported", index, prop)
             except cv2.error:  # pragma: no cover - backend-specific
                 log.info("camera %s: property %s raised", index, prop)
-        got = (
-            cap.get(cv2.CAP_PROP_FRAME_WIDTH),
-            cap.get(cv2.CAP_PROP_FRAME_HEIGHT),
-            cap.get(cv2.CAP_PROP_FPS),
+        got = {
+            "width": cap.get(cv2.CAP_PROP_FRAME_WIDTH),
+            "height": cap.get(cv2.CAP_PROP_FRAME_HEIGHT),
+            "fps": cap.get(cv2.CAP_PROP_FPS),
+            "fourcc": cap.get(cv2.CAP_PROP_FOURCC),
+        }
+        code = got["fourcc"]
+        reported_fourcc = (
+            "".join(chr((int(code) >> (8 * i)) & 255) for i in range(4))
+            if math.isfinite(code) and 0 < code <= 0xFFFFFFFF
+            else "unavailable"
         )
         log.info(
-            "camera %s open: %sx%s at %s fps requested, driver reports %s", index, width, height, fps, got
+            "camera %s open: %sx%s at %s fps %s requested, driver reports %s (%s)",
+            index,
+            width,
+            height,
+            fps,
+            fourcc,
+            got,
+            reported_fourcc,
         )
+        if reported_fourcc != fourcc:
+            log.warning(
+                "camera %s: requested %s but driver reports %s; compressed USB bandwidth is unverified",
+                index,
+                fourcc,
+                reported_fourcc,
+            )
         return cap
     except BaseException:
         cap.release()

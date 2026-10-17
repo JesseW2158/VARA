@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -109,3 +110,74 @@ def test_capture_is_released_if_open_configuration_fails(monkeypatch, failure):
     with pytest.raises(type(failure)):
         cameras.open_camera(2)
     assert released == [True]
+
+
+class NegotiatingCapture:
+    """Model a backend which drops MJPG while renegotiating its size or frame rate."""
+
+    def __init__(self, *, refuse_format=False, format_report=None):
+        self.refuse_format = refuse_format
+        self.format_report = format_report
+        self.settings = {cameras.cv2.CAP_PROP_FOURCC: cameras.cv2.VideoWriter_fourcc(*"YUY2")}
+        self.calls = []
+        self.released = False
+
+    def isOpened(self):
+        return True
+
+    def set(self, prop, value):
+        self.calls.append((prop, value))
+        if prop == cameras.cv2.CAP_PROP_FOURCC and self.refuse_format:
+            return False
+        self.settings[prop] = value
+        if prop in (
+            cameras.cv2.CAP_PROP_FRAME_WIDTH,
+            cameras.cv2.CAP_PROP_FRAME_HEIGHT,
+            cameras.cv2.CAP_PROP_FPS,
+        ):
+            self.settings[cameras.cv2.CAP_PROP_FOURCC] = cameras.cv2.VideoWriter_fourcc(*"YUY2")
+        return True
+
+    def get(self, prop):
+        if prop == cameras.cv2.CAP_PROP_FOURCC and self.format_report is not None:
+            return self.format_report
+        return self.settings[prop]
+
+    def release(self):
+        self.released = True
+
+
+def test_format_survives_backend_size_and_fps_renegotiation(monkeypatch, caplog):
+    capture = NegotiatingCapture()
+    monkeypatch.setattr(cameras.cv2, "VideoCapture", lambda *args: capture)
+    with caplog.at_level(logging.INFO, logger="vision.cameras"):
+        assert cameras.open_camera(2) is capture
+    assert capture.get(cameras.cv2.CAP_PROP_FOURCC) == cameras.cv2.VideoWriter_fourcc(*"MJPG")
+    assert "driver reports" in caplog.text and "(MJPG)" in caplog.text
+    assert "unverified" not in caplog.text and not capture.released
+
+
+def test_refused_format_is_reported_without_claiming_compressed_stream(monkeypatch, caplog):
+    capture = NegotiatingCapture(refuse_format=True)
+    monkeypatch.setattr(cameras.cv2, "VideoCapture", lambda *args: capture)
+    assert cameras.open_camera(2) is capture
+    assert "refused" in caplog.text and "driver reports YUY2" in caplog.text
+    assert "compressed USB bandwidth is unverified" in caplog.text
+
+
+@pytest.mark.parametrize("reported", [0, -1, float("nan")])
+def test_missing_format_readback_is_reported_as_unverified(monkeypatch, caplog, reported):
+    capture = NegotiatingCapture(format_report=reported)
+    monkeypatch.setattr(cameras.cv2, "VideoCapture", lambda *args: capture)
+    assert cameras.open_camera(2) is capture
+    assert "driver reports unavailable" in caplog.text
+
+
+@pytest.mark.parametrize(("platform", "manual"), [("nt", 0), ("posix", 1)])
+def test_manual_exposure_uses_backend_value_without_changing_exposure(monkeypatch, platform, manual):
+    capture = NegotiatingCapture()
+    monkeypatch.setattr(cameras, "os", SimpleNamespace(name=platform))
+    monkeypatch.setattr(cameras.cv2, "VideoCapture", lambda *args: capture)
+    cameras.open_camera(2)
+    assert (cameras.cv2.CAP_PROP_AUTO_EXPOSURE, manual) in capture.calls
+    assert all(prop != cameras.cv2.CAP_PROP_EXPOSURE for prop, _ in capture.calls)

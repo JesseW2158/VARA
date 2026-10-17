@@ -15,6 +15,25 @@ the independent checks below. This procedure reads cameras and writes a matrix; 
    overhead image and independently tape-measure its table coordinates `[x, y]` in meters at z=0.
    Keep the original image and measurement notes with this setup's evidence.
 
+Use a loose printed object marker such as ID 10 to identify each check spot. Lay it flat directly on the
+table, without its object underneath, and keep other copies of that ID out of view. Move this same marker
+to five separately tape-measured positions; do not reuse the fitting markers 0-7. Keep the camera and the
+fitting markers fixed throughout. Close other programs using the overhead camera, then capture each spot:
+
+```powershell
+.\.venv\Scripts\python.exe scripts/capture_table.py --out runs/table-calibration/spot-1
+```
+
+Repeat with new directories `spot-2` through `spot-5`. The command uses `OVERHEAD_CAM` from `.env`, never
+moves the arm, and refuses an existing output directory. Each directory contains the untouched
+`physical-original.png`, an annotated image with marker IDs and center crosses, and `markers.json`.
+Copy ID 10's observed `pixel` pair from that report and combine it with your separately measured `table`
+pair below. The center is the mean of the four detected corners, in pixels from the image's top-left
+(`u` right, `v` down). These are image measurements only; the tool does not infer table coordinates or
+save a homography. With no detections it keeps the image for diagnosis and exits unsuccessfully.
+`--fake` is available for offline checks, but its files are explicitly labeled synthetic and cannot serve
+as physical calibration evidence.
+
 Save those measurements as a JSON list in `measurements/check-points.json`. Each entry has this shape
 (the numbers below illustrate the format only; replace them with your measurements):
 
