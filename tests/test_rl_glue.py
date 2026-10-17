@@ -107,7 +107,7 @@ def test_write_rewards_in_fake_mode_writes_four_checked_variants(tmp_path, monke
         assert key in prompt
     assert "16 floats" in prompt and "obs[9:12]" in prompt and "obs[12:15]" in prompt and "obs[15]" in prompt
     assert f"{he.FALL_PENALTY:g}" in prompt and "do not penalize falls again" in prompt
-    assert "import math" in prompt and "200 lines" in prompt and "BaseException" in prompt
+    assert "import math" in prompt and f"{wr.BODY_MAX_LINES} lines" in prompt and "BaseException" in prompt
     assert "__main__" in prompt and "No numpy" in prompt and "underscore" in prompt
     assert BASELINE.read_text(encoding="utf-8").strip() in prompt
     assert "not measured yet" in prompt
@@ -201,11 +201,15 @@ def test_write_rewards_handles_missing_and_twice_rejected_variants(tmp_path, mon
 
 
 def test_write_rewards_cli(tmp_path, monkeypatch, capsys):
+    from agents import llm
+
     monkeypatch.setenv("FAKE_LLM", "1")
+    monkeypatch.setattr(llm, "RUNS", tmp_path / "runs")  # the CLI's task_id "rewards" logs llm.jsonl there
     code = wr.main(["--out", str(tmp_path / "out"), "--task-dir", str(tmp_path / "run")])
     out = capsys.readouterr().out.strip().splitlines()
     assert code == 0 and len(out) == 4 and all(line.endswith(".py") for line in out)
     assert sorted(p.name for p in (tmp_path / "out").glob("*.py")) == [f"variant_{k}.py" for k in range(1, 5)]
+    assert (tmp_path / "runs" / "rewards" / "llm.jsonl").is_file()  # logged, but not into the repo's runs/
 
 
 # ----------------------------------------------------------------------------------- train_parallel
@@ -296,6 +300,18 @@ def test_train_parallel_rejects_bad_input_before_touching_anything(tmp_path, fix
         tp.train_parallel([tmp_path / "missing.py"], steps=10, out_dir=tmp_path)
     with pytest.raises(ValueError):
         tp.train_parallel(fixture_rewards, steps=0, out_dir=tmp_path, local=True)
+    for key, value in (
+        ("poll_s", math.inf),
+        ("poll_s", math.nan),
+        ("max_wait_s", 0),
+        ("max_wait_s", math.inf),
+        ("max_wait_s", math.nan),
+        ("n_envs", 0),
+    ):
+        with pytest.raises(ValueError):
+            tp.train_parallel(fixture_rewards, steps=10, out_dir=tmp_path, **{key: value})
+    with pytest.raises(ValueError, match="non-empty"):
+        tp.train_parallel(fixture_rewards, steps=10, out_dir="")
     assert not (tmp_path / "result.json").exists()
     assert tp.variant_names([pathlib.Path("a/x.py"), pathlib.Path("b/x.py")]) == ["x", "x_2"]
     assert tp.hint_for(pathlib.Path("variant_2.py")) == wr.SHAPING_IDEAS[1]
@@ -339,6 +355,15 @@ def test_read_progress_and_select_best(tmp_path):
     assert tp.select_best(variants) == 1
     assert tp.select_best(variants[3:]) == 4 - 3
     assert tp.select_best([variants[2], variants[3]]) is None
+    invalid = [
+        {**variants[0], "error": "training failed"},
+        {**variants[0], "success_rate": math.nan},
+        {**variants[0], "success_rate": 1.1},
+        {**variants[0], "success_rate": -0.1},
+        {**variants[0], "success_rate": 10**1000},
+        {**variants[0], "mean_steps_to_success": -1},
+    ]
+    assert tp.select_best(invalid) is None
     data = tp.write_curves(
         [{"name": "a", "hint": "h", "progress": rows, "chosen": True, "final_success_rate": 0.25}],
         tmp_path / "curves.json",
@@ -556,6 +581,37 @@ def test_train_parallel_deletes_the_sandboxes_when_a_step_fails(tmp_path, monkey
     assert fake.sandboxes == []
 
 
+def test_train_parallel_deadline_deletes_all_sandboxes(tmp_path, monkeypatch, fixture_rewards):
+    fake = FakeDaytona([0.5] * 4, [40.0] * 4, polls_until_done=100)
+    monkeypatch.setattr(tp, "_daytona_factory", lambda: fake)
+    now = [0.0]
+    sleeps = []
+    monkeypatch.setattr(tp.time, "monotonic", lambda: now[0])
+
+    def advance(seconds):
+        sleeps.append(seconds)
+        now[0] += seconds
+
+    monkeypatch.setattr(tp, "sleep", advance)
+    with pytest.raises(TimeoutError, match="sandbox training exceeded"):
+        tp.train_parallel(fixture_rewards, out_dir=tmp_path, max_wait_s=0.5, poll_s=30)
+    assert sleeps == [0.5]
+    assert len(fake.sandboxes) == 4 and all(sandbox.deleted for sandbox in fake.sandboxes)
+    assert not (tmp_path / "result.json").exists()
+
+
+def test_train_parallel_refuses_stale_artifacts_before_launch(tmp_path, monkeypatch, fixture_rewards):
+    fake = FakeDaytona([0.5] * 4, [40.0] * 4)
+    monkeypatch.setattr(tp, "_daytona_factory", lambda: fake)
+    stale = tmp_path / "variant_1" / "summary.json"
+    stale.parent.mkdir()
+    stale.write_text('{"success_rate": 1.0}', encoding="utf-8")
+    with pytest.raises(ValueError, match="existing training artifacts"):
+        tp.train_parallel(fixture_rewards, out_dir=tmp_path)
+    assert fake.sandboxes == []
+    assert stale.read_text(encoding="utf-8") == '{"success_rate": 1.0}'
+
+
 def test_train_parallel_cli_falls_back_to_local_without_a_key(tmp_path, monkeypatch, fixture_rewards, capsys):
     monkeypatch.delenv("DAYTONA_API_KEY", raising=False)
 
@@ -591,6 +647,30 @@ def test_train_parallel_cli_falls_back_to_local_without_a_key(tmp_path, monkeypa
     assert seen["local"] is True and seen["steps"] == 77 and seen["rewards"] == fixture_rewards
     assert "variant_1" in captured.out and "CHOSEN" in captured.out
     assert json.loads(captured.out.strip().splitlines()[-1])["chosen"] == "variant_1"
+
+
+def test_train_parallel_cli_reports_daytona_errors_without_a_traceback(
+    tmp_path, monkeypatch, fixture_rewards, capsys
+):
+    from daytona.common.errors import DaytonaError
+
+    monkeypatch.setenv("DAYTONA_API_KEY", "dtn_not_a_real_key")
+
+    def failing_train(rewards, **kwargs):
+        raise DaytonaError("Failed to create sandbox: connection refused")
+
+    monkeypatch.setattr(tp, "train_parallel", failing_train)
+    args = ["--rewards", *map(str, fixture_rewards), "--steps", "10", "--out", str(tmp_path / "o")]
+    assert tp.main(args) == 2
+    err = capsys.readouterr().err
+    assert err.startswith("error: DaytonaError: Failed to create sandbox") and "dtn_not_a_real_key" not in err
+
+    def buggy_train(rewards, **kwargs):
+        raise KeyError("a bug of ours stays a traceback")
+
+    monkeypatch.setattr(tp, "train_parallel", buggy_train)
+    with pytest.raises(KeyError):
+        tp.main(args)
 
 
 # ------------------------------------------------------------------------------------ policy_runner
@@ -704,6 +784,7 @@ def test_run_policy_never_changes_the_gripper():
     assert len(driver.commands) == 5 and {gripper for _q, gripper in driver.commands} == {0.37}
     driver = FakeDriver()
     driver.command(driver.read()[0], 0.2)  # a held object: the last commanded gripper is what we repeat
+    driver.gripper_reading_override = 0.42  # the jaws read wider than the hold, as on a squeezed object
     driver.commands.clear()
     pr.run_policy(
         driver, lambda: None, "unused.zip", timeout=3 * he.DT, policy=StubPolicy([0.3, 0.0, 0.0, 0.0])
@@ -711,7 +792,16 @@ def test_run_policy_never_changes_the_gripper():
     assert len(driver.commands) == 3 and {gripper for _q, gripper in driver.commands} == {0.2}
 
 
-def test_run_policy_holds_below_the_ceiling():
+def test_run_policy_holds_below_the_ceiling(tmp_path, monkeypatch):
+    # From home, climbing pulls the tip back past the box's x face before it reaches the ceiling, so the
+    # box guard would answer first; widen x/y (same ceiling) to test the ceiling hold on its own.
+    wide = tmp_path / "scene.yaml"
+    wide.write_text(
+        "workspace: {x: [-0.6, 0.6], y: [-0.6, 0.6], z: [0.02, 0.30]}\n"
+        "zones: {handoff: {x: 0.28, y: -0.08, z: 0.10}}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(pr, "SCENE_PATH", wide)
     driver = FakeDriver()
     z0 = ik.fk_tip(driver.read()[0])[2]
     assert z0 < pr.ceiling_z()
@@ -727,6 +817,140 @@ def test_run_policy_holds_below_the_ceiling():
     assert max(heights) <= pr.ceiling_z() + 1e-9
     assert max(heights) > z0 + 0.01  # it did climb before being held
     assert "policy held below the ceiling" in events and events.count("policy held below the ceiling") == 1
+
+
+class GreedyPolicy(StubPolicy):
+    """Pushes whichever single joint moves the tip furthest along `sign * axis`: a policy chasing a hand
+    outside the box (or a bad one) in its worst case."""
+
+    def __init__(self, axis: int, sign: float) -> None:
+        super().__init__([0.0, 0.0, 0.0, 0.0])
+        self.axis, self.sign = axis, sign
+
+    def predict(self, obs, deterministic: bool = True):
+        self.observations.append(np.array(obs, dtype=np.float64))
+        q = np.array(obs[:5], dtype=np.float64)
+        p0 = ik.fk_tip(q)[self.axis]
+        best, action = 0.0, np.zeros(4, dtype=np.float32)
+        for j in range(4):
+            for sign in (-1.0, 1.0):
+                trial = q.copy()
+                trial[j] += sign * he.MAX_STEP_RAD
+                gain = self.sign * (ik.fk_tip(trial)[self.axis] - p0)
+                if gain > best:
+                    best, action = gain, np.eye(4, dtype=np.float32)[j] * sign
+        return action, None
+
+
+def workspace_box() -> dict[str, list[float]]:
+    from arm.replay import load_box
+
+    return load_box(pr.SCENE_PATH)
+
+
+@pytest.mark.parametrize(
+    ("axis", "sign", "face"),
+    [(2, -1.0, "floor"), (0, -1.0, "x low"), (1, 1.0, "y high"), (1, -1.0, "y low")],
+)
+def test_run_policy_never_carries_the_tip_out_of_the_workspace_box(axis, sign, face):
+    """The verifier's case: a policy that drives the tip through the floor or a side is held at the face."""
+    box = workspace_box()
+    driver = FakeDriver()
+    events: list[str] = []
+    policy = GreedyPolicy(axis, sign)
+    pr.run_policy(driver, lambda: None, "unused.zip", timeout=4.0, on_event=events.append, policy=policy)
+    tips = [ik.fk_tip(q) for q, _gripper in driver.commands]
+    assert tips, face
+    for tip in tips:
+        for a, v in zip("xyz", tip, strict=True):
+            assert box[a][0] - 1e-9 <= v <= box[a][1] + 1e-9, (face, a, v)
+    start = ik.fk_tip(ik.home_q())[axis]
+    assert sign * (tips[-1][axis] - start) > 0.01, face  # it did move the way it was pushed
+    # ...until a face held it (a sideways push swings the tip around the base into the near x face first:
+    # the verifier's hand at y = 0.40 pulled the old runner's tip to x = 0.05)
+    nearest_face = min(abs(v - bound) for a, v in zip("xyz", tips[-1], strict=True) for bound in box[a])
+    assert nearest_face < 0.02, (face, tips[-1])
+    assert events.count("policy held inside the workspace box") == 1, events
+
+
+def test_run_policy_from_outside_the_box_may_only_come_back():
+    """An arm already outside the box is not frozen there: steps back in pass, steps further out hold."""
+    box = workspace_box()
+    lim = ik.limits()
+    q = np.array(ik.home_q())
+    for _ in range(400):  # walk the tip below the floor, joint step by joint step, inside the joint limits
+        best, best_q = 0.0, None
+        for j in range(4):
+            for s in (-1.0, 1.0):
+                trial = q.copy()
+                trial[j] = float(np.clip(trial[j] + s * he.MAX_STEP_RAD, *lim[ik.JOINTS[j]]))
+                gain = ik.fk_tip(q)[2] - ik.fk_tip(trial)[2]
+                if gain > best:
+                    best, best_q = gain, trial
+        if best_q is None or ik.fk_tip(q)[2] < box["z"][0] - 0.01:
+            break
+        q = best_q
+    z_start = ik.fk_tip(q)[2]
+    assert z_start < box["z"][0] - 0.005  # below the floor
+    down = FakeDriver(q0=[float(v) for v in q])
+    pr.run_policy(down, lambda: None, "unused.zip", timeout=1.0, policy=GreedyPolicy(2, -1.0))
+    assert min(ik.fk_tip(c[0])[2] for c in down.commands) >= z_start - 1e-9
+    up = FakeDriver(q0=[float(v) for v in q])
+    pr.run_policy(up, lambda: None, "unused.zip", timeout=1.0, policy=GreedyPolicy(2, 1.0))
+    assert ik.fk_tip(up.commands[-1][0])[2] > box["z"][0]  # climbed back in
+
+
+def test_run_policy_clamps_the_target_inside_the_box():
+    box = workspace_box()
+    inset = pr.TARGET_INSET_M
+    for hand, expect in (
+        ({"x": 0.25, "y": 0.0, "z": -0.20}, {2: box["z"][0] + inset}),  # a hand reading below the table
+        ({"x": 0.25, "y": 0.40, "z": 0.10}, {1: box["y"][1] - inset}),  # beyond the taped edge
+        (
+            {"x": 0.02, "y": -0.40, "z": 0.40},
+            {0: box["x"][0] + inset, 1: box["y"][0] + inset, 2: box["z"][1] - inset},
+        ),
+    ):
+        policy = StubPolicy([0.0, 0.0, 0.0, 0.0])
+        events: list[str] = []
+        scene = {"hand": {"marker": 40, **hand, "seen": True}}
+        pr.run_policy(
+            FakeDriver(),
+            lambda s=scene: s,
+            "unused.zip",
+            timeout=3 * he.DT,
+            on_event=events.append,
+            policy=policy,
+        )
+        for obs in policy.observations:
+            for i, v in expect.items():
+                assert obs[12 + i] == pytest.approx(v), (hand, i)
+        assert events.count("policy target clamped inside the workspace box") == 1
+    # a target inside the inset box is passed through untouched and nothing is reported
+    policy = StubPolicy([0.0, 0.0, 0.0, 0.0])
+    events = []
+    hand = {"marker": 40, "x": 0.25, "y": 0.05, "z": 0.03, "seen": True}
+    pr.run_policy(
+        FakeDriver(),
+        lambda: {"hand": hand},
+        "unused.zip",
+        timeout=he.DT,
+        on_event=events.append,
+        policy=policy,
+    )
+    assert np.allclose(policy.observations[-1][12:15], [0.25, 0.05, 0.08])
+    assert not any("clamped" in e for e in events)
+
+
+def test_run_policy_refuses_without_a_workspace_box(tmp_path, monkeypatch):
+    bad = tmp_path / "scene.yaml"
+    bad.write_text("zones: {handoff: {x: 0.28, y: -0.08, z: 0.1}}\n", encoding="utf-8")
+    monkeypatch.setattr(pr, "SCENE_PATH", bad)
+    driver = FakeDriver()
+    events: list[str] = []
+    policy = StubPolicy([1.0, 0.0, 0.0, 0.0])
+    assert pr.run_policy(driver, lambda: None, "unused.zip", on_event=events.append, policy=policy) is False
+    assert driver.commands == [] and events[-1].startswith("policy unavailable: no workspace box")
 
 
 def test_run_policy_builds_the_observation_from_the_scene_and_the_driver():

@@ -525,6 +525,7 @@ def test_reward_wrapper_rejects_non_numeric_and_raising_rewards():
     check(lambda obs, action, prev_action, info: [0.1], "not a number")
     check(lambda obs, action, prev_action, info: 1 / 0, "raised ZeroDivisionError")
     check(lambda obs, action, prev_action, info: info["missing"], "raised KeyError")
+    check(lambda obs, action, prev_action, info: 10**1000, "outside the finite float range")
     exits = "import math\n\ndef reward(obs, action, prev_action, info):\n    raise SystemExit(0)\n"
     check(load_entry(exits, entry="reward"), "raised SystemExit")
     # a numpy scalar and an int are numbers
@@ -544,6 +545,11 @@ def test_train_validates_its_arguments_and_writes_null_eval_keys(tmp_path):
         train.train(BASELINE, 64, out, n_envs=1, seed=-1)
     with pytest.raises(ValueError, match="eval_episodes"):
         train.train(BASELINE, 64, out, n_envs=1, eval_episodes=-3)
+    with pytest.raises(ValueError, match="non-empty"):
+        train.train(BASELINE, 64, "", n_envs=1)
+    for timeout in (0.0, -1.0, math.nan, math.inf):
+        with pytest.raises(ValueError, match="worker_timeout_s"):
+            train.train(BASELINE, 64, out, n_envs=1, worker_timeout_s=timeout)
     with pytest.raises(ValueError, match="seed"):
         evaluate.run_episodes(None, 1, seed=-1)
     with pytest.raises(ValueError, match="episodes"):
@@ -561,8 +567,7 @@ def test_train_validates_its_arguments_and_writes_null_eval_keys(tmp_path):
 
 @pytest.mark.parametrize("n_envs", [1, 2])
 def test_train_cli_reports_a_raising_reward_as_an_error(tmp_path, n_envs):
-    """A reward that raises at call time ends the run with one `error:` line and exit 2, under DummyVecEnv
-    and under SubprocVecEnv (where the worker dies), without a hang or a second traceback from the cleanup."""
+    """A reward that raises ends single- and multiple-worker runs without a cleanup hang."""
     bad = tmp_path / "raises.py"
     src = "import math\n\ndef reward(obs, action, prev_action, info):\n    return 1 / 0\n"
     bad.write_text(src, encoding="utf-8")
@@ -575,6 +580,38 @@ def test_train_cli_reports_a_raising_reward_as_an_error(tmp_path, n_envs):
     assert last.startswith("error: "), last
     assert "ZeroDivisionError" in proc.stderr
     assert proc.stdout.strip() == "" and not (out / "policy.zip").exists()
+
+
+@pytest.mark.parametrize("n_envs", [1, 2])
+@pytest.mark.parametrize("body", ["while True:\n        pass", "return math.factorial(100000000)"])
+def test_train_kills_nonreturning_rewards_including_native_code(tmp_path, n_envs, body):
+    import multiprocessing
+
+    from rl import train
+
+    path = tmp_path / "hang.py"
+    path.write_text(
+        "import math\n\ndef reward(obs, action, prev_action, info):\n    " + body + "\n", encoding="utf-8"
+    )
+    assert check_source(path.read_text(encoding="utf-8"), entry="reward") == []
+    original = {process.pid for process in multiprocessing.active_children()}
+    started = time.monotonic()
+    with pytest.raises(TimeoutError, match="reward execution timed out"):
+        train.train(path, 64, tmp_path / "out", n_envs=n_envs, eval_episodes=0, worker_timeout_s=0.2)
+    assert time.monotonic() - started < 30
+    assert not (tmp_path / "out" / "policy.zip").exists()
+    assert {process.pid for process in multiprocessing.active_children()} <= original
+
+
+@pytest.mark.parametrize("args", [["--steps", "0"], ["--steps", "-1"], ["--seed", "-1"]])
+def test_environment_check_refuses_invalid_arguments_before_constructing_an_env(monkeypatch, args):
+    def unexpected():
+        raise AssertionError("invalid CLI arguments must not create an environment")
+
+    monkeypatch.setattr(he, "HandoffEnv", unexpected)
+    with pytest.raises(SystemExit) as exc:
+        he.main(["--check", *args])
+    assert exc.value.code == 2
 
 
 # ------------------------------------------------------------------ literal pins (final hardening)

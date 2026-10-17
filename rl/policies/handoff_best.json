@@ -1,0 +1,21 @@
+{
+  "policy": "handoff_best.zip",
+  "sha256": "20241035387934aa96f0bea819e584c21b63be4572452e9027bb62dd3d3a702c",
+  "source_policy": "rl/runs/baseline/policy.zip",
+  "reward": "rl/rewards/baseline.py",
+  "requested_steps": 500000,
+  "steps": 507904,
+  "training_seed": 1,
+  "selection_reason": "The 500k-step hand-written baseline outperformed the four approximately 150k-step reward variants; this is the baseline policy, not a generated-reward winner.",
+  "evaluation": {
+    "evaluated_on": "2026-10-17",
+    "seed": 0,
+    "episodes": 100,
+    "successes": 97,
+    "success_rate": 0.97,
+    "mean_steps_to_success": 47.95876288659794,
+    "falls": 0,
+    "mean_final_dist": 0.018811041188080378
+  },
+  "deployment": "simulation; config/rl.yaml use_policy remains false pending real-arm M4 validation"
+}

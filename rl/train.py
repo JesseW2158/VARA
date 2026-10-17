@@ -9,7 +9,9 @@ the function, and nothing ever imports the reward module). `RewardWrapper` repla
 with `reward(obs, action, prev_action, info)`; the success metric stays the env's `info["success"]`: the
 reward sees a copy of `info`, so nothing it writes reaches Monitor, the callbacks or progress.csv.
 
-Stable-Baselines3 PPO, MlpPolicy, SubprocVecEnv (spawn) for more than one env, DummyVecEnv for one. Writes to
+Stable-Baselines3 PPO, MlpPolicy, SubprocVecEnv (spawn) for every env, including a single env. Each worker
+response has a parent-enforced deadline, including reward loading and execution; a timeout terminates all
+workers, even when a reward hangs inside native math code. Writes to
 `--out`: `checkpoints/` every CHECKPOINT_EVERY steps, `progress.csv` (step, mean_reward, success_rate over the
 last WINDOW episodes) at least every PROGRESS_EVERY steps and at the end, `policy.zip`, and `summary.json`
 with a `--eval-episodes` (default 100) evaluation on a fresh env (success rate, mean steps to success;
@@ -43,7 +45,9 @@ import numpy as np
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
 from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
+from stable_baselines3.common.vec_env import SubprocVecEnv, VecEnv
+from stable_baselines3.common.vec_env.base_vec_env import CloudpickleWrapper
+from stable_baselines3.common.vec_env.subproc_vec_env import _worker
 
 from rl.evaluate import empty_result, run_episodes
 from rl.handoff_env import ACTION_SIZE, FALL_PENALTY, HandoffEnv
@@ -59,6 +63,8 @@ EVAL_EPISODES = 100
 PROGRESS_COLUMNS = ("step", "mean_reward", "success_rate")
 MAX_ROLLOUT = 1024  # n_steps per env
 MIN_ROLLOUT = 64
+WORKER_TIMEOUT_S = 5.0  # one env step including its reward; enforced outside the worker
+STARTUP_TIMEOUT_S = 60.0  # spawning imports torch before loading the reward
 
 
 def copy_info(info: dict[str, Any]) -> dict[str, Any]:
@@ -111,7 +117,12 @@ class RewardWrapper(gym.Wrapper):
             raise ValueError(f"reward() raised {type(exc).__name__}: {exc} at step {step}") from exc
         if not isinstance(value, numbers.Real):  # a numeric string, None or a list is not a reward
             raise ValueError(f"reward() returned {value!r} at step {step}, not a number")
-        reward = float(value)
+        try:
+            reward = float(value)
+        except (OverflowError, ValueError, TypeError) as exc:
+            raise ValueError(
+                f"reward() returned a number outside the finite float range at step {step}"
+            ) from exc
         if not math.isfinite(reward):
             raise ValueError(f"reward() returned {reward!r} at step {step}")
         if info.get("fell"):
@@ -126,13 +137,14 @@ class EnvFactory:
     def __init__(self, reward_path: str, seed: int = 0) -> None:
         self.reward_path = str(reward_path)
         self.seed = int(seed)
+        self.env_class = HandoffEnv  # preserve an explicitly injected env across spawn as well
 
     def __call__(self) -> gym.Env:
         from sim.restricted import load_entry  # the one sanctioned loader of AI-written code
 
         src = pathlib.Path(self.reward_path).read_text(encoding="utf-8")
         reward_fn = load_entry(src, entry="reward", filename=self.reward_path)
-        env = Monitor(RewardWrapper(HandoffEnv(), reward_fn))
+        env = Monitor(RewardWrapper(self.env_class(), reward_fn))
         env.action_space.seed(self.seed)
         return env
 
@@ -199,18 +211,85 @@ def rollout_sizes(steps: int, n_envs: int) -> tuple[int, int]:
     return n_steps, batch
 
 
-def make_vec_env(reward_path: str | pathlib.Path, n_envs: int, seed: int):
-    """SubprocVecEnv (spawn, Windows-safe) for n_envs > 1, DummyVecEnv for 1."""
+class _DeadlineConnection:
+    """Parent endpoint with a bounded recv; the worker keeps an ordinary multiprocessing pipe."""
+
+    def __init__(self, connection: Any, timeout: float) -> None:
+        self.connection = connection
+        self.timeout = timeout
+
+    def recv(self):
+        if not self.connection.poll(self.timeout):
+            raise TimeoutError(f"environment worker exceeded {self.timeout:g} s; reward execution timed out")
+        return self.connection.recv()
+
+    def send(self, value):
+        return self.connection.send(value)
+
+    def close(self):
+        self.connection.close()
+
+
+class BoundedSubprocVecEnv(SubprocVecEnv):
+    """SB3's spawn workers with bounded startup, step and cleanup waits.
+
+    The worker protocol and vector operations are SB3's; only construction wraps the parent pipes.
+    A reward never executes in the training parent, which can kill a stuck worker without its cooperation.
+    """
+
+    def __init__(self, factories: list[EnvFactory], timeout: float = WORKER_TIMEOUT_S) -> None:
+        self.waiting = False
+        self.closed = False
+        self.processes = []
+        self.remotes = []
+        ctx = multiprocessing.get_context("spawn")
+        try:
+            for factory in factories:
+                parent, child = ctx.Pipe()
+                self.remotes.append(_DeadlineConnection(parent, STARTUP_TIMEOUT_S))
+                process = ctx.Process(
+                    target=_worker, args=(child, parent, CloudpickleWrapper(factory)), daemon=True
+                )
+                process.start()
+                self.processes.append(process)
+                child.close()
+            self.remotes[0].send(("get_spaces", None))
+            observation_space, action_space = self.remotes[0].recv()
+            VecEnv.__init__(self, len(factories), observation_space, action_space)
+            for remote in self.remotes:
+                remote.timeout = timeout
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self) -> None:
+        """Bounded cleanup also works while a reward is stuck or another worker already died."""
+        if self.closed:
+            return
+        for process in self.processes:
+            if process.is_alive():
+                process.terminate()
+        for process in self.processes:
+            process.join(timeout=1.0)
+            if process.is_alive():
+                process.kill()
+                process.join(timeout=1.0)
+        for remote in self.remotes:
+            remote.close()
+        self.waiting = False
+        self.closed = True
+
+
+def make_vec_env(reward_path: str | pathlib.Path, n_envs: int, seed: int, timeout: float = WORKER_TIMEOUT_S):
+    """Spawn each env, including n_envs=1, so the parent can terminate a non-returning reward."""
     factories = [EnvFactory(str(reward_path), seed + i) for i in range(n_envs)]
-    if n_envs > 1:
-        return SubprocVecEnv(factories, start_method="spawn")
-    return DummyVecEnv(factories)
+    return BoundedSubprocVecEnv(factories, timeout=timeout)
 
 
 WORKER_ERRORS = (EOFError, BrokenPipeError, ConnectionError)  # what the parent sees of a dead worker
 
 
-def _close_vec_env(vec_env: DummyVecEnv | SubprocVecEnv) -> None:
+def _close_vec_env(vec_env: SubprocVecEnv) -> None:
     """Close the vec env; when a worker already died (its pipe is broken), terminate the rest instead of
     waiting on them, so the original error surfaces rather than a second traceback from the cleanup."""
     try:
@@ -232,6 +311,7 @@ def train(
     seed: int = 0,
     eval_episodes: int = EVAL_EPISODES,
     verbose: int = 0,
+    worker_timeout_s: float = WORKER_TIMEOUT_S,
 ) -> dict[str, Any]:
     """Train PPO with the reward in `reward_path`, save `out/policy.zip` and return the written summary.
 
@@ -239,6 +319,8 @@ def train(
     worker dies (a reward that raises under SubprocVecEnv; the worker's own traceback goes to stderr).
     """
     reward_path = pathlib.Path(reward_path)
+    if not str(out).strip():
+        raise ValueError("out must be a non-empty output directory")
     out = pathlib.Path(out)
     if steps < 1 or n_envs < 1:
         raise ValueError("steps and n_envs must be at least 1")
@@ -246,6 +328,8 @@ def train(
         raise ValueError(f"seed must be a non-negative integer, got {seed}")
     if eval_episodes < 0:
         raise ValueError(f"eval_episodes must be at least 0, got {eval_episodes}")
+    if not math.isfinite(worker_timeout_s) or worker_timeout_s <= 0:
+        raise ValueError("worker_timeout_s must be finite and positive")
     src = reward_path.read_text(encoding="utf-8")
     problems = check_source(src, entry="reward")
     if problems:
@@ -261,7 +345,7 @@ def train(
     )
     started = time.time()
     try:
-        vec_env = make_vec_env(reward_path, n_envs, seed)
+        vec_env = make_vec_env(reward_path, n_envs, seed, worker_timeout_s)
     except WORKER_ERRORS as exc:
         raise RuntimeError("an environment worker died while starting (its traceback is above)") from exc
     try:
@@ -319,6 +403,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--eval-episodes", type=int, default=EVAL_EPISODES)
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument(
+        "--worker-timeout-s",
+        type=float,
+        default=WORKER_TIMEOUT_S,
+        help="maximum seconds for one environment/reward response",
+    )
     args = parser.parse_args(argv)
     if not pathlib.Path(args.reward).is_file():
         print(f"error: no such reward file: {args.reward}", file=sys.stderr)
@@ -332,6 +422,7 @@ def main(argv: list[str] | None = None) -> int:
             seed=args.seed,
             eval_episodes=args.eval_episodes,
             verbose=1 if args.verbose else 0,
+            worker_timeout_s=args.worker_timeout_s,
         )
     except (ValueError, RuntimeError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)

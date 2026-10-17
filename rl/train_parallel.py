@@ -2,7 +2,7 @@
 
 `train_parallel(rewards, *, steps=600_000, out_dir=ROOT / "rl" / "runs" / "parallel", local=False,
 poll_s=30, n_envs=None, eval_episodes=100, seed=0, policy_dest=BEST_POLICY, curves_path=CURVES_PATH,
-hints=None, report=None, max_wait_s=None, snapshot=SNAPSHOT_NAME) -> dict` trains one PPO policy per
+hints=None, report=None, max_wait_s=3600, snapshot=SNAPSHOT_NAME) -> dict` trains one PPO policy per
 reward file (at most MAX_SANDBOXES = 4 files), collects `policy.zip`, `progress.csv`, `summary.json` and
 `train.log` of each run in `out_dir/<variant>/`, picks the best by evaluation success rate, then by mean
 steps to success, then by order, copies its policy to `rl/policies/handoff_best.zip`, and writes
@@ -122,6 +122,7 @@ LOCAL_ENV_KEYS = ("PATH", "SYSTEMROOT", "TEMP", "TMP", "USERNAME")
 LOCAL_N_ENVS = 4
 CREATE_TIMEOUT_S = 120
 EXEC_TIMEOUT_S = 60
+MAX_WAIT_S = 3600.0  # applies by default to both local training and Daytona polling
 # Shell probes run in REMOTE_DIR: `kill -0` is a shell builtin, so no procps is needed in the slim image.
 STATUS_CMD = (
     "if [ -f out/summary.json ]; then echo done; "
@@ -228,7 +229,7 @@ def _now_iso() -> str:
 def _float_or_none(value: Any) -> float | None:
     try:
         number = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     return number if math.isfinite(number) else None
 
@@ -327,6 +328,35 @@ def _train_command(
 # ---------------------------------------------------------------------------------------- local path
 
 
+def _poll_pause(started: float, poll_s: float, max_wait_s: float, runner: str) -> None:
+    remaining = max_wait_s - (time.monotonic() - started)
+    if remaining <= 0:
+        raise TimeoutError(f"{runner} training exceeded {max_wait_s:g} s")
+    sleep(min(poll_s, remaining))
+    if time.monotonic() - started >= max_wait_s:
+        raise TimeoutError(f"{runner} training exceeded {max_wait_s:g} s")
+
+
+def _kill_local(proc: subprocess.Popen) -> None:
+    """Stop this training and its environment workers, including a worker stuck in native code."""
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+            check=False,
+        )
+    else:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    if proc.poll() is None:
+        proc.kill()
+    proc.wait(timeout=10)
+
+
 def _run_local(
     runs: list[dict[str, Any]],
     steps: int,
@@ -335,7 +365,7 @@ def _run_local(
     seed: int,
     poll_s: float,
     say: Callable[[str], None],
-    max_wait_s: float | None,
+    max_wait_s: float,
 ) -> None:
     """The trainings as local subprocesses of rl.train, polled until every one has ended."""
     procs: list[tuple[dict[str, Any], subprocess.Popen[bytes], Any]] = []
@@ -347,14 +377,23 @@ def _run_local(
             cmd = _train_command(run["reward"], steps, str(vdir), n_envs, eval_episodes, seed)
             cmd[0] = sys.executable
             handle = (vdir / "train.log").open("wb")
-            proc = subprocess.Popen(
-                cmd, cwd=str(ROOT), env=clean_env(), stdout=handle, stderr=subprocess.STDOUT
-            )
+            try:
+                proc = subprocess.Popen(
+                    cmd,
+                    cwd=str(ROOT),
+                    env=clean_env(),
+                    stdout=handle,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=os.name != "nt",
+                )
+            except BaseException:
+                handle.close()
+                raise
             procs.append((run, proc, handle))
             say(f"{run['name']}: training started locally (pid {proc.pid}, {n_envs} envs, {steps} steps)")
         pending = set(range(len(procs)))
         while pending:
-            sleep(poll_s)
+            _poll_pause(started, poll_s, max_wait_s, "local")
             for i in sorted(pending):
                 run, proc, handle = procs[i]
                 code = proc.poll()
@@ -375,15 +414,14 @@ def _run_local(
                     say(f"{run['name']}: failed ({run['error']})")
                 else:
                     say(f"{run['name']}: finished")
-            if pending and max_wait_s is not None and time.monotonic() - started > max_wait_s:
+            if pending and time.monotonic() - started > max_wait_s:
                 raise TimeoutError(f"local training exceeded {max_wait_s:g} s")
     finally:
         for run, proc, handle in procs:
             if proc.poll() is None:
-                proc.kill()
                 try:
-                    proc.wait(timeout=10)
-                except subprocess.TimeoutExpired:
+                    _kill_local(proc)
+                except (OSError, subprocess.TimeoutExpired):
                     log.error("%s: training process %d did not stop", run["name"], proc.pid)
             if not handle.closed:
                 handle.close()
@@ -449,7 +487,7 @@ def _run_sandboxes(
     seed: int,
     poll_s: float,
     say: Callable[[str], None],
-    max_wait_s: float | None,
+    max_wait_s: float,
     snapshot: str,
 ) -> None:
     """Create one sandbox per run, train, poll, download; delete every sandbox in `finally`."""
@@ -481,8 +519,10 @@ def _run_sandboxes(
             say(f"{run['name']}: training started ({train})")
         pending = set(range(len(sandboxes)))
         while pending:
-            sleep(poll_s)
+            _poll_pause(started, poll_s, max_wait_s, "sandbox")
             for i in sorted(pending):
+                if time.monotonic() - started >= max_wait_s:
+                    raise TimeoutError(f"sandbox training exceeded {max_wait_s:g} s")
                 run, sandbox = sandboxes[i]
                 progress = _result_text(
                     sandbox.process.exec(PROGRESS_CMD, cwd=REMOTE_DIR, timeout=EXEC_TIMEOUT_S)
@@ -503,7 +543,7 @@ def _run_sandboxes(
                 )
                 run["error"] = _last_error(tail, f"training ended without summary.json (status {status!r})")
                 say(f"{run['name']}: failed ({run['error']})")
-            if pending and max_wait_s is not None and time.monotonic() - started > max_wait_s:
+            if pending and time.monotonic() - started > max_wait_s:
                 raise TimeoutError(f"sandbox training exceeded {max_wait_s:g} s")
     finally:
         _restore_sigterm(previous)
@@ -535,6 +575,10 @@ def _collect(run: dict[str, Any]) -> dict[str, Any]:
     error = run.get("error")
     if error is None and summary is None:
         error = "no summary.json after training"
+    if error is None and not policy.is_file():
+        error = "no policy.zip after training"
+    if error is None and rate is not None and not 0.0 <= rate <= 1.0:
+        error = "invalid evaluation success_rate: expected a value from 0 to 1"
     return {
         **run,
         "summary": summary,
@@ -554,11 +598,19 @@ def select_best(variants: Sequence[dict[str, Any]]) -> int | None:
     best: int | None = None
     best_key: tuple[float, float, int] | None = None
     for i, variant in enumerate(variants):
-        rate = variant.get("success_rate")
+        rate = _float_or_none(variant.get("success_rate"))
         policy = variant.get("policy")
-        if rate is None or not policy or not pathlib.Path(policy).is_file():
+        if (
+            variant.get("error")
+            or rate is None
+            or not 0 <= rate <= 1
+            or not policy
+            or not pathlib.Path(policy).is_file()
+        ):
             continue
-        mean = variant.get("mean_steps_to_success")
+        mean = _float_or_none(variant.get("mean_steps_to_success"))
+        if mean is not None and mean <= 0:
+            continue
         key = (-float(rate), float(mean) if mean is not None else math.inf, i)
         if best_key is None or key < best_key:
             best, best_key = i, key
@@ -609,7 +661,7 @@ def train_parallel(
     curves_path: str | pathlib.Path = CURVES_PATH,
     hints: Sequence[str] | None = None,
     report: Callable[[str], None] | None = None,
-    max_wait_s: float | None = None,
+    max_wait_s: float | None = MAX_WAIT_S,
     snapshot: str = SNAPSHOT_NAME,
 ) -> dict[str, Any]:
     """Train every reward (at most four), pick the best policy, write curves.json; see the module doc.
@@ -628,14 +680,24 @@ def train_parallel(
             raise FileNotFoundError(f"no such reward file: {path}")
     if int(steps) < 1 or int(eval_episodes) < 0 or int(seed) < 0:
         raise ValueError("steps must be >= 1, eval_episodes >= 0 and seed >= 0")
-    if not (float(poll_s) > 0):
-        raise ValueError(f"poll_s must be positive, got {poll_s!r}")
+    if not math.isfinite(float(poll_s)) or not (float(poll_s) > 0):
+        raise ValueError(f"poll_s must be finite and positive, got {poll_s!r}")
+    max_wait_s = MAX_WAIT_S if max_wait_s is None else float(max_wait_s)
+    if not math.isfinite(max_wait_s) or max_wait_s <= 0:
+        raise ValueError("max_wait_s must be finite and positive")
+    if n_envs is not None and n_envs < 1:
+        raise ValueError("n_envs must be at least 1")
+    if not str(out_dir).strip():
+        raise ValueError("out_dir must be a non-empty output directory")
     if hints is not None and len(hints) != len(paths):
         raise ValueError("hints must have one entry per reward")
     out = pathlib.Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     say = report if report is not None else (lambda line: log.info("%s", line))
     names = variant_names(paths)
+    for name in names:
+        if any((out / name / artifact).exists() for artifact in RESULT_FILES):
+            raise ValueError(f"existing training artifacts in {out / name}; choose a fresh output directory")
     runner = "local" if local else "daytona"
     runs: list[dict[str, Any]] = [
         {
@@ -720,6 +782,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--poll-s", type=float, default=30.0)
     parser.add_argument(
+        "--max-wait-s",
+        type=float,
+        default=MAX_WAIT_S,
+        help="maximum wall time for training and polling (default 3600 s)",
+    )
+    parser.add_argument(
         "--build-snapshot", action="store_true", help="build the RL snapshot first (needs a key)"
     )
     parser.add_argument("--snapshot", default=SNAPSHOT_NAME)
@@ -758,8 +826,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             policy_dest=args.policy_dest,
             curves_path=args.curves,
             snapshot=args.snapshot,
+            max_wait_s=args.max_wait_s,
         )
     except (ValueError, FileNotFoundError, RuntimeError, TimeoutError, OSError) as exc:
+        print(f"error: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 2
+    except Exception as exc:  # the Daytona SDK's own DaytonaError family subclasses none of the above
+        if not type(exc).__module__.startswith("daytona"):
+            raise
         print(f"error: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 2
     for variant in result["variants"]:

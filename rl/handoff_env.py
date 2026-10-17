@@ -470,6 +470,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args(argv)
     if args.check:
+        if args.steps < 1 or args.seed < 0:
+            parser.error("--check needs --steps >= 1 and --seed >= 0")
         _check(args.steps, args.seed)
         return 0
     parser.print_help()

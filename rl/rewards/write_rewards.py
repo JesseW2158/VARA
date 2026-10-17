@@ -37,7 +37,7 @@ from typing import Any
 from agents.candidates import extract_code, extract_code_blocks
 from agents.llm import chat, codegen_model
 from rl import handoff_env as he
-from sim.candidate_check import check_source
+from sim.candidate_check import MAX_LINES, check_source
 
 __all__ = [
     "CLOSING_LINE",
@@ -68,6 +68,9 @@ CLOSING_LINE = "Return four Python code blocks, one per variant, nothing else."
 # Every written variant opens with three comment lines: provenance, then the file-level noqa and fmt-off
 # directives, so ruff skips the generated file (lint and format) without an exclusion in pyproject.toml.
 HEADER_LINES = ("# ruff: noqa", "# fmt: off")
+# The header (one provenance line + HEADER_LINES) is checked with the body, so it counts toward
+# check_source's MAX_LINES: the model is told the rest.
+BODY_MAX_LINES = MAX_LINES - 1 - len(HEADER_LINES)
 SYSTEM_PROMPT = (
     "You design reward functions for reinforcement learning on a robot arm. Reply with Python code blocks "
     "only: no prose before, between or after them."
@@ -163,7 +166,7 @@ def trap_list() -> str:
 numpy, no `from typing import ...`, no other import), constants `NAME = <literal>`, and `def` functions.
 - The entry point is exactly `def reward(obs, action, prev_action, info):` at the top level, with those four \
 parameter names and no others. It returns a finite float.
-- At most 200 lines.
+- At most {BODY_MAX_LINES} lines (a 3-line provenance header is added before the check).
 - No name that starts with an underscore anywhere, not even a bare `_` loop variable, and no \
 `if __name__ == "__main__":` block.
 - No annotation that names a forbidden thing (`info: object`) and none of these names anywhere: \

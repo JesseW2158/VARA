@@ -16,14 +16,19 @@ policy=None) -> bool` is what `arm.real_robot.carry_to_hand` calls when config/r
   the readings, never from a simulator), `policy.predict(obs, deterministic=True)` clipped to [-1, 1],
   scaled to +-2 degrees on joints 0-3 and integrated into a command that starts from the present pose and
   stays 3 degrees inside the limits, exactly like the env's command. A step whose tip would rise above the
-  workspace ceiling (config/scene.yaml `workspace.z[1]`, 0.30 m) is held instead. The gripper value never
-  changes: every command repeats the last commanded gripper (or the reading at the start), so a held
-  object stays held.
+  workspace ceiling (config/scene.yaml `workspace.z[1]`, 0.30 m) is held instead. The workspace box binds
+  the rest of the motion the way it binds the IK path in arm/real_robot.py: the target is clamped
+  TARGET_INSET_M inside the box (a hand reading below the table or beyond the taped edge is aimed at the
+  nearest point inside), and a step that would carry the tip farther outside the box than it already is
+  (through the floor or a side) is held. Without a readable box the policy does not run (the IK path takes
+  over). The gripper value never changes: every command repeats the last commanded gripper (or the reading
+  at the start), so a held object stays held.
 - Returns True once the tip has been within 3 cm of the target for 10 consecutive steps, False on timeout,
   when `driver.stopped` is set (checked every step; a refused command counts) or when the policy cannot be
   loaded (the IK path takes over). `on_event` receives short strings: `policy start: <file>`,
   `policy success after N steps`, `policy timeout after N steps`, `policy stopped`,
-  `policy unavailable: ...`, `policy held below the ceiling`.
+  `policy unavailable: ...`, `policy held below the ceiling`, `policy held inside the workspace box`,
+  `policy target clamped inside the workspace box` (each hold/clamp note once per run).
 - `clock` and `sleep` default to `time.monotonic`/`time.sleep` on a real driver; on a FakeDriver a virtual
   clock advances by what the loop sleeps and nothing waits, so a FakeDriver run takes no wall time and a
   timeout of 8 s is 240 steps. `policy` lets tests pass an object with `predict(obs, deterministic=True)
@@ -56,6 +61,7 @@ from rl.handoff_env import (
 __all__ = [
     "CEILING_Z",
     "HAND_OFFSET_Z",
+    "TARGET_INSET_M",
     "ceiling_z",
     "clear_policy_cache",
     "handoff_zone",
@@ -68,6 +74,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 SCENE_PATH = ROOT / "config" / "scene.yaml"
 HAND_OFFSET_Z = 0.05  # m above the wristband
 CEILING_Z = 0.30  # m, the default when config/scene.yaml has no workspace ceiling
+TARGET_INSET_M = 0.03  # m, targets are clamped this far inside the workspace box (as arm/real_robot.py does)
 
 log = logging.getLogger(__name__)
 _POLICIES: dict[str, Any] = {}
@@ -135,6 +142,20 @@ def target_point(scene: dict[str, Any] | None) -> tuple[float, float, float]:
     return handoff_zone(scene)
 
 
+def _box_excess(point: Any, box: dict[str, list[float]]) -> float:
+    """How far (m) `point` lies outside `box` along its worst axis; 0.0 inside."""
+    return max(
+        max(float(box[a][0]) - float(v), float(v) - float(box[a][1]), 0.0)
+        for a, v in zip("xyz", point, strict=True)
+    )
+
+
+def _clamp_into(point: Any, box: dict[str, list[float]]) -> np.ndarray:
+    return np.array(
+        [min(max(float(v), float(box[a][0])), float(box[a][1])) for a, v in zip("xyz", point, strict=True)]
+    )
+
+
 class _VirtualClock:
     """Time that advances only in `sleep`: a FakeDriver run takes no wall time."""
 
@@ -191,6 +212,14 @@ def run_policy(
         emit(f"policy unavailable: {type(exc).__name__}: {exc}")
         log.warning("policy %s unavailable: %s", policy_path, exc)
         return False
+    try:
+        from arm.replay import load_box, shrunk_box  # lazy: arm/replay.py is not in the RL sandbox bundle
+
+        box = load_box(SCENE_PATH)
+    except Exception as exc:  # no box, no policy: nothing moved yet and the IK path refuses too
+        emit(f"policy unavailable: no workspace box ({type(exc).__name__}: {exc})")
+        return False
+    target_box = shrunk_box(box, TARGET_INSET_M)
     now, pause = _timing(driver, clock, sleep)
     lim = ik.limits()
     lo = np.array([lim[joint][0] for joint in ik.JOINTS]) + MARGIN_RAD
@@ -203,6 +232,8 @@ def run_policy(
     streak = 0
     steps = 0
     held_warned = False
+    box_warned = False
+    clamp_warned = False
     start = now()
     next_tick = start
     emit(f"policy start: {name}")
@@ -219,7 +250,11 @@ def run_policy(
             q_cmd = q.copy()  # integrate from the present pose, as the env integrates from its start pose
             last = getattr(driver, "last_command", None)
             gripper_hold = float(last[1]) if last else float(gripper_read)
-        target = np.array(target_point(scene() if scene is not None else None))
+        raw_target = np.array(target_point(scene() if scene is not None else None))
+        target = _clamp_into(raw_target, target_box)
+        if not clamp_warned and not np.allclose(target, raw_target, rtol=0.0, atol=1e-12):
+            emit("policy target clamped inside the workspace box")
+            clamp_warned = True
         tip = np.array(ik.fk_tip(q))
         obs = build_observation(q, prev_action, target, tip=tip)
         raw, _state = model.predict(obs, deterministic=True)
@@ -232,6 +267,13 @@ def run_policy(
             if not held_warned:
                 emit("policy held below the ceiling")
                 held_warned = True
+        elif _box_excess(ik.fk_tip(q_next), box) > _box_excess(ik.fk_tip(q_cmd), box) + 1e-9:
+            # never deeper outside the box than the arm already is: the floor and sides bind like the ceiling
+            q_next = q_cmd.copy()
+            action = np.zeros(ACTION_SIZE)
+            if not box_warned:
+                emit("policy held inside the workspace box")
+                box_warned = True
         if not driver.command([float(v) for v in q_next], gripper_hold):
             emit("policy stopped")
             return False
