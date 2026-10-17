@@ -1,5 +1,40 @@
 # VARA implementation handoff
 
+## Latest follow-up (2026-10-17, Codex)
+
+Three parallel workstreams continued from the status below:
+
+**Combined gate: 1,242 passed, no skips, in 142.90 seconds.** Ruff check and format check pass
+(81 files), text files remain LF, and protected contracts/schemas are unchanged. This follow-up is
+saved in four task-sized local commits (A13, A15, A6, S0); no remote push was performed.
+
+- Clear-table fixture candidates 3 and 4 now avoid the blocked third tray slot by placing shortest
+  props first and releasing above existing tray contents near the tray center. Both pass 5/5 trials
+  at seed 7 with zero collisions, limit hits or IK failures. The full fake learn reached `saved`
+  (`runs/t-0011/`; isolated library `runs/e2e_fake/20261017-192552/skills/`). Scene, obstacles and
+  collision checks were unchanged. The 15 cm release involves dropping props and is not physically
+  validated. Seed 17 still produces rejected tea-tin/juice-box pickup collisions; this is not a
+  general guarantee of clear-table success.
+- Live carry now falls back to the handoff zone for out-of-box hand targets. Missing or insufficient
+  clearance and incomplete rises abort holding the object. Release requires measured arrival or
+  steady hand proximity; deadline, stalled-clock and tracking-limit failures retain the grasp.
+  Bounded travel can still continue into validated tracking before reaching above the target.
+- Added `python -m arm.inspect_hardware` and 51 tests. All serial access remains in `arm/driver.py`.
+  The command opens only the bus, reads registers/calibration, and closes the raw port without any
+  motor writes, including failure paths. See [hardware calibration notes](docs/hardware-calibration.md).
+
+**New physical finding:** follower COM8 calibration matches its saved file, but leader COM7 hardware
+offsets/ranges differ from its saved `my_awesome_leader_arm.json` on all six motors. No matching alternate
+file exists in the local calibration cache. Both arms answered all six motors; follower 11.9-12.0 V,
+31-34 C; leader 4.9 V, 26-28 C. Both reported torque off and stored goals zero. Evidence is
+`runs/hardware/20261017-continuation.json`. No torque, goals or calibration were changed. Reconcile the
+leader calibration before teleoperation, and still complete measured A6 before Cartesian replay.
+
+Additional open review findings: the disabled RL policy runner needs Cartesian tip-speed enforcement
+before D7; simulator snapshots currently lose incoming `seen=False` flags, so auxiliary post-handoff
+runs do not establish two-object behavior. During real `Driver.connect`, LeRobot `configure()` can
+temporarily remove torque between goal sync and re-enable; supported-pose validation remains required.
+
 ## Current continuation status (2026-10-17, Codex)
 
 **Read this section before the historical handoff below.** The original handoff predates the
@@ -44,9 +79,9 @@ The combined startup/video regression subset passed 75 tests. Both starter skill
 with the juice box, five trials, seed 7: **5/5 each, zero collisions and zero limit hits**. The fake
 `good_morning` routine was also saved and then replayed to `done ok` in an isolated library.
 
-Physical carry validation must still cover two inherited fallback behaviors: out-of-workspace hand
-targets are clamped into the allowed box, and an incomplete clearance rise can proceed to bounded
-tracking. These are covered by the existing simulation/mock tests, not validated with a held real object.
+The latest follow-up above replaces the inherited out-of-workspace clamp and incomplete-rise fallback
+with handoff-zone targeting and abort-while-holding behavior. Physical validation with a held object
+is still outstanding.
 
 Hardware was checked **read-only** using the reviewed `lerobot-tools/arm_check.py` in the conda
 `lerobot` environment. All six motors responded on both boards: leader COM7 / serial 5B90103224 at

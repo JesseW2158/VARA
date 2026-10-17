@@ -23,8 +23,8 @@ All Python commands use `.venv/Scripts/python.exe` unless another environment is
 | Check | Result |
 | --- | --- |
 | Initial `-m pytest -q` | 1,141 passed, no skips, 122.70 seconds |
-| Final `-m pytest -q` | **1,172 passed, no skips, 151.54 seconds** |
-| Final Ruff and whitespace gates | Check passed; 79 files already formatted; `git diff --check` passed |
+| First continuation `-m pytest -q` | **1,172 passed, no skips, 151.54 seconds** |
+| First continuation Ruff and whitespace gates | Check passed; 79 files already formatted; `git diff --check` passed |
 | Repository line endings and protected files | No tracked CRLF text files; no changes to `docs/interfaces.md`, `schemas/`, or `tests/contract/` |
 | `scripts/e2e_fake.py "put the juice box in the tray"` | Reached `saved`; candidate 3 selected, four candidates passed 5/5 |
 | `-m agents.router --eval --fake` | 20/20 phrases matched |
@@ -83,22 +83,66 @@ All raw encoder readings were within 0-4095. LeRobot calibration files already e
 VARA's A6 joint-to-simulation mapping: `config/joint_map.yaml` still explicitly contains placeholder
 signs and offsets. No Cartesian motion, teleoperation, goal sync or torque change was attempted.
 
+## Follow-up continuation
+
+Three workstreams ran in parallel: clear-table candidate repair, live-carry fallback safety, and
+hardware calibration review. Root added the read-only inspection command and integrated the changes.
+
+| Check | Result |
+| --- | --- |
+| Hardware inspection regression | 51 passed; fakes expose no motor-write/configure/torque APIs |
+| Final follow-up full suite | **1,242 passed, no skips, 142.90 seconds** |
+| Final follow-up formatting/contracts | Ruff check passed; 81 files formatted; no CRLF text or protected-contract changes |
+| Carry/replay regression | 122 passed; no release on failed clearance, arrival, timer or policy assumptions |
+| Fixture candidate regression | 58 passed, including scoring all six clear-table fixtures |
+| Clear-table candidates 3 and 4, seed 7 | 5/5 each; zero collisions, limit hits or IK failures; mean simulated duration 30.913/40.233 s |
+| `scripts/e2e_fake.py "clear the table"` | `saved`; candidate 3 selected; 13 trajectory segments validated and replayed |
+| COM8 read-only calibration comparison | All six motors matched `my_awesome_follower_arm.json` |
+| COM7 read-only calibration comparison | All six motors differed from `my_awesome_leader_arm.json`; no matching alternate cache file |
+
+The new passing fixtures use shortest-first placement and a 15 cm release near the tray center,
+avoiding the third slot that brought the forearm into the cereal box. The scene, obstacle, collision
+checker and success tests are unchanged. Evidence is under
+`runs/verification/clear-table-20261017/cand_3/` and `cand_4/`. Broader perturbations remain difficult:
+candidate 3 achieved 9/10 successes with no collisions at seed 42, while seed 17 rejected both
+strategies for tea-tin/juice-box contact during pickup. The elevated drop needs physical validation.
+
+The complete clear-table fake learn used `runs/t-0011/` and preserved the normal library by saving to
+`runs/e2e_fake/20261017-192552/skills/`. This supersedes the earlier no-passing-candidate demo outcome;
+it does not turn the earlier queued benchmarks into successful executions.
+
+Live carry now latches the configured handoff zone for out-of-box targets, refuses missing or
+insufficient clearance, and checks measured rise completion. Tracking opens the gripper only after
+encoder-confirmed zone arrival or continuous hand proximity. Missing hand detections reset the
+proximity timer; timeout or stalled-clock failure freezes while preserving the grasp. The optional
+policy sees the same fallback target, and its return value does not bypass the measured release check.
+
+`-m arm.inspect_hardware` records raw register and calibration evidence without motor writes, including
+partial-connection and read failure paths. Its real run correctly exited 1 for the leader calibration
+mismatch. Both arms reported torque off and stored goals zero; nothing was synchronized or powered.
+Full report: `runs/hardware/20261017-continuation.json`. See
+[hardware calibration notes](hardware-calibration.md) for supply, temperature and A6 prerequisites.
+
 ## Remaining acceptance work
 
 - A6: measure joint signs/offsets against the model and pass the five-pose 1.5 cm accuracy test.
 - A4/A9/A10/A11/A12/A13: supervised jog, replay, carry, grip and Esc latency acceptance on the follower.
-  Carry acceptance must include inherited fallback behavior: out-of-workspace hand targets clamp into
-  the workspace, and incomplete clearance rises can proceed to bounded tracking. Mock/simulation
-  coverage does not establish loaded-object clearance on the actual arm.
+  Carry now falls back to the handoff zone for out-of-box targets and retains its grasp on incomplete
+  clearance or failed arrival. Mock coverage does not establish loaded-object clearance on the actual arm.
 - B1/B3-B8 and I2: external camera mount, printed markers, measured homography, live accuracy, wrist
   images and five-marker touch check. The existing homography was produced with synthetic frames.
 - C1-C3/C5-C6/C8, D3-D5 and A14: live model, Daytona and voice checks where the task requires them.
   Offline fixtures do not establish API compatibility or cloud cleanup on a real account.
 - I1 still needs the other laptops; I3 and the M gates need the integrated physical scene.
 - D7 remains off (`use_policy: false`); simulated policy results do not establish loaded-object,
-  grasp-pose or moving-hand performance on the real arm.
-- The clear-table simulation is still difficult, and the tea tin can tip at tray release. Revisit the
-  real layout/tray height under A15 before demo choreography.
+  grasp-pose or moving-hand performance on the real arm. The policy runner also needs Cartesian
+  tip-speed enforcement before enabling it.
+- Clear-table fixtures now pass the demo seed but still fail on some broader perturbations; the 15 cm
+  release drops props into the tray. Revisit the real layout/tray height under A15 before choreography.
+- Preserve incoming scene visibility in simulation: unseen objects currently reappear as seen in its
+  snapshot. Auxiliary after-handoff runs therefore do not prove correct reduced-object behavior.
+- Reconcile the leader's hardware/saved calibration mismatch before teleoperation. Keep the arm
+  supported during real connection: configure temporarily disables torque after the initial goal sync.
 
 Task checkboxes are updated only where the stated acceptance can be supported by available evidence.
 Hardware, live-service and human-observation checks remain open.
