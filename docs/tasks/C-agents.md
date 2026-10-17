@@ -1,21 +1,23 @@
 # Lane C tasks: router, candidates, Daytona pool, orchestrator
 
+**Continuation verification:** [2026-10-17 evidence](../verification-2026-10-17.md). Checked boxes have supporting evidence; hardware and live-service acceptance remains open.
+
 Lane C owns the learning loop and the glue: route a request and write its success test, generate six candidates, score them in parallel Daytona sandboxes, hand the winner's path to Lane A, and save what the camera confirms. Build every step against the fakes first; Daytona replaces the local runner once scoring works.
 
 **Progress** (in time order; C sleeps 7:30 to 11:30 AM Saturday)
 
-- [ ] S0 · Scaffold with fakes (in Shared tasks) · Sat 1:30 AM
+- [x] S0 · Scaffold with fakes (in Shared tasks) · Sat 1:30 AM
 - [ ] C1 · Model client · Sat 2:00 AM
 - [ ] C2 · Router and success spec · Sat 3:00 AM (M1a)
 - [ ] C5 · Daytona smoke test and snapshot · Sat 3:00 AM (M1a)
 - [ ] C3 · Candidate prompt and strategy hints · Sat 4:00 AM
-- [ ] C4 · Runner on MuJoCo · Sat 5:00 AM
+- [x] C4 · Runner on MuJoCo · Sat 5:00 AM
 - [ ] C9 · Real execution and saving · Sat 6:00 AM (M1)
 - [ ] C8 · Planner for saved skills · Sat 12:30 PM
 - [ ] C6 · Sandbox pool · Sat 1:30 PM
 - [ ] C7 · Selection, repair and budgets · Sat 2:30 PM (M2)
-- [ ] C11 · Orchestrator hardening · Sat 3:00 PM
-- [ ] C10 · Routines · Sat 5:00 PM
+- [x] C11 · Orchestrator hardening · Sat 3:00 PM
+- [x] C10 · Routines · Sat 5:00 PM (fake definition + replay verified; real integration remains I3)
 
 ## C1 · Model client (`agents/llm.py`)
 

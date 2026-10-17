@@ -1,10 +1,12 @@
 # Shared tasks
 
+**Continuation verification:** [2026-10-17 evidence](../verification-2026-10-17.md). Checked boxes have supporting evidence; hardware and live-service acceptance remains open.
+
 These tasks make the whole pipeline runnable before any hardware works, so four Claude Code sessions build against something real from the first hour. S0 and I1 are tonight's critical path.
 
 **Progress**
 
-- [ ] S0 · Scaffold with fakes · Lane C · Sat 1:30 AM
+- [x] S0 · Scaffold with fakes · Lane C · Sat 1:30 AM
 - [ ] I1 · Fake end-to-end on every laptop · all · Sat 2:00 AM
 - [ ] I2 · Arm meets camera · A and B · Sat 5:30 AM
 - [ ] I3 · First real learn · all · Sat 6:00 AM (M1)

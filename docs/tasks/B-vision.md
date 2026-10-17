@@ -1,11 +1,13 @@
 # Lane B tasks: cameras, scene state, verification, dashboard
 
+**Continuation verification:** [2026-10-17 evidence](../verification-2026-10-17.md). Checked boxes have supporting evidence; hardware and live-service acceptance remains open.
+
 Lane B gives everyone the scene in meters, ten times a second, accurate to 1.5 cm, then builds the dashboard judges watch. The camera check after every real run uses the same success test that scored the simulations.
 
 **Progress** (in time order; B sleeps 3:30 to 7:30 AM Saturday)
 
 - [ ] B1 · Cameras · Fri 11:00 PM
-- [ ] B2 · OpenCV with ArUco · Fri 11:15 PM
+- [x] B2 · OpenCV with ArUco · Fri 11:15 PM
 - [ ] B3 · Markers · Sat 12:45 AM
 - [ ] B4 · Mount the overhead camera · Sat 1:15 AM
 - [ ] B5 · Table calibration · Sat 2:15 AM

@@ -1,0 +1,9 @@
+# Keep the working tree consistent on Windows as well as Linux.
+* text=auto eol=lf
+*.npy binary
+*.zip binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.mp4 binary
+*.stl binary

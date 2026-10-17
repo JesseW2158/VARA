@@ -1,4 +1,66 @@
-# VARA implementation handoff (written 2026-10-17, 13:10 local, by the Claude Code coordinator session)
+# VARA implementation handoff
+
+## Current continuation status (2026-10-17, Codex)
+
+**Read this section before the historical handoff below.** The original handoff predates the
+`027f6d7` Partial Completion commit and later fixes that were uncommitted when this continuation began. The core software and glue modules
+are implemented. This continuation preserved those changes, reviewed the previous agents' reports,
+and split remaining arm, orchestration and RL work across three parallel agents.
+
+Current evidence and outstanding acceptance work are recorded in
+[`docs/verification-2026-10-17.md`](docs/verification-2026-10-17.md). Task ledgers now distinguish checked
+software acceptance from open hardware/live-service work. The original four audit workflows stopped
+at a session limit; they did not produce completed audit verdicts.
+
+Verified before the new fixes: **1,141 tests passed with no skips**; the fake juice-box learn reached
+`saved`; the fake router matched 20/20 phrases; all six candidate fixtures passed source checks.
+Five clear-table demo runs queued within 8.9-10.6 seconds. They met the time budget but did not execute
+successfully because no clear-table candidate passed simulation.
+
+**Final combined gate: 1,172 passed, no skips, in 151.54 seconds.** Ruff check and format check pass
+(79 files), no tracked text files contain CRLF, and protected contracts/schemas are unchanged.
+This continuation is saved as five task-sized local commits on `master` (A13, C11, D5, D6, S0).
+No remote push was performed.
+
+New work in this continuation:
+
+- Bind STOP handlers before confirmation/countdown and connection in the orchestrator and arm CLIs;
+  check every stop source before and after connecting. The orchestrator now exposes its driver to STOP
+  before lifespan startup. Driver jog requires typed confirmation, and startup cleanup preserves torque.
+- Bound every RL training worker response in the parent process, including a single environment;
+  terminate workers stuck in Python or native math. Reject overflowing rewards and invalid arguments.
+- Bound parallel training runs, reject stale output directories and failed policies, and clean up
+  local process trees. Cloud transport requests still have their existing 60-second request timeout.
+- Record D-GO and policy provenance: **97/100 successes, zero falls, seed 0**. The selected policy
+  already matched the 507,904-step hand-written baseline; it is not a generated-reward winner.
+  `rl/policies/handoff_best.json` carries the hash and independent evaluation. The original training
+  summary reports 94/100 using a different evaluation seed (10001).
+- Replace OpenCV's browser-incompatible mp4v video with H.264/yuv420p via PyAV. The existing video
+  failed in Edge; the regenerated 10-second, 640x480 clip loads successfully. Failed renders preserve
+  the prior clip. Install `requirements-rl.txt` for the new `av` dependency (19.0.1 here).
+- Add `.gitattributes` to keep text files LF on Windows, and document runnable Windows commands.
+
+The combined startup/video regression subset passed 75 tests. Both starter skills were re-scored
+with the juice box, five trials, seed 7: **5/5 each, zero collisions and zero limit hits**. The fake
+`good_morning` routine was also saved and then replayed to `done ok` in an isolated library.
+
+Physical carry validation must still cover two inherited fallback behaviors: out-of-workspace hand
+targets are clamped into the allowed box, and an incomplete clearance rise can proceed to bounded
+tracking. These are covered by the existing simulation/mock tests, not validated with a held real object.
+
+Hardware was checked **read-only** using the reviewed `lerobot-tools/arm_check.py` in the conda
+`lerobot` environment. All six motors responded on both boards: leader COM7 / serial 5B90103224 at
+4.9 V and 27-29 C; follower COM8 / serial 5B90101188 at 11.9-12.1 V and 31-34 C. No goals or torque
+settings were written. Existing LeRobot calibration is not the same as VARA's joint-to-simulation
+mapping: `config/joint_map.yaml` still contains A6 placeholders. Complete measured A6 and physical
+camera calibration before Cartesian hardware replay. `config/rl.yaml` remains `use_policy: false`.
+
+The baseline, curves and generated browser video exist locally. Runs/video are gitignored; regenerate
+the video with `.venv/Scripts/python.exe -m rl.render_video --policy rl/policies/handoff_best.zip --out
+web/static/rl_sim.mp4 --seconds 10`. Both `config/homography.npy` and the selected policy ZIP were already
+tracked when this continuation began. The existing homography is synthetic, not a real-camera calibration.
+
+## Historical handoff (2026-10-17, 13:10 local, Claude Code coordinator)
 
 This file is for whoever picks the work up next (a person or another coding agent). It says what exists,
 how it was verified, what is still running, what is open, and what must never be done without the team.

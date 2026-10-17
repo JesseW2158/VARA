@@ -1,16 +1,20 @@
 # Lane D tasks: RL with a 7:00 AM go/no-go, then the story
 
+**D-GO result (2026-10-17): 97/100 successes, 0 falls**, independent baseline evaluation (100 episodes, seed 0). **GO for the remaining RL track; real deployment remains disabled** until D7/M4 and the physical mapping/safety gates pass. The 507,904-step baseline is already the selected `rl/policies/handoff_best.zip`; training-summary evaluation uses a different seed and reports 94/100. Current evidence: `rl/runs/baseline/dgo.json`.
+
+**Continuation verification:** [2026-10-17 evidence](../verification-2026-10-17.md). Checked boxes have supporting evidence; hardware and live-service acceptance remains open.
+
 Lane D proves the slow path: Grok writes four reward functions, Daytona trains four policies at once, and the best one brings the held object to a moving hand on the real arm. A go/no-go at 7:00 AM Saturday decides whether RL reaches the real arm or is shown from simulation.
 
 **Progress** (in time order; D sleeps 3:00 to 7:00 AM Saturday)
 
-- [ ] D1 · Environment · Sat 1:30 AM
-- [ ] D2 · Baseline PPO, started before sleep · Sat 3:00 AM
-- [ ] D-GO · Go/no-go decision · Sat 7:00 AM
+- [x] D1 · Environment · Sat 1:30 AM
+- [x] D2 · Baseline PPO, started before sleep · Sat 3:00 AM
+- [x] D-GO · Go/no-go decision · Sat 7:00 AM
 - [ ] D3 · RL snapshot · Sat 8:30 AM
-- [ ] D4 · Reward-writing agent · Sat 9:30 AM
+- [x] D4 · Reward-writing agent · Sat 9:30 AM
 - [ ] D5 · Parallel training on Daytona · Sat 1:00 PM
-- [ ] D6 · Simulation video · Sat 2:00 PM
+- [x] D6 · Simulation video · Sat 2:00 PM
 - [ ] D7 · Real deployment · Sat 6:00 PM (M4)
 - [ ] D8 · Story work · from Sat 6:00 PM
 

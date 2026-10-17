@@ -1,18 +1,20 @@
 # Lane A tasks: arm, simulation, replay, voice
 
+**Continuation verification:** [2026-10-17 evidence](../verification-2026-10-17.md). Checked boxes have supporting evidence; hardware and live-service acceptance remains open.
+
 Lane A makes simulation and the real arm agree, then makes the real arm do exactly what simulation checked and nothing else. The joint map check (A6) and arm-meets-camera (I2) are the most important hours of the night: if they fail, nothing downstream works.
 
 **Progress** (in time order)
 
-- [ ] A1 · Install · Fri 10:00 PM
+- [x] A1 · Install · Fri 10:00 PM
 - [ ] A2 · Power and ports · Fri 10:30 PM
 - [ ] A3 · Calibrate and teleoperate · Fri 11:30 PM
 - [ ] A11 · Gripper measurements and object choice · Sat 12:30 AM
 - [ ] A5 · Simulation model · Sat 1:00 AM (tip site by 12:45 AM for Lane D)
 - [ ] A4 · Driver with freeze · Sat 1:30 AM
 - [ ] A6 · Joint map and accuracy check · Sat 2:30 AM
-- [ ] A7 · Inverse kinematics · Sat 3:00 AM (M1a)
-- [ ] A8 · SimRobot in MuJoCo · Sat 4:30 AM
+- [x] A7 · Inverse kinematics · Sat 3:00 AM (M1a)
+- [x] A8 · SimRobot in MuJoCo · Sat 4:30 AM
 - [ ] A9 · Replay engine · Sat 5:00 AM
 - [ ] A10 · Live primitives · Sat 5:30 AM
 - [ ] A12 · Starter skills · Sat 6:00 AM (M1)
@@ -42,14 +44,20 @@ pip install -r requirements.txt "lerobot[feetech]"
 
 **Needs:** A2. **By:** Fri 11:30 PM.
 
+On this laptop both arms already have calibration files. Reuse `my_awesome_follower_arm` and
+`my_awesome_leader_arm`; recalibration is a separate physical procedure, not an installation step.
+Before teleoperation follow the read-only check, pose check and goal-sync procedure in
+`C:/Users/jesse/lerobot-tools/HANDOFF.md`. The generic commands below are for an initial setup.
+On PowerShell use `$env:FOLLOWER_PORT` / `$env:LEADER_PORT` and put each command on one line.
+
 ```bash
-lerobot-calibrate --robot.type=so101_follower --robot.port=$FOLLOWER_PORT --robot.id=follower
-lerobot-calibrate --teleop.type=so101_leader --teleop.port=$LEADER_PORT --teleop.id=leader
-lerobot-teleoperate --robot.type=so101_follower --robot.port=$FOLLOWER_PORT --robot.id=follower \
-  --teleop.type=so101_leader --teleop.port=$LEADER_PORT --teleop.id=leader
+lerobot-calibrate --robot.type=so101_follower --robot.port=$FOLLOWER_PORT --robot.id=my_awesome_follower_arm
+lerobot-calibrate --teleop.type=so101_leader --teleop.port=$LEADER_PORT --teleop.id=my_awesome_leader_arm
+lerobot-teleoperate --robot.type=so101_follower --robot.port=$FOLLOWER_PORT --robot.id=my_awesome_follower_arm \
+  --teleop.type=so101_leader --teleop.port=$LEADER_PORT --teleop.id=my_awesome_leader_arm
 ```
 
-Assembled kits normally ship with motor IDs set. Run `lerobot-setup-motors` only if calibration reports a missing motor; it needs each motor connected on its own, which means unplugging the daisy chain. Use the id `follower` everywhere afterward, because the calibration file is keyed by it.
+Assembled kits normally ship with motor IDs set. Run `lerobot-setup-motors` only if calibration reports a missing motor; it needs each motor connected on its own, which means unplugging the daisy chain. Reuse the configured calibration IDs everywhere afterward, because calibration files are keyed by ID.
 
 **Done when:** the follower mirrors the leader smoothly through every joint's full range. Then unplug the leader: it stays unplugged except during teleoperation, and always during demos.
 
@@ -69,22 +77,26 @@ Assembled kits normally ship with motor IDs set. Run `lerobot-setup-motors` only
 
 **Needs:** A3. **By:** Sat 1:30 AM. **Files:** `arm/driver.py`, `tests/test_driver_fake.py`.
 
-```python
-# Newer LeRobot releases: from lerobot.robots.so_follower import SOFollower, SOFollowerRobotConfig
-from lerobot.robots.so101_follower import SO101Follower, SO101FollowerConfig
+Use the implemented wrapper; direct LeRobot `connect()` can enable torque against stale goals.
+The installed LeRobot 0.6.2 classes are `SOFollower` and `SOFollowerRobotConfig` from
+`lerobot.robots.so_follower`, imported only by `arm/driver.py`.
 
-JOINTS = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"]
-cfg = SO101FollowerConfig(port=FOLLOWER_PORT, id="follower", use_degrees=True, max_relative_target=5.0)
-robot = SO101Follower(cfg)
-robot.connect()
-obs = robot.get_observation()          # {"shoulder_pan.pos": degrees, ..., "gripper.pos": 0-100}
-robot.send_action({f"{j}.pos": v for j, v in zip(JOINTS, target)})
+```python
+from arm.driver import FakeDriver
+
+robot = FakeDriver()
+q, gripper = robot.read()  # five radians, separate 0.0-1.0 gripper
+robot.command(q, gripper)
+robot.freeze()            # keeps torque on; command() refuses until resume()
 ```
+
+For physical testing use `python -m arm.driver --real --jog`, which provides the confirmation,
+countdown, goal synchronization and Esc watcher. The wrapper reads the configured calibration ID.
 
 - `read() -> (q, gripper)`: 5 joint angles in radians and the gripper from 0.0 to 1.0, converted through `config/joint_map.yaml`.
 - `command(q, gripper)`: clips each joint to its calibrated range minus 3° and to 2° per 30 Hz tick, whatever the caller asks. LeRobot's `max_relative_target` is only a second layer; confirm it clips on your installed version.
 - `freeze()`: command the present position as the goal, keep torque on, and set the stopped flag. `command` is ignored until `resume()`.
-- `torque_off()`: maintenance only, via `robot.bus.disable_torque()` (or `robot.disconnect()`, which also cuts torque by default).
+- `torque_off()`: explicit maintenance only, with the arm supported at rest. The wrapper sets `disable_torque_on_disconnect=False`; disconnecting preserves torque. STOP calls `freeze()`.
 - One lock around all serial access. `FAKE_ROBOT=1` swaps in an in-memory arm with the same methods.
 
 **Done when:** `pytest -q tests/test_driver_fake.py` passes, and `python -m arm.driver --real --jog` moves each joint +10° and back at 30 Hz, while Esc pressed mid-move holds the arm where it is without sagging.
@@ -106,7 +118,7 @@ Copy `Simulation/SO101/` into `sim/model/` and write `sim/model/scene_ours.xml`,
 
 **Needs:** A4, A5. **By:** Sat 2:30 AM. **Files:** `config/joint_map.yaml`, `config/limits.yaml`.
 
-For each of the 5 arm joints, send the real arm to +20° on that joint with the others at 0, set the same joint to +0.349 rad in the viewer, and compare directions side by side. Record each joint's `sign` (+1 or -1) and `offset_deg`, plus the gripper's 0 to 100 range against the model's jaw joint range. Write the calibrated joint ranges, in radians, to `config/limits.yaml`. Then put the real arm in 5 poses spread over the workspace, tape-measure the tip from the origin, and compare with the model's forward kinematics from the same readings.
+For each of the 5 arm joints, start at a measured, supported reference pose and compare a positive joint increment with the same increment in the viewer (+20 degrees is +0.349 rad). Use the capped driver jog and establish clearance before each increment. Do not command all joints to 0: LeRobot zero is each calibrated range midpoint, not the rest pose. Record each joint's `sign` (+1 or -1) and `offset_deg`, plus the gripper's 0 to 100 range against the model's jaw joint range. Write the calibrated joint ranges, in radians, to `config/limits.yaml`. Then put the real arm in 5 poses spread over the workspace, tape-measure the tip from the origin, and compare with the model's forward kinematics from the same readings.
 
 **Done when:** all 5 poses agree within 1.5 cm. A joint off by a constant needs its `offset_deg` fixed.
 
@@ -131,7 +143,7 @@ Replace S0's kinematic stand-in behind the same class. The Robot API and its not
 
 - `move_to`: IK, then a joint-space path from the current joints with a trapezoidal speed profile. Joints at most 60°/s, tip at most `speed` (capped at 0.2 m/s), waypoints at 30 Hz appended to the current `path` segment.
 - `transit_z`: rise straight up to it, travel at that height, then descend.
-- `set_roll(angle)`: wrist_roll = angle - shoulder_pan + `roll_offset`. Measure `roll_offset` so the jaws line up with an object at yaw 0.
+- `set_roll(angle)`: wrist_roll = angle + shoulder_pan + `roll_offset`. Measure `roll_offset` so the jaws line up with an object at yaw 0.
 - Grasping without friction physics: while an object is held, after every `mj_step` set its free joint to the tip pose plus the offset captured at grasp time and zero its velocity. Attach only within the tolerance in Contracts.
 - Collisions, limit hits, IK failures and the 60 s simulated-time limit (a `BaseException` subclass), as in Contracts.
 - Object, obstacle and hand poses load from the scene JSON; `final_scene.json` is written from the end state.
