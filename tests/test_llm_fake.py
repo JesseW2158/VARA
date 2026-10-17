@@ -39,6 +39,8 @@ def real(monkeypatch, tmp_path):
     """Real path: no fake flag, a key in the environment, recorded sleeps, runs/ in tmp."""
     monkeypatch.delenv("FAKE_LLM", raising=False)
     monkeypatch.delenv("FAKE", raising=False)
+    monkeypatch.delenv("ROUTER_REASONING_EFFORT", raising=False)
+    monkeypatch.delenv("CODEGEN_REASONING_EFFORT", raising=False)
     monkeypatch.setenv("XAI_API_KEY", SECRET)
     monkeypatch.setattr(llm, "RUNS", tmp_path / "runs")
     sleeps: list[float] = []
@@ -289,8 +291,8 @@ def test_model_names_from_env_with_defaults(monkeypatch, caplog):
     monkeypatch.delenv("CODEGEN_MODEL", raising=False)
     monkeypatch.setattr(llm, "_WARNED", set())  # the warning fires once per process
     with caplog.at_level(logging.WARNING, logger="agents.llm"):
-        assert llm.router_model() == "grok-4-fast"
-        assert llm.codegen_model() == "grok-4"
+        assert llm.router_model() == "grok-4.3"
+        assert llm.codegen_model() == "grok-4.7"
     assert "ROUTER_MODEL" in caplog.text and "CODEGEN_MODEL" in caplog.text
     monkeypatch.setenv("ROUTER_MODEL", "grok-3-mini")
     monkeypatch.setenv("CODEGEN_MODEL", "grok-4-0709")
@@ -339,12 +341,13 @@ def test_real_nan_in_a_plain_text_reply_triggers_the_validation_retry(real, monk
 
 def test_real_json_schema_success(real, monkeypatch):
     client, seen = install(monkeypatch, ['{"action": "stop"}'])
-    reply = llm.chat(MSGS, "grok-4-fast", schema=ROUTER_SCHEMA, timeout=7, purpose="router", task_id="t-0002")
+    reply = llm.chat(MSGS, "grok-4.3", schema=ROUTER_SCHEMA, timeout=7, purpose="router", task_id="t-0002")
     assert reply == {"action": "stop"}
     assert seen == {"api_key": SECRET, "base_url": "https://api.x.ai/v1", "timeout": 7.0}
     call = client.calls[0]
-    assert call["model"] == "grok-4-fast" and call["messages"] == MSGS and call["timeout"] == 7.0
+    assert call["model"] == "grok-4.3" and call["messages"] == MSGS and call["timeout"] == 7.0
     assert call["temperature"] == 0.2
+    assert call["reasoning_effort"] == "none" and call["max_completion_tokens"] == 2048
     assert call["response_format"]["type"] == "json_schema"
     assert call["response_format"]["json_schema"]["name"] == "router"
     assert call["response_format"]["json_schema"]["schema"]["oneOf"] == ROUTER_SCHEMA["oneOf"]
@@ -356,9 +359,11 @@ def test_real_json_schema_success(real, monkeypatch):
 
 def test_real_text_reply_for_code(real, monkeypatch):
     client, _seen = install(monkeypatch, ["```python\ndef run(robot, args):\n    return True\n```"])
-    reply = llm.chat(MSGS, "grok-4", purpose="write_skill")
+    reply = llm.chat(MSGS, "grok-4.7", purpose="write_skill")
     assert reply.startswith("```python")
     assert client.calls[0]["temperature"] == 0.7
+    assert client.calls[0]["reasoning_effort"] == "low"
+    assert client.calls[0]["max_completion_tokens"] == 8192
     assert "response_format" not in client.calls[0]
 
 
@@ -367,6 +372,77 @@ def test_real_temperatures(real, monkeypatch, purpose, temperature):
     client, _seen = install(monkeypatch, ["ok"])
     llm.chat(MSGS, "grok-4", purpose=purpose)
     assert client.calls[0]["temperature"] == temperature
+
+
+@pytest.mark.parametrize(
+    ("model", "purpose", "effort", "tokens"),
+    [
+        ("grok-4.3", "router", "none", 2048),
+        ("grok-4.7", "router", "low", 2048),
+        ("grok-4.3", "write_skill", "low", 8192),
+        ("grok-4.7-latest", "repair", "low", 8192),
+        ("grok-4.7", "write_rewards", "low", 16384),
+        ("grok-4-fast", "router", None, 2048),
+        ("custom-code-model", "write_skill", None, 8192),
+    ],
+)
+def test_latency_options_respect_known_model_capabilities(real, monkeypatch, model, purpose, effort, tokens):
+    client, _ = install(monkeypatch, ["ok"])
+    assert llm.chat(MSGS, model, purpose=purpose) == "ok"
+    request = client.calls[0]
+    assert request["model"] == model
+    assert request.get("reasoning_effort") == effort
+    assert request["max_completion_tokens"] == tokens
+    assert "max_tokens" not in request
+
+
+@pytest.mark.parametrize("purpose", ["router", "write_skill", "repair", "write_rewards"])
+def test_explicit_effort_overrides_are_forwarded_for_known_and_custom_models(real, monkeypatch, purpose):
+    variable = "ROUTER_REASONING_EFFORT" if purpose == "router" else "CODEGEN_REASONING_EFFORT"
+    monkeypatch.setenv(variable, " medium ")
+    for model in ("grok-4.7", "custom-model"):
+        client, _ = install(monkeypatch, ["ok"])
+        llm.chat(MSGS, model, purpose=purpose)
+        assert client.calls[0]["reasoning_effort"] == "medium"
+
+
+@pytest.mark.parametrize("effort", ["none", "unbounded"])
+def test_bad_effort_fails_before_constructing_client(real, monkeypatch, effort):
+    monkeypatch.setenv("CODEGEN_REASONING_EFFORT", effort)
+    client, seen = install(monkeypatch, ["unused"])
+    with pytest.raises(ValueError, match="CODEGEN_REASONING_EFFORT"):
+        llm.chat(MSGS, "grok-4.7", purpose="write_skill")
+    assert not seen and not client.calls
+
+
+def test_effort_and_output_caps_survive_schema_fallback_and_validation_retry(real, monkeypatch):
+    client, _ = install(monkeypatch, [StatusError(400), '{"action":"dance"}', '{"action":"stop"}'])
+    assert llm.chat(MSGS, "grok-4.3", schema=ROUTER_SCHEMA, purpose="router") == {"action": "stop"}
+    assert len(client.calls) == 3
+    assert all(call["reasoning_effort"] == "none" for call in client.calls)
+    assert all(call["max_completion_tokens"] == 2048 for call in client.calls)
+    assert "response_format" not in client.calls[-1]
+
+
+def test_truncated_output_is_rejected_even_if_the_visible_prefix_parses(real, monkeypatch):
+    client, _ = install(monkeypatch, [])
+    response = _response('{"action":"stop"}')
+    response.choices[0].finish_reason = "length"
+    client.chat.completions.create = lambda **_: response
+    with pytest.raises(llm.ModelCallFailed, match="truncated"):
+        llm.chat(MSGS, "grok-4.3", schema=ROUTER_SCHEMA, purpose="router")
+
+
+def test_client_construction_consumes_the_whole_call_budget(fake_clock, monkeypatch):
+    client, _ = install(monkeypatch, ["ok"], clock=fake_clock)
+
+    def slow_factory(**_):
+        fake_clock.now += 2.0
+        return client
+
+    monkeypatch.setattr(llm, "client_factory", slow_factory)
+    assert llm.chat(MSGS, "grok-4.7", purpose="write_skill", timeout=5) == "ok"
+    assert client.calls[0]["timeout"] == 3.0
 
 
 def test_real_4xx_falls_back_to_plain_text(real, monkeypatch, caplog):

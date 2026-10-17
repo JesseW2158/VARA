@@ -280,8 +280,10 @@ Measured facts (upstream frame, all joints at 0, "new calibration" = every joint
   unknown router phrase returns `{"action": "queue", "task": <text>, "reason": "no fixture for this phrase"}`;
   an unknown candidate key returns `tests/fixtures/candidate_clear_table.py`. The fake returns the candidate
   wrapped in a ```python fence so the real-path code extraction is exercised.
-- `router_model()`, `codegen_model()` read `ROUTER_MODEL`/`CODEGEN_MODEL` (default `grok-4-fast` and `grok-4`
-  when unset, with a warning). `python -m agents.llm --ping`.
+- `router_model()`, `codegen_model()` read `ROUTER_MODEL`/`CODEGEN_MODEL` (default `grok-4.3` and `grok-4.7`
+  when unset, with a warning). Routing defaults to no reasoning; code generation uses low reasoning.
+  See [live model configuration](setup.md#live-model-configuration) for effort overrides, output caps,
+  and current official documentation. `python -m agents.llm --ping` makes authenticated API calls.
 
 ### agents/router.py (C2)
 - `route(text, skills, scene, *, task_id=None, timeout=15) -> dict` validated against schemas/router.json.

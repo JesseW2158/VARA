@@ -6,6 +6,10 @@ reply text, or a dict validated against `schema` when one is given.
 Real path (no fake flag):
 - `openai.OpenAI(api_key=XAI_API_KEY, base_url=XAI_BASE_URL)` and `chat.completions.create`, with
   temperature 0.2 for `purpose="router"` and 0.7 for `write_skill`, `repair` and `write_rewards`;
+- defaults: grok-4.3 with reasoning_effort="none" for routing, grok-4.7 with "low" for code generation.
+  ROUTER_MODEL/CODEGEN_MODEL still override models; ROUTER_REASONING_EFFORT/CODEGEN_REASONING_EFFORT
+  override effort. Unknown model overrides receive no automatic effort parameter. Output token caps
+  bound visible replies only, not reasoning tokens; the existing whole-call deadline still applies;
 - with `schema`, the first attempt asks for `response_format={"type": "json_schema", ...}`; any 4xx other
   than 429 falls back to plain text, from which the first `{...}` block is parsed (`NaN` and `Infinity`
   are not JSON and never get through); the result is validated with jsonschema and, on failure, the model
@@ -85,10 +89,20 @@ FIXTURES = ROOT / "tests" / "fixtures" / "llm"
 DEFAULT_CANDIDATE = ROOT / "tests" / "fixtures" / "candidate_clear_table.py"
 
 XAI_BASE_URL = "https://api.x.ai/v1"
-DEFAULT_ROUTER_MODEL = "grok-4-fast"
-DEFAULT_CODEGEN_MODEL = "grok-4"
+DEFAULT_ROUTER_MODEL = "grok-4.3"
+DEFAULT_CODEGEN_MODEL = "grok-4.7"
 PURPOSES = ("router", "write_skill", "repair", "write_rewards")
 TEMPERATURES = {"router": 0.2, "write_skill": 0.7, "repair": 0.7, "write_rewards": 0.7}
+# Verified against docs.x.ai/developers/models and the Chat Completions reference, 2026-10-17.
+# xAI's max_completion_tokens limits visible output only; it does not bound hidden reasoning.
+MAX_COMPLETION_TOKENS = {"router": 2048, "write_skill": 8192, "repair": 8192, "write_rewards": 16384}
+_REASONING_LEVELS = {"none", "low", "medium", "high", "xhigh"}
+_MODEL_EFFORTS = {
+    "grok-4.3": {"none", "low", "medium", "high"},
+    "grok-4.5": {"low", "medium", "high"},
+    "grok-4.6": {"low", "medium", "high", "xhigh"},
+    "grok-4.7": {"low", "medium", "high", "xhigh"},
+}
 BACKOFF_S = (1.0, 2.0, 4.0)
 MIN_ATTEMPT_S = 0.5  # no HTTP attempt, backoff or validation retry starts with less budget than this
 RETRY_PROMPT = (
@@ -250,13 +264,22 @@ def _real_chat(
     purpose: str | None,
     task_id: str | None,
 ) -> str | dict[str, Any]:
-    client = _make_client(timeout)
     deadline = clock() + timeout
+    options = _request_options(model, purpose, schema)
+    client = _make_client(timeout)
     temperature = _temperature(purpose, schema)
     structured = schema is not None
     for validation_round in (1, 2):
         text, usage, ms, structured = _complete_with_fallback(
-            client, model, msgs, temperature, schema if structured else None, timeout, deadline, purpose
+            client,
+            model,
+            msgs,
+            temperature,
+            schema if structured else None,
+            timeout,
+            deadline,
+            purpose,
+            options,
         )
         _log(task_id, model, purpose, usage, ms)
         if schema is None:
@@ -285,6 +308,28 @@ def _temperature(purpose: str | None, schema: Mapping[str, Any] | None) -> float
     if purpose in TEMPERATURES:
         return TEMPERATURES[purpose]
     return 0.2 if schema is not None else 0.7
+
+
+def _request_options(model: str, purpose: str | None, schema: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Keep latency-sensitive calls explicit without guessing capabilities of custom model slugs."""
+    routing = purpose == "router" or (purpose is None and schema is not None)
+    variable = "ROUTER_REASONING_EFFORT" if routing else "CODEGEN_REASONING_EFFORT"
+    effort = os.environ.get(variable, "").strip().lower()
+    family = model.removesuffix("-latest")
+    supported = _MODEL_EFFORTS.get(family)
+    if effort:
+        if effort not in _REASONING_LEVELS:
+            raise ValueError(f"{variable} must be none, low, medium, high, or xhigh")
+        if supported is not None and effort not in supported:
+            raise ValueError(f"{variable} is unsupported by {model}; choose {', '.join(sorted(supported))}")
+    elif supported is not None:
+        effort = "none" if routing and "none" in supported else "low"
+    options: dict[str, Any] = {
+        "max_completion_tokens": MAX_COMPLETION_TOKENS.get(purpose, 2048),
+    }
+    if effort:
+        options["reasoning_effort"] = effort
+    return options
 
 
 def _make_client(timeout: float) -> Any:
@@ -320,18 +365,21 @@ def _complete_with_fallback(
     timeout: float,
     deadline: float,
     purpose: str | None,
+    options: Mapping[str, Any],
 ) -> tuple[str, tuple[int, int], float, bool]:
     """Structured output first; on a 4xx (other than 429) fall back to plain text."""
     if schema is not None:
         try:
             response_format = _response_format(schema, purpose)
-            text, usage, ms = _complete(client, model, msgs, temperature, response_format, timeout, deadline)
+            text, usage, ms = _complete(
+                client, model, msgs, temperature, response_format, timeout, deadline, options
+            )
             return text, usage, ms, True
         except ModelCallFailed as exc:
             if exc.status is None or not (400 <= exc.status < 500) or exc.status == 429:
                 raise
             logger.warning("structured output refused (HTTP %s); falling back to plain text", exc.status)
-    text, usage, ms = _complete(client, model, msgs, temperature, None, timeout, deadline)
+    text, usage, ms = _complete(client, model, msgs, temperature, None, timeout, deadline, options)
     return text, usage, ms, False
 
 
@@ -343,11 +391,12 @@ def _complete(
     response_format: Mapping[str, Any] | None,
     timeout: float,
     deadline: float,
+    options: Mapping[str, Any],
 ) -> tuple[str, tuple[int, int], float]:
     """One completion with up to 3 retries (1, 2, 4 s) on 429 and 5xx, all inside the budget that ends at
     `deadline` (on `clock`): each attempt gets the time left, and a retry whose backoff would leave less
     than `MIN_ATTEMPT_S` is not made. Raises ModelCallFailed."""
-    kwargs: dict[str, Any] = {"model": model, "messages": msgs, "temperature": temperature}
+    kwargs: dict[str, Any] = {"model": model, "messages": msgs, "temperature": temperature, **options}
     if response_format is not None:
         kwargs["response_format"] = dict(response_format)
     retries = len(BACKOFF_S)
@@ -399,6 +448,8 @@ def _content_of(response: Any) -> str:
     choices = _field(response, "choices") or []
     if not choices:
         raise ModelCallFailed("the model returned no choices")
+    if _field(choices[0], "finish_reason") == "length":
+        raise ModelCallFailed("the model reached its output token limit; refusing a truncated reply")
     message = _field(choices[0], "message")
     content = _field(message, "content") if message is not None else None
     if content is None:
