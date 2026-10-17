@@ -193,6 +193,7 @@ HOME_RAISE_Z = (0.20, 0.25, 0.15, 0.12)  # intermediate tip heights tried when h
 HAND_PARKED_Z = -1.0
 RELEASE_SEPARATION = 0.06  # m from the grasp center at which a released object collides with the robot again
 RELEASE_GRACE_TICKS = 30  # or after this many ticks (1 s), whichever comes first
+DROP_SETTLE_TICKS = 15  # 0.5 s for an object dropped by pick() while holding to land before poses are read
 MAX_SKILL_DEPTH = 8
 SKILL_NAME_RE = r"^[a-z][a-z0-9_]{1,40}$"
 
@@ -661,10 +662,14 @@ class SimRobot:
         approach_m = _finite(approach)
         if approach_m is None:
             return False
+        was_holding = self._held is not None
+        if was_holding or self._grip < 1.0:
+            self.open_gripper()
+        if was_holding:  # the dropped object lands (it may be the target) before its pose is read
+            for _ in range(DROP_SETTLE_TICKS):
+                self._tick(record=False)
         x, y, _z, yaw = self._object_pose(name)
         grasp_z = max(self._object_half_height(name), 0.02)
-        if self._held is not None or self._grip < 1.0:
-            self.open_gripper()
         if transit_z is not None and not self._transit(transit_z, (x, y)):
             return False
         above = (x, y, grasp_z + approach_m)

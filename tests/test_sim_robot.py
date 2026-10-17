@@ -854,3 +854,82 @@ def test_input_edge_cases_are_refused_or_sane(robot):
     robot.reset(FAKE_SCENE)
     assert robot.pick("pill_bottle", transit_z=0.30) is True  # the transit at the ceiling of the box
     assert robot.stats["ik_failures"] == 0 and validate(robot) == []
+
+
+# ------------------------------------------------------------- 9.9 pins: pick while holding, yaw, depth, tray
+
+
+def test_pick_while_holding_reads_the_pose_after_the_drop():
+    """pick() drops what it holds first; the target's pose is read after the drop has landed (it used to be
+    read before, so picking the held object again descended onto its old spot and hit it)."""
+    for first, second in (("juice_box", "juice_box"), ("juice_box", "pill_bottle")):
+        r = SimRobot(FAKE_SCENE)
+        assert r.pick(first) is True
+        assert r.pick(second) is True, (first, second, r._collision_log)
+        assert r._held == second and r.stats["collisions"] == 0, r._collision_log
+        assert validate(r) == []
+
+
+def descend_misaligned(robot: SimRobot, name: str, yaw_offset: float) -> float:
+    """Like descend_to at half height, but with the jaws turned `yaw_offset` off the object's width; returns
+    the measured angle (degrees) between the closing direction and the width."""
+    x, y, _z, yaw = robot._object_pose(name)
+    gz = robot._object_half_height(name)
+    robot.open_gripper()
+    q_above, ok = robot._goal("grasp", (x, y, gz + 0.08), -math.pi / 2, robot._q_cmd)
+    assert ok
+    roll = robot._roll_for(yaw + yaw_offset, float(q_above[0]))
+    assert robot._move("grasp", (x, y, gz + 0.08), -math.pi / 2, 0.2, roll=roll)
+    assert robot._move("grasp", (x, y, gz), -math.pi / 2, 0.2, straight=True)
+    _a, c = ik.jaw_axes(robot._q_cmd)
+    diff = (math.atan2(c[1], c[0]) - (yaw + math.pi / 2)) % math.pi
+    return math.degrees(min(diff, math.pi - diff))
+
+
+def test_box_attaches_only_with_the_jaws_within_20_degrees_of_its_width(robot):
+    assert sim_robot.ATTACH_YAW == pytest.approx(math.radians(20.0))
+    robot.reset(FAKE_SCENE)
+    off = descend_misaligned(robot, "juice_box", math.radians(10.0))
+    assert off < 20.0 and robot.close_gripper() is True, off
+    robot.reset(FAKE_SCENE)
+    off = descend_misaligned(robot, "juice_box", math.radians(26.0))
+    assert off > 20.0 and robot.close_gripper() is False, off
+    assert robot._held is None
+
+
+def test_a_self_recursive_skill_stops_at_the_nesting_cap(tmp_path):
+    assert sim_robot.MAX_SKILL_DEPTH == 8
+    loop = dict(
+        load_skill("hand_over"),
+        name="loop",
+        code="def run(robot, args):\n    return robot.run_skill('loop', {})\n",
+    )
+    (tmp_path / "loop.json").write_text(json.dumps(loop), encoding="utf-8")
+    other = SimRobot(FAKE_SCENE, skills_dir=tmp_path)
+    assert other.run_skill("loop", {}) is False  # not a RecursionError
+    assert other.events == ["run_skill: loop nested too deep"]
+
+
+def test_tray_contacts_are_named_after_the_tray():
+    """Body-name labels for the tray walls: the empty gripper and a held object dragged out through the -x
+    wall are counted as 'gripper hit tray' and 'held juice_box hit tray'."""
+    far = copy.deepcopy(FAKE_SCENE)
+    far["objects"]["juice_box"].update({"x": 0.12, "y": -0.23})
+    far["objects"]["tea_tin"].update({"x": 0.12, "y": 0.23})
+    tray = far["zones"]["tray"]
+    r = SimRobot(far)
+    assert r.move_to(tray["x"], tray["y"], 0.12) and r.move_to(tray["x"], tray["y"], 0.03)
+    assert r._collision_log == []
+    assert r.move_to(tray["x"] - 0.10, tray["y"], 0.03)
+    assert r._collision_log == ["gripper hit tray"]
+    r = SimRobot(far)
+    assert r.pick("juice_box", transit_z=TRANSIT_Z)
+    x, y, _z, _yaw = r._object_pose("juice_box")
+    assert (
+        r.move_to(x, y, 0.28)
+        and r.move_to(tray["x"], tray["y"], 0.28)
+        and r.move_to(tray["x"], tray["y"], 0.08)
+    )
+    assert r._collision_log == []
+    assert r.move_to(tray["x"] - 0.10, tray["y"], 0.08)
+    assert r._collision_log == ["held juice_box hit tray"]

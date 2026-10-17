@@ -461,3 +461,138 @@ def test_jog_zero_degrees_moves_nothing_and_fractional_amplitude_is_exact():
     assert len(d.commands) == 5 * 6  # per joint: 1, 2, 2.5, 2, 1, 0 degrees
     with pytest.raises(ValueError):
         driver.jog(d, step_deg=0.0, realtime=False)
+
+
+# -- A13: a STOP that lands before or during connect() survives it ------------------------------------------
+
+
+def test_freeze_before_connect_persists_on_the_fake():
+    d = make()
+    d.disconnect()
+    d.freeze()
+    d.connect()
+    assert d.connected and d.stopped and d.torque
+    assert d.command(Q0, 1.0) is False and d.commands == []
+    d.resume()
+    assert d.command(Q0, 1.0) is True
+
+
+def test_freeze_waiting_for_the_lock_during_connect_persists_on_the_fake():
+    d = make()
+    d.disconnect()
+    esc = threading.Thread(target=d.freeze)
+    with d.lock:  # stands in for a connect() in progress
+        esc.start()
+        assert d._freeze_requested.wait(2.0)  # Esc landed; freeze() waits for the lock
+        d.connect()
+        assert d.stopped  # connect() applied it before returning
+    esc.join(2.0)
+    assert not esc.is_alive() and d.stopped
+    assert d.command(Q0, 1.0) is False and d.commands == []
+
+
+def test_command_applies_a_freeze_that_is_still_landing():
+    d = make()
+    esc = threading.Thread(target=d.freeze)
+    with d.lock:
+        esc.start()
+        assert d._freeze_requested.wait(2.0)
+        assert d.command([v + 0.01 for v in Q0], 1.0) is False
+        assert d.stopped
+    esc.join(2.0)
+    assert d.commands == []
+
+
+def test_resume_cannot_cancel_a_freeze_that_is_still_landing():
+    d = make()
+    esc = threading.Thread(target=d.freeze)
+    with d.lock:
+        esc.start()
+        assert d._freeze_requested.wait(2.0)
+        d.resume()
+        assert d.stopped
+    esc.join(2.0)
+    assert d.stopped and d.command(Q0, 1.0) is False
+
+
+# -- gripper-scale helpers: the 0-100 scale of the config files stays inside arm/driver.py ------------------
+
+OBJECTS = (
+    "10: {name: pill_bottle, kind: object, held_min: 6}\n"
+    "11: {name: juice_box, kind: object, held_min: 10}\n"
+    "30: {name: cereal_box, kind: obstacle}\n"
+)
+
+
+def write_config(tmp_path, monkeypatch, *, objects: str | None = OBJECTS, gripper: str | None = None) -> None:
+    path = tmp_path / "objects.yaml"
+    if objects is not None:
+        path.write_text(objects, encoding="utf-8")
+    monkeypatch.setattr(driver, "OBJECTS_PATH", path)
+    if gripper is not None:
+        jm = tmp_path / "joint_map.yaml"
+        jm.write_text(f"gripper: {gripper}\n", encoding="utf-8")
+        monkeypatch.setattr(driver, "JOINT_MAP_PATH", jm)
+
+
+def test_gripper_helpers_with_the_default_map(tmp_path, monkeypatch):
+    write_config(tmp_path, monkeypatch)
+    assert driver.pct_to_gripper(25) == pytest.approx(0.25)
+    assert driver.gripper_to_pct(0.25) == pytest.approx(25.0)
+    assert driver.pct_to_gripper(130) == 1.0 and driver.pct_to_gripper(-5) == 0.0
+    assert driver.gripper_to_pct(2.0) == pytest.approx(100.0)
+    assert driver.held_threshold("juice_box") == pytest.approx(0.10)
+    assert driver.held_threshold("pill_bottle") == pytest.approx(0.06)
+    for other in ("banana", None, "", "cereal_box"):  # unknown, none, or no held_min: the smallest on file
+        assert driver.held_threshold(other) == pytest.approx(0.06)
+    assert driver.empty_closed_reading() == 0.0
+
+
+def test_gripper_helpers_with_an_inverted_map(tmp_path, monkeypatch):
+    write_config(tmp_path, monkeypatch, gripper="{closed_pct: 100, open_pct: 0}")
+    assert driver.pct_to_gripper(25) == pytest.approx(0.75)
+    assert driver.gripper_to_pct(0.75) == pytest.approx(25.0)
+    assert driver.held_threshold("juice_box") == pytest.approx(0.10)  # a 100-point span either way
+    assert driver.empty_closed_reading() == 0.0
+
+
+def test_gripper_helpers_with_an_empty_closed_reading(tmp_path, monkeypatch):
+    write_config(tmp_path, monkeypatch, gripper="{closed_pct: 10, open_pct: 90, empty_closed_pct: 18}")
+    assert driver.empty_closed_reading() == pytest.approx(0.1)  # (18 - 10) / 80
+    assert driver.held_threshold("juice_box") == pytest.approx(10 / 80)
+    assert driver.pct_to_gripper(50) == pytest.approx(0.5)
+    write_config(tmp_path, monkeypatch, gripper="{closed_pct: 90, open_pct: 10, empty_closed_pct: 82}")
+    assert driver.empty_closed_reading() == pytest.approx(0.1)  # (82 - 90) / (10 - 90)
+
+
+def test_gripper_helpers_fallbacks_and_malformed_config(tmp_path, monkeypatch):
+    write_config(tmp_path, monkeypatch, objects=None)  # no objects file at all
+    assert driver.held_threshold("juice_box") == pytest.approx(driver.DEFAULT_HELD_MIN_PCT / 100)
+    write_config(tmp_path, monkeypatch, objects="30: {name: cereal_box, kind: obstacle}\n")
+    assert driver.held_threshold("cereal_box") == pytest.approx(driver.DEFAULT_HELD_MIN_PCT / 100)
+    for bad in (
+        "- a list\n",
+        "11: {name: juice_box, held_min: -2}\n",
+        "11: {name: juice_box, held_min: lots}\n",
+    ):
+        write_config(tmp_path, monkeypatch, objects=bad)
+        with pytest.raises(ValueError):
+            driver.held_threshold("juice_box")
+    write_config(tmp_path, monkeypatch)
+    for bad in (
+        "{closed_pct: 0, open_pct: 100, empty_closed_pct: 120}",
+        "{closed_pct: 0, open_pct: 100, empty_closed_pct: x}",
+    ):
+        write_config(tmp_path, monkeypatch, gripper=bad)
+        with pytest.raises(ValueError, match="empty_closed_pct"):
+            driver.empty_closed_reading()
+
+
+def test_fake_driver_gripper_methods_match_the_module(tmp_path, monkeypatch):
+    write_config(tmp_path, monkeypatch, gripper="{closed_pct: 10, open_pct: 90, empty_closed_pct: 18}")
+    d = make()
+    assert d.pct_to_gripper(50) == driver.pct_to_gripper(50)
+    assert d.gripper_to_pct(0.5) == driver.gripper_to_pct(0.5)
+    assert d.held_threshold("juice_box") == driver.held_threshold("juice_box")
+    assert d.held_threshold("banana") == driver.held_threshold("banana")
+    assert d.empty_closed_reading() == driver.empty_closed_reading()

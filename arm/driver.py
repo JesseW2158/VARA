@@ -499,10 +499,12 @@ class _DriverBase:
         if self.connected:
             log.warning("freeze: arm stopped and holding (t=%.3f)", self.frozen_at)
         else:
-            log.warning("freeze: stopped flag set while not connected; connect() will hold (t=%.3f)", self.frozen_at)
+            log.warning(
+                "freeze: stopped flag set while not connected; connect() will hold (t=%.3f)", self.frozen_at
+            )
 
     def resume(self) -> None:
-        """Clear the STOP. A freeze() still waiting for the lock wins: it is applied and `stopped` stays set."""
+        """Clear the STOP. A freeze() still waiting for the lock wins: it is applied, `stopped` stays set."""
         with self.lock:
             if self._freeze_requested.is_set():
                 self._freeze_locked()
@@ -960,6 +962,13 @@ def jog(
 
 
 def _countdown(seconds: int, watcher: EscWatcher) -> bool:
+    try:
+        answer = input("Type yes when the arm and table are clear: ")
+    except EOFError:
+        answer = ""
+    if answer.strip().lower() not in ("y", "yes"):
+        print("Not confirmed; nothing moved.")
+        return False
     for n in range(seconds, 0, -1):
         print(f"Moving the REAL arm in {n}... keep clear (Esc aborts)", flush=True)
         for _ in range(10):
@@ -1001,16 +1010,19 @@ def main(argv: list[str] | None = None) -> int:
     from dotenv import load_dotenv
 
     load_dotenv()
-    watcher = EscWatcher()
+    driver = Driver(port=args.port, follower_id=args.follower_id)
+    watcher = EscWatcher(driver.freeze)
     watcher.start()
     try:
         if not _countdown(3, watcher):
             return 1
-        driver = Driver(port=args.port, follower_id=args.follower_id)
-        watcher.callback = driver.freeze  # from here on Esc freezes the arm, during connect() included
+        if watcher.pressed or driver.stopped:
+            print("Stopped before connecting; nothing moved.")
+            return 1
         driver.connect()
         try:
-            if driver.stopped:
+            if watcher.pressed or driver.stopped:
+                driver.freeze()
                 print("Esc pressed while connecting: arm frozen with torque on, nothing moved.")
                 ok = False
             else:

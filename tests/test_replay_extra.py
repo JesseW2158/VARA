@@ -530,3 +530,50 @@ def test_cli_without_esc_runs_and_a_stale_cancel_flag_does_not_count(real_cli, c
     d = drivers[-1]
     assert d.commands and not d.stopped
     assert json.loads(capsys.readouterr().out.strip().splitlines()[-1])["ok"]
+
+
+@pytest.mark.parametrize("entry", ["replay", "home", "jog"])
+@pytest.mark.parametrize("stop_at", ["countdown", "connect"])
+def test_arm_cli_latches_stop_before_and_during_connect(real_cli, monkeypatch, entry, stop_at):
+    from arm import driver as driver_mod
+    from arm import real_robot
+
+    path, drivers = real_cli
+    connects = []
+    original_connect = _StubDriver.connect
+
+    def connect(driver):
+        connects.append(driver)
+        original_connect(driver)
+        if stop_at == "connect":
+            driver.freeze()  # no watcher.pressed or global cancellation flag
+
+    def confirmed(seconds, watcher):
+        assert watcher.callback is not None  # STOP is bound throughout confirmation/countdown
+        if stop_at == "countdown":
+            watcher.pressed = True
+            watcher.callback()
+        return True
+
+    monkeypatch.setattr(_StubDriver, "connect", connect)
+    monkeypatch.setattr(real_robot, "confirm_arm_clear", confirmed)
+    monkeypatch.setattr(driver_mod, "_countdown", confirmed)
+    monkeypatch.setattr("builtins.input", lambda *args: "")
+    if entry == "replay":
+        result = replay.main(["--real", "--traj", str(path)])
+    elif entry == "home":
+        result = real_robot.main(["--real", "--home"])
+    else:
+        result = driver_mod.main(["--real", "--jog"])
+    assert result == 1
+    assert bool(connects) == (stop_at == "connect")
+    assert drivers[-1].stopped and not drivers[-1].connected
+    assert drivers[-1].commands == []
+
+
+def test_driver_countdown_requires_confirmation(monkeypatch):
+    from arm import driver as driver_mod
+
+    monkeypatch.setattr("builtins.input", lambda *args: "no")
+    monkeypatch.setattr(driver_mod.time, "sleep", lambda *_: pytest.fail("countdown after refusal"))
+    assert driver_mod._countdown(3, _StubWatcher()) is False

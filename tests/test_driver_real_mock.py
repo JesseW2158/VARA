@@ -9,6 +9,7 @@ its stored Goal_Position. lerobot itself is never imported here.
 from __future__ import annotations
 
 import math
+import threading
 
 import pytest
 
@@ -544,3 +545,138 @@ def test_negative_control_fake_bus_treats_nan_like_lerobot():
 
 
 SIGNIFICANT = {"bus.connect", "is_calibrated", "write", "enable_torque", "disable_torque", "configure"}
+
+
+# -- A13: a STOP that lands before or during connect() survives it -----------------------------------------
+
+
+def build_freezing_in(step: str):
+    """A Driver whose fake robot calls freeze() inside one connect step, with stale goals planted first.
+
+    The call runs on the connecting thread (the RLock lets it in), so it lands while `connected` is still
+    False: exactly the window in which the old connect() erased it by ending with `stopped = False`.
+    """
+    log: list = []
+    robots: list[FakeRobot] = []
+    holder: dict[str, Driver] = {}
+
+    def factory(**config):
+        robot = FakeRobot(log, **config)
+        robots.append(robot)
+        bus = robot.bus
+        stale(bus)
+        if step == "bus.connect":
+            original_connect = bus.connect
+
+            def connect(handshake: bool = True) -> None:
+                original_connect(handshake)
+                holder["d"].freeze()
+
+            bus.connect = connect  # type: ignore[method-assign]
+        elif step == "goal_sync":
+            original_write = bus.write
+            fired: list[bool] = []
+
+            def write(data_name, motor, value, *, normalize=True, num_retry=0):
+                if not fired:
+                    fired.append(True)
+                    holder["d"].freeze()
+                original_write(data_name, motor, value, normalize=normalize, num_retry=num_retry)
+
+            bus.write = write  # type: ignore[method-assign]
+        elif step == "configure":
+
+            def configure() -> None:
+                log.append(("configure",))
+                bus.disable_torque()
+                holder["d"].freeze()  # Esc while configure() has torque off
+                bus.enable_torque()
+
+            robot.configure = configure  # type: ignore[method-assign]
+        else:
+            raise AssertionError(step)
+        return robot
+
+    d = Driver(robot_factory=factory)
+    holder["d"] = d
+    return d, log, robots
+
+
+def assert_frozen_after_connect(d: Driver, log: list, bus: FakeBus) -> None:
+    """Stopped and holding with torque on, re-synced after configure(), nothing moves until resume()."""
+    assert d.connected and d.stopped and d.torque and all(bus.torque.values())
+    assert bus.goal == bus.present and bus.max_jump == 0
+    configure_at = log.index(("configure",))
+    goal_at = [i for i, e in enumerate(log) if e[0] == "write" and e[1] == "Goal_Position"]
+    assert max(goal_at) > configure_at  # goal := present once more after configure()'s torque toggle
+    assert not any(e[0] == "send_action" for e in log)
+    del log[:]
+    assert d.command([math.radians(1.0), 0.0, 0.0, 0.0, 0.0], 1.0) is False
+    assert log == []  # the very next command reaches nothing
+    d.resume()
+    assert d.command([math.radians(1.0), 0.0, 0.0, 0.0, 0.0], 1.0) is True
+    assert any(e[0] == "send_action" for e in log)
+
+
+@pytest.mark.parametrize("step", ["bus.connect", "goal_sync", "configure"])
+def test_freeze_during_connect_survives_it(step):
+    d, log, robots = build_freezing_in(step)
+    d.connect()
+    assert_frozen_after_connect(d, log, robots[0].bus)
+
+
+def test_freeze_from_the_esc_thread_while_connect_holds_the_lock():
+    """The real Esc path: freeze() runs on the watcher thread and waits for the lock connect() holds."""
+    log: list = []
+    robots: list[FakeRobot] = []
+    esc: list[threading.Thread] = []
+    holder: dict[str, Driver] = {}
+
+    def factory(**config):
+        robot = FakeRobot(log, **config)
+        robots.append(robot)
+        stale(robot.bus)
+        original_configure = robot.configure
+
+        def configure() -> None:
+            t = threading.Thread(target=holder["d"].freeze)
+            t.start()
+            esc.append(t)
+            assert holder["d"]._freeze_requested.wait(2.0)  # Esc landed; freeze() now waits for the lock
+            original_configure()
+
+        robot.configure = configure  # type: ignore[method-assign]
+        return robot
+
+    d = Driver(robot_factory=factory)
+    holder["d"] = d
+    d.connect()
+    assert d.stopped  # connect() applied the waiting STOP itself before releasing the lock
+    esc[0].join(2.0)
+    assert not esc[0].is_alive()
+    assert_frozen_after_connect(d, log, robots[0].bus)
+
+
+def test_freeze_before_connect_is_not_cleared_by_connect():
+    log: list = []
+    robots: list[FakeRobot] = []
+
+    def factory(**config):
+        robot = FakeRobot(log, **config)
+        robots.append(robot)
+        stale(robot.bus)
+        return robot
+
+    d = Driver(robot_factory=factory)
+    d.freeze()  # Esc before connect(): nothing to hold yet, only the flag
+    assert d.stopped and not d.connected and log == []
+    d.connect()
+    assert_frozen_after_connect(d, log, robots[0].bus)
+
+
+def test_driver_gripper_scale_methods_match_the_module():
+    d, _, _ = build()  # no connection needed: pure config arithmetic
+    assert d.pct_to_gripper(40.0) == driver.pct_to_gripper(40.0) == pytest.approx(0.4)
+    assert d.gripper_to_pct(0.4) == driver.gripper_to_pct(0.4) == pytest.approx(40.0)
+    assert d.held_threshold("juice_box") == driver.held_threshold("juice_box")
+    assert d.empty_closed_reading() == driver.empty_closed_reading() == 0.0

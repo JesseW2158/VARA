@@ -140,7 +140,6 @@ GRIP_SETTLE_S = 0.4  # a grip close waits this long before reading the gripper
 OPEN_SETTLE_S = 0.3
 RISE_M = 0.05  # the rise after a missed grasp
 CEILING_CLEARANCE_M = 0.005  # a rise stops this far under the box's top
-DEFAULT_HELD_MIN_PCT = 5.0  # when config/objects.yaml names no held_min at all
 MAX_COMMANDS_PER_WAYPOINT = 1000  # a waypoint that needs more ticks than this is a bug, not a slow move
 CAP_FIT_ITERS = 4  # refinements of a sub-step's joint fraction until its measured tip step fits the cap
 
@@ -617,7 +616,6 @@ class Session:
         self.q: list[float] = []
         self.g: float = 1.0
         self.tip: Vec3 = (0.0, 0.0, 0.0)
-        self._objects: dict[str, dict[str, Any]] | None = None
 
     # -- events and scene ----------------------------------------------------------------------------------
     def emit(self, text: str) -> None:
@@ -952,36 +950,15 @@ class Session:
         return reading, holding
 
     def held_threshold(self, obj: str | None) -> float:
-        """The object's `held_min` (config/objects.yaml, LeRobot's 0-100 scale) in our 0-1 gripper units,
-        converted through the gripper span of `arm.driver.joint_map()`. An unknown object uses the smallest
+        """The object's `held_min` in our 0-1 gripper units: `arm.driver.held_threshold`, which keeps
+        LeRobot's 0-100 scale inside the driver (hard rule 3). An unknown object uses the smallest
         `held_min` on file."""
-        if self._objects is None:
-            self._objects = load_objects()
-        entry = self._objects.get(obj) if obj else None
-        if entry is not None and entry.get("held_min") is not None:
-            pct = float(entry["held_min"])
-        else:
-            known = [float(e["held_min"]) for e in self._objects.values() if e.get("held_min") is not None]
-            pct = min(known) if known else DEFAULT_HELD_MIN_PCT
-        grip = driver_mod.joint_map()["gripper"]
-        return pct / abs(float(grip["open_pct"]) - float(grip["closed_pct"]))
+        return float(driver_mod.held_threshold(obj))
 
     def empty_closed(self) -> float:
-        """The gripper reading (0-1) of an empty close: `gripper.empty_closed_pct` in config/joint_map.yaml
-        when A11 records one, else 0.0."""
-        grip = driver_mod.joint_map()["gripper"]
-        raw = grip.get("empty_closed_pct")
-        if raw is None:
-            try:
-                data = yaml.safe_load(Path(driver_mod.JOINT_MAP_PATH).read_text(encoding="utf-8"))
-            except (OSError, yaml.YAMLError):
-                data = None
-            entry = data.get("gripper") if isinstance(data, dict) else None
-            raw = entry.get("empty_closed_pct") if isinstance(entry, dict) else None
-        if raw is None:
-            return 0.0
-        closed, opened = float(grip["closed_pct"]), float(grip["open_pct"])
-        return max(0.0, min(1.0, (float(raw) - closed) / (opened - closed)))
+        """The gripper reading (0-1) of an empty close: `arm.driver.empty_closed_reading()` (0.0 until A11
+        records `gripper.empty_closed_pct`)."""
+        return float(driver_mod.empty_closed_reading())
 
 
 # ------------------------------------------------------------------------------------------------------------
@@ -1231,14 +1208,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(
             "WARNING: no --scene-file: no hand data, the 10 cm hand check is off. Keep hands out of the box."
         )
-    watcher = driver_mod.EscWatcher()
+    real_robot.clear_cancel()  # discard an earlier session's cancellation before watching this startup
+    drv = driver_mod.Driver(port=args.port, follower_id=args.follower_id)
+    watcher = driver_mod.EscWatcher(lambda: real_robot.freeze(drv))
     watcher.start()
     try:
         if not real_robot.confirm_arm_clear(3, watcher):
             return 1
-        real_robot.clear_cancel()  # only an Esc from here on counts
-        drv = driver_mod.Driver(port=args.port, follower_id=args.follower_id)
-        watcher.callback = lambda: real_robot.freeze(drv)
+        if real_robot.esc_during_connect(watcher, drv):
+            return 1
         drv.connect()  # the only place this CLI powers the arm
         try:
             if real_robot.esc_during_connect(watcher, drv):

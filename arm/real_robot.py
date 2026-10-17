@@ -17,26 +17,50 @@ ceiling).
   degrees per tick (the plan starts from the pose clamped into the band).
 - `freeze(driver)`: the driver's freeze (hold in place, torque on) plus the module-level cancel flag that
   any running primitive checks every tick; a cancelled primitive returns reason `stopped`.
-- `carry_to_hand(obj, *, driver, scene, on_event, timeout, ...)`: with the object held, move the grasp
-  center (`arm.ik.fk_grasp`) toward the seen wristband + 0.05 m (the handoff zone when the hand is unseen)
-  on a straight line re-aimed at 10 Hz. Each cycle solves IK (`arm.ik.solve_grasp`) for the point at most
-  one cycle's tip travel ahead on that line, the pitch blended toward -60 degrees by at most PITCH_STEP_RAD
-  (shallower pitches are tried where the reach needs them), and executes `bridge(q, solution)` at <= 2
-  degrees per tick, all joints interpolated together, only after that bridge validated against the limits
-  and the box (inset PLAN_INSET_M) and was checked never to take the grasp center lower than the start or
-  the goal by more than DIVE_TOL_M (`_servo_path`). Nothing is ever stepped toward an unvalidated pose: a
-  solution more than SERVO_JUMP_RAD away (what the cycle's ticks can execute) is only used up to
-  LINE_JUMP_RAD and then run to its end before re-aiming; when no point on the line is reachable, the first
-  ticks of the validated joint-space sweep to the goal's pose run, else the arm holds. The target is
-  clamped TARGET_INSET_M inside the workspace box, so a hand at or beyond the tape is served at the
-  nearest point inside and the tip never leaves the box. Once the hand has stayed within 0.08 m of the
-  grasp center for 1 s the gripper opens; after `timeout` seconds (finite; capped at TIMEOUT_MAX_S) with no
-  steady hand it opens at the handoff zone instead; MAX_TRACK_S of tracking, or a clock that stops
-  advancing, ends the tracking where it is. Then it backs off 0.05 m up, goes home and emits
-  `handoff_done`. With `use_policy: true` in
-  config/rl.yaml the RL policy (`rl.policy_runner.run_policy`, imported lazily) does the reach instead of
-  IK; when it cannot be imported, IK is used with a warning. The 10 cm hand freeze is off inside this
-  primitive (it approaches the hand on purpose); the speed cap near the hand stays on.
+- `carry_to_hand(obj, *, driver, scene, on_event, timeout, ...)`: with the object held, take the grasp
+  center (`arm.ik.fk_grasp`) to the target, the seen wristband + 0.05 m (the handoff zone when the hand is
+  unseen), clamped TARGET_INSET_M inside the workspace box, so a hand at or beyond the tape is served at
+  the nearest point inside and the tip never leaves the box (9.9 suggested the handoff zone instead; the
+  clamp is kept because the clamped target is still a validated point inside the box, at most 3 cm from
+  the tape, and the release still needs the hand within 0.08 m of the grasp center, so a hand far outside
+  waits out the timeout and gets the handoff zone anyway). The carry has three legs, like
+  `arm.sim_robot.SimRobot.carry_to_hand`, which is what the skill was scored with:
+  1. Rise: straight up at the present xy to the carry height, the sim's clearance rule
+     (`carry_height`): the held object's longest half-extent plus CARRY_CLEARANCE_M above the tallest
+     obstacle or seen object still on the table, capped CEILING_MARGIN_M under the box top, with heights
+     and sizes from config/objects.yaml (`arm.replay.load_objects`; the scene's own entry when the file
+     lacks the name). The rise is planned whole before it starts (`_plan_rise`: IK every LINE_SAMPLE_M,
+     the pitch blended toward the steepest one that reaches the top) and validated against the limits, the
+     box (which holds the tip under the 0.30 m ceiling), the vertical line (CARRY_LINE_TOL_M) and the
+     start height. No rise when the grasp center is already there or the target is at or above the carry
+     height (the sim's rule too). When the scene, a height or the held object's size is missing, or the
+     rise does not validate (IK, box, ceiling), there is no rise and no travel: the carry goes straight
+     for the target as before this leg existed, and an event says why.
+  2. Travel: straight lines at the carry height toward the point above the target, re-aimed at 10 Hz as
+     the hand moves, each cycle's bridge validated like the tracking's (below) and never taking the grasp
+     center more than CARRY_LINE_TOL_M under the carry height, with no joint-space sweep. It ends above
+     the target (ABOVE_XY_M), or where no straight step at that height validates (the reach shrinks with
+     height), or after TRAVEL_MAX_S, or when the clock stops advancing; the tracking goes on from there
+     (an event says so).
+  3. Tracking and descent: a straight line toward the target re-aimed at 10 Hz. Each cycle solves IK
+     (`arm.ik.solve_grasp`) for the point at most one cycle's tip travel ahead on that line, the pitch
+     blended toward -60 degrees by at most PITCH_STEP_RAD (shallower pitches are tried where the reach
+     needs them), and executes `bridge(q, solution)` at <= 2 degrees per tick, all joints interpolated
+     together, only after that bridge validated against the limits and the box (inset PLAN_INSET_M) and
+     was checked never to take the grasp center lower than the start or the goal by more than DIVE_TOL_M
+     (`_servo_path`; the descent from the carry height goes down to the goal, which that allows). Nothing
+     is ever stepped toward an unvalidated pose: a solution more than SERVO_JUMP_RAD away (what the cycle's
+     ticks can execute) is only used up to LINE_JUMP_RAD and then run to its end before re-aiming; when no
+     point on the line is reachable, the first ticks of the validated joint-space sweep to the goal's pose
+     run, else the arm holds. Once the hand has stayed within 0.08 m of the grasp center for 1 s the
+     gripper opens; after `timeout` seconds of tracking (finite; capped at TIMEOUT_MAX_S) with no steady
+     hand it opens at the handoff zone instead; MAX_TRACK_S of tracking, or a clock that stops advancing,
+     ends the tracking where it is.
+  Then it backs off 0.05 m up, goes home and emits `handoff_done`. With `use_policy: true` in
+  config/rl.yaml the RL policy (`rl.policy_runner.run_policy`, imported lazily) does the reach after the
+  rise and travel, before the IK tracking; when it cannot be imported, IK is used with a warning. The 10
+  cm hand freeze is off inside this primitive (it approaches the hand on purpose); the speed cap near the
+  hand stays on in every leg.
 
 Each primitive returns `{"ok": bool, "reason": None | "stopped" | "hand_too_close" | "error",
 "events": [...]}` and never raises for driver, IK or scene failures: an error while moving freezes the arm;
@@ -75,6 +99,7 @@ from arm import ik
 from arm.replay import (
     BRIDGE_STEP_RAD,
     LINE_JUMP_RAD,
+    LINE_SAMPLE_M,
     MAX_STEP_RAD,
     PLAN_INSET_M,
     STEP_TOL,
@@ -83,6 +108,7 @@ from arm.replay import (
     Session,
     bridge,
     inside_box,
+    load_objects,
     scene_file_reader,
     setup_failure,
     shrunk_box,
@@ -90,7 +116,11 @@ from arm.replay import (
 )
 
 __all__ = [
+    "ABOVE_XY_M",
     "BACKOFF_M",
+    "CARRY_CLEARANCE_M",
+    "CARRY_LINE_TOL_M",
+    "CEILING_MARGIN_M",
     "DIVE_TOL_M",
     "HAND_ABOVE_M",
     "HOME_STEP_RAD",
@@ -102,7 +132,9 @@ __all__ = [
     "START_PITCH",
     "TARGET_INSET_M",
     "TIMEOUT_MAX_S",
+    "TRAVEL_MAX_S",
     "cancelled",
+    "carry_height",
     "carry_to_hand",
     "clear_cancel",
     "confirm_arm_clear",
@@ -145,6 +177,15 @@ STALL_CYCLES = 100  # tracking cycles with an unchanged clock reading before the
 TARGET_INSET_M = 0.03
 SERVO_JUMP_RAD = TICKS_PER_CYCLE * MAX_STEP_RAD  # 6 deg: the joint move one cycle's ticks execute
 DIVE_TOL_M = 0.01  # a cycle never takes the grasp center lower than the start or the goal by more
+# The carry height, the sim's rule (arm/sim_robot.py `_carry_clearance`; tests pin the two equal).
+CARRY_CLEARANCE_M = 0.02  # the held object's lowest point clears the tallest thing on the table by this
+CEILING_MARGIN_M = 0.01  # the carry height stays this far under the top of the workspace box
+RISE_DONE_M = 0.005  # a grasp center this close under the carry height needs no rise (the sim's 5 mm)
+# IK's 5 mm position tolerance plus 1 mm: how far the rise may stray from its vertical line and how far
+# the travel may sink under the carry height.
+CARRY_LINE_TOL_M = 0.006
+ABOVE_XY_M = 0.01  # the travel ends with the grasp center this close (in xy) to above the target
+TRAVEL_MAX_S = 10.0  # the travel at the carry height never runs longer than this
 
 _CANCEL = threading.Event()
 
@@ -375,8 +416,9 @@ def carry_to_hand(
     sleep: Callable[[float], None] | None = None,
     realtime: bool | None = None,
 ) -> dict[str, Any]:
-    """Hand the held `obj` to the tracked hand (see the module docstring). Ends at home with the event
-    `handoff_done` (also sent through `on_event`, so the orchestrator can count the run event)."""
+    """Hand the held `obj` to the tracked hand: rise to the carry height, travel above the target, then
+    track and descend (see the module docstring). Ends at home with the event `handoff_done` (also sent
+    through `on_event`, so the orchestrator can count the run event)."""
     drv = driver if driver is not None else driver_mod.get_driver()
     clear_cancel()
     events: list[str] = []
@@ -401,10 +443,12 @@ def carry_to_hand(
         if seconds > TIMEOUT_MAX_S:
             session.emit(f"timeout {seconds:g} s capped at {TIMEOUT_MAX_S:g} s")
             seconds = TIMEOUT_MAX_S
+        target = _Target(session)
+        _carry_high(session, obj, target)
         cfg = policy_config()
         if cfg["use_policy"]:
             _run_policy(session, cfg, seconds)
-        _track_hand(session, seconds)
+        _track_hand(session, seconds, target)
         session.open_gripper(where="release")
         session.emit("released")
         session.rise(BACKOFF_M, where="back off")
@@ -454,6 +498,224 @@ def _clamp_point(point: Sequence[float], box: dict[str, Sequence[float]]) -> tup
     return (x, y, z)
 
 
+class _Target:
+    """Where the grasp center goes: HAND_ABOVE_M over the seen wristband, else the handoff zone, clamped
+    TARGET_INSET_M inside the workspace box (one event the first time a target is clamped). Shared by the
+    travel and the tracking, so the note is not repeated."""
+
+    def __init__(self, session: Session) -> None:
+        self.zone = handoff_zone(session.scene_dict())
+        self.box = shrunk_box(session.box, TARGET_INSET_M)
+        self._noted = False
+
+    def goal(self, session: Session, hand: Vec3 | None, *, fallback: bool) -> Vec3:
+        raw = self.zone if fallback or hand is None else (hand[0], hand[1], hand[2] + HAND_ABOVE_M)
+        goal = _clamp_point(raw, self.box)
+        if goal != tuple(float(v) for v in raw) and not self._noted:
+            self._noted = True
+            session.emit(
+                f"target outside the workspace box (inset {TARGET_INSET_M:.2f} m): aiming at the nearest "
+                "point inside"
+            )
+        return goal
+
+
+def _positive(value: Any) -> float | None:
+    """`value` as a finite float > 0, else None (bools and non-numbers too)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        number = float(value)
+    except OverflowError:
+        return None
+    return number if math.isfinite(number) and number > 0.0 else None
+
+
+def _item_height(entry: Any) -> float | None:
+    return _positive(entry.get("h")) if isinstance(entry, dict) else None
+
+
+def _item_reach(entry: Any) -> float | None:
+    """The longest half-extent of an object (center to the farthest point, whatever its tilt), the sim's
+    rule: hypot(radius, h / 2) for a cylinder (`size[1]` is its diameter, as sim/model/build_scene.py
+    builds it), the half-diagonal of the box otherwise (an entry without `shape`, like a scene entry, counts
+    as a box, which is never smaller)."""
+    if not isinstance(entry, dict):
+        return None
+    size, h = entry.get("size"), _item_height(entry)
+    if not isinstance(size, (list, tuple)) or len(size) != 2 or h is None:
+        return None
+    length, width = _positive(size[0]), _positive(size[1])
+    if length is None or width is None:
+        return None
+    if entry.get("shape") == "cylinder":
+        return math.hypot(width / 2, h / 2)
+    return math.sqrt((length / 2) ** 2 + (width / 2) ** 2 + (h / 2) ** 2)
+
+
+def carry_height(
+    obj: str | None,
+    scene: Any,
+    *,
+    ceiling: float,
+    objects: dict[str, dict[str, Any]] | None = None,
+) -> tuple[float | None, str]:
+    """The grasp-center height of the carry by the sim's rule (`arm.sim_robot.SimRobot._carry_clearance`):
+    the held object's longest half-extent (`_item_reach`) plus CARRY_CLEARANCE_M above the tallest
+    obstacle (seen or not: an obstacle never moves and keeps its last pose) or seen object other than
+    `obj`, capped CEILING_MARGIN_M under `ceiling` (the top of the workspace box).
+
+    Heights and sizes come from config/objects.yaml (`objects`, default `arm.replay.load_objects()`) by
+    name, else from the scene's own entry (which the scene contract copies from that file). Returns
+    `(height, how)` with a short description of the sum, or `(None, why)` when the scene, a height or the
+    held object's size is missing."""
+    if not isinstance(scene, dict):
+        return None, "no scene data"
+    config = load_objects() if objects is None else objects
+    if not obj:
+        return None, "the held object is not named"
+    held_scene = scene.get("objects", {}).get(obj) if isinstance(scene.get("objects"), dict) else None
+    reach = _item_reach(config.get(obj))
+    reach = reach if reach is not None else _item_reach(held_scene)
+    if reach is None:
+        return None, f"no size for the held {obj}"
+    tallest, tallest_name = 0.0, "the table"
+    for group in ("obstacles", "objects"):
+        items = scene.get(group)
+        if not isinstance(items, dict):
+            return None, f"the scene has no {group} mapping"
+        for name, item in items.items():
+            if group == "objects" and (name == obj or not (isinstance(item, dict) and item.get("seen"))):
+                continue
+            h = _item_height(config.get(name))
+            h = h if h is not None else _item_height(item)
+            if h is None:
+                return None, f"no height for {name}"
+            if h > tallest:
+                tallest, tallest_name = h, str(name)
+    height = tallest + reach + CARRY_CLEARANCE_M
+    how = f"{tallest_name} {tallest:.2f} m + {obj} {reach:.3f} m + {CARRY_CLEARANCE_M:.2f} m"
+    cap = float(ceiling) - CEILING_MARGIN_M
+    if height > cap:
+        return cap, f"{how}, capped {CEILING_MARGIN_M:.2f} m under the box top"
+    return height, how
+
+
+def _carry_high(session: Session, obj: str | None, target: _Target) -> None:
+    """Legs 1 and 2 of the carry (module docstring): rise at the present xy to the carry height, then
+    travel at that height to above the target. Returns with the arm wherever they ended; an event says why
+    whenever a leg is skipped or cut short. Raises Abort like every motion (STOP, box gate)."""
+    session.check_stopped()
+    height, how = carry_height(obj, session.scene_dict(), ceiling=float(session.box["z"][1]))
+    if height is None:
+        session.emit(f"carry: no rise ({how}): straight toward the target")
+        return
+    goal = target.goal(session, session.hand(), fallback=False)
+    if goal[2] >= height:
+        session.emit(
+            f"carry: target {goal[2]:.2f} m high, at or above the carry height {height:.2f} m: no rise"
+        )
+        return
+    session.emit(f"carry height {height:.2f} m ({how})")
+    (x, y, z), _ = ik.fk_grasp(session.q)
+    if z < height - RISE_DONE_M:
+        path, why = _plan_rise(session, height)
+        if path is None:
+            session.emit(f"carry: rise to {height:.2f} m refused ({why}): straight toward the target")
+            return
+        session.emit(f"carry: rising {(height - z) * 100:.1f} cm at ({x:.2f}, {y:.2f}), {len(path)} steps")
+        session.stream(path, where="carry rise")
+    _travel(session, height, target)
+
+
+def _plan_rise(session: Session, height: float) -> tuple[list[list[float]] | None, str]:
+    """The rise as one validated path, or (None, why). The grasp center goes straight up from where it is
+    to `height`: IK (`arm.ik.solve_grasp`) every LINE_SAMPLE_M, the pitch blended linearly from the present
+    one to the steepest pitch, from START_PITCH toward horizontal in PITCH_STEP_RAD steps, that reaches the
+    top exactly (the sim's rise also asks for the steepest pitch), consecutive samples bridged at <=
+    MAX_STEP_RAD per joint. Refused when a sample has no IK solution or needs a joint reconfiguration
+    (LINE_JUMP_RAD), when a waypoint leaves the limits or the box inset by PLAN_INSET_M (the box's top is
+    the 0.30 m ceiling), strays more than CARRY_LINE_TOL_M from the vertical line, or dips more than
+    DIVE_TOL_M under the start."""
+    q = [float(v) for v in session.q]
+    (x0, y0, z0), pitch0 = ik.fk_grasp(q)
+    top = (x0, y0, float(height))
+    pitch_top: float | None = None
+    for k in range(round(-START_PITCH / PITCH_STEP_RAD) + 1):  # -60, -55, ... 0 degrees
+        pitch = START_PITCH + k * PITCH_STEP_RAD
+        q_top, ok = ik.solve_grasp(top, pitch, q0=q)
+        if ok and abs(ik.fk_grasp(q_top)[1] - pitch) <= ik.PITCH_TOL:
+            pitch_top = pitch
+            break
+    if pitch_top is None:
+        return None, f"no IK solution at ({x0:.2f}, {y0:.2f}, {height:.2f})"
+    samples = max(1, math.ceil((height - z0) / LINE_SAMPLE_M))
+    path: list[list[float]] = []
+    q_prev = q
+    for k in range(1, samples + 1):
+        frac = k / samples
+        point = (x0, y0, z0 + (height - z0) * frac)
+        q_next, ok = ik.solve_grasp(point, pitch0 + (pitch_top - pitch0) * frac, q0=q_prev)
+        if not ok:
+            return None, f"no IK solution at ({x0:.2f}, {y0:.2f}, {point[2]:.2f})"
+        q_next = [float(v) for v in q_next]
+        jump = max(abs(a - b) for a, b in zip(q_next, q_prev, strict=True))
+        if jump > LINE_JUMP_RAD:
+            return None, f"joint reconfiguration of {math.degrees(jump):.0f} deg at z {point[2]:.2f}"
+        path.extend(bridge(q_prev, q_next, MAX_STEP_RAD))
+        q_prev = q_next
+    problems = validate_path(path, session.limits, ik.fk_tip, shrunk_box(session.box, PLAN_INSET_M))
+    if problems:
+        return None, problems[0]
+    for waypoint in path:
+        (x, y, z), _ = ik.fk_grasp(waypoint)
+        if math.hypot(x - x0, y - y0) > CARRY_LINE_TOL_M:
+            return None, f"the grasp center would stray {math.hypot(x - x0, y - y0) * 100:.1f} cm sideways"
+        if z < z0 - DIVE_TOL_M:
+            return None, f"the grasp center would dip to {z:.3f} m"
+    return path, ""
+
+
+def _travel(session: Session, height: float, target: _Target) -> None:
+    """Leg 2: straight lines of the grasp center toward the point `height` above the target, re-aimed at
+    TRACK_HZ (the target follows the hand), each cycle's path from `_servo_path` with the floor `height -
+    CARRY_LINE_TOL_M` and no joint-space sweep. Ends above the target (within ABOVE_XY_M), where no straight
+    step at that height validates, after TRAVEL_MAX_S, or after STALL_CYCLES cycles with the same clock
+    reading; the tracking goes on from wherever it ended."""
+    pacer = session.pacer
+    t0 = pacer.now()
+    last_now: float | None = None
+    stalled = 0
+    last_note = ""
+    while True:
+        session.check_stopped()
+        now = pacer.now()
+        stalled = stalled + 1 if now == last_now else 0
+        last_now = now
+        goal = target.goal(session, session.hand(), fallback=False)
+        (x, y, z), _ = ik.fk_grasp(session.q)
+        if math.hypot(goal[0] - x, goal[1] - y) <= ABOVE_XY_M:
+            session.emit(f"carry: above the target at {z:.2f} m")
+            return
+        if now - t0 >= TRAVEL_MAX_S or stalled >= STALL_CYCLES:
+            session.emit(
+                f"carry: travel at {height:.2f} m cut short at ({x:.2f}, {y:.2f}): tracking from here"
+            )
+            return
+        aim = (goal[0], goal[1], height)
+        path, note = _servo_path(session, aim, START_PITCH, floor_z=height - CARRY_LINE_TOL_M, sweep=False)
+        if path is None:
+            session.emit(
+                f"carry: no straight travel at {height:.2f} m beyond ({x:.2f}, {y:.2f}) toward "
+                f"({goal[0]:.2f}, {goal[1]:.2f}): tracking from here"
+            )
+            return
+        if note and note != last_note:
+            session.emit(f"carry travel: {note}")
+        last_note = note
+        session.stream(path, where="carry travel")
+
+
 def _pitch_candidates(pitch_now: float, pitch_goal: float) -> list[float]:
     """The pitches one cycle tries, in order: the present pitch moved toward `pitch_goal` by at most
     PITCH_STEP_RAD, the present pitch, then shallower pitches (toward horizontal, never past it) in
@@ -470,7 +732,14 @@ def _grasp_dives(path: Sequence[Sequence[float]], z_floor: float) -> bool:
     return any(ik.fk_grasp(q)[0][2] < z_floor for q in path)
 
 
-def _servo_path(session: Session, goal: Vec3, pitch_goal: float) -> tuple[list[list[float]] | None, str]:
+def _servo_path(
+    session: Session,
+    goal: Vec3,
+    pitch_goal: float,
+    *,
+    floor_z: float | None = None,
+    sweep: bool = True,
+) -> tuple[list[list[float]] | None, str]:
     """The validated joint-space path one 10 Hz cycle executes, or None (holding), with a note for the
     events ("" when all is well).
 
@@ -478,15 +747,16 @@ def _servo_path(session: Session, goal: Vec3, pitch_goal: float) -> tuple[list[l
     on the straight line from the grasp center to `goal`, solved with `arm.ik.solve_grasp` for each pitch
     of `_pitch_candidates`. A solution is used when `bridge(q, solution, MAX_STEP_RAD)` validates inside
     the box inset by PLAN_INSET_M and never takes the grasp center lower than the start or the goal by more
-    than DIVE_TOL_M; the first one within SERVO_JUMP_RAD (what the cycle's ticks execute) wins, else the
-    half step is tried, else the nearest solution within LINE_JUMP_RAD runs to its end before the next
-    re-aim. When no point on the line is reachable, the first TICKS_PER_CYCLE waypoints of the validated
-    joint-space sweep to the goal's pose run. Every path returned here is exactly what is streamed, so the
-    executed motion is always validated (never a per-joint step toward a far pose).
+    than DIVE_TOL_M (or lower than `floor_z` when given: the travel at the carry height); the first one
+    within SERVO_JUMP_RAD (what the cycle's ticks execute) wins, else the half step is tried, else the
+    nearest solution within LINE_JUMP_RAD runs to its end before the next re-aim. When no point on the line
+    is reachable, the first TICKS_PER_CYCLE waypoints of the validated joint-space sweep to the goal's pose
+    run (unless `sweep` is False). Every path returned here is exactly what is streamed, so the executed
+    motion is always validated (never a per-joint step toward a far pose).
     """
     q = [float(v) for v in session.q]
     grasp, pitch_now = ik.fk_grasp(q)
-    z_floor = min(grasp[2], goal[2]) - DIVE_TOL_M
+    z_floor = min(grasp[2], goal[2]) - DIVE_TOL_M if floor_z is None else float(floor_z)
     inset = shrunk_box(session.box, PLAN_INSET_M)
     remaining = math.dist(grasp, goal)
     reach = TICKS_PER_CYCLE * session.tip_cap(session.tip)
@@ -522,32 +792,32 @@ def _servo_path(session: Session, goal: Vec3, pitch_goal: float) -> tuple[list[l
                 far = (jump, path)
     if far is not None:
         return far[1], f"re-aiming with a {math.degrees(far[0]):.0f} deg joint move"
-    q_full, ok = ik.solve_grasp(goal, pitch_goal, q0=q)
-    if ok:
-        sweep = bridge(q, q_full, MAX_STEP_RAD)[:TICKS_PER_CYCLE]
-        if not validate_path(sweep, session.limits, ik.fk_tip, inset) and not _grasp_dives(sweep, z_floor):
-            return sweep, "straight approach blocked: joint-space sweep toward the target"
+    if sweep:
+        q_full, ok = ik.solve_grasp(goal, pitch_goal, q0=q)
+        if ok:
+            head = bridge(q, q_full, MAX_STEP_RAD)[:TICKS_PER_CYCLE]
+            if not (validate_path(head, session.limits, ik.fk_tip, inset) or _grasp_dives(head, z_floor)):
+                return head, "straight approach blocked: joint-space sweep toward the target"
     x, y, z = goal
     return None, f"no IK solution toward ({x:.2f}, {y:.2f}, {z:.2f}): holding"
 
 
-def _track_hand(session: Session, timeout: float) -> None:
-    """Straight-line tracking at TRACK_HZ until the release condition holds (the hand steady within
+def _track_hand(session: Session, timeout: float, target: _Target | None = None) -> None:
+    """Leg 3: straight-line tracking at TRACK_HZ until the release condition holds (the hand steady within
     RELEASE_WITHIN_M of the grasp center for RELEASE_STEADY_S, or the handoff zone reached after the
-    timeout). Targets are clamped TARGET_INSET_M inside the workspace box. The tracking ends where it is
-    after MAX_TRACK_S whatever the deadlines, and when the clock stops advancing (STALL_CYCLES cycles with
-    the same reading), since the deadlines need it."""
+    timeout, which counts from here). Targets come from `target` (clamped TARGET_INSET_M inside the
+    workspace box). The tracking ends where it is after MAX_TRACK_S whatever the deadlines, and when the
+    clock stops advancing (STALL_CYCLES cycles with the same reading), since the deadlines need it."""
     pacer = session.pacer
     t0 = pacer.now()
     deadline = t0 + timeout
     fallback_deadline = deadline + FALLBACK_EXTRA_S
-    zone = handoff_zone(session.scene_dict())
-    target_box = shrunk_box(session.box, TARGET_INSET_M)
+    target = _Target(session) if target is None else target
+    zone = target.zone
     near_since: float | None = None
     fallback = session.scene_fn is None
     if fallback:
         session.emit("no hand data: releasing at the handoff zone")
-    noted: set[str] = set()  # one-time notes: the clamp and each new IK failure streak
     last_note = ""
     last_now: float | None = None
     stalled = 0
@@ -561,17 +831,7 @@ def _track_hand(session: Session, timeout: float) -> None:
             fallback = True
             session.emit(f"no steady hand within {timeout:g} s: falling back to the handoff zone")
         grasp_center, _ = ik.fk_grasp(session.q)
-        if fallback or hand is None:
-            raw = zone
-        else:
-            raw = (hand[0], hand[1], hand[2] + HAND_ABOVE_M)
-        goal = _clamp_point(raw, target_box)
-        if goal != tuple(float(v) for v in raw) and "clamp" not in noted:
-            noted.add("clamp")
-            session.emit(
-                f"target outside the workspace box (inset {TARGET_INSET_M:.2f} m): aiming at the nearest "
-                "point inside"
-            )
+        goal = target.goal(session, hand, fallback=fallback)
         if not fallback and hand is not None:
             if math.dist(grasp_center, hand) <= RELEASE_WITHIN_M:
                 near_since = now if near_since is None else near_since
@@ -682,14 +942,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     load_dotenv()
     if scene is None:
         print("WARNING: no --scene-file: no hand data; carry_to_hand releases at the handoff zone.")
-    watcher = driver_mod.EscWatcher()
+    clear_cancel()  # discard an earlier session's cancellation before watching this startup
+    drv = driver_mod.Driver(port=args.port, follower_id=args.follower_id)
+    watcher = driver_mod.EscWatcher(lambda: freeze(drv))
     watcher.start()
     try:
         if not confirm_arm_clear(3, watcher):
             return 1
-        clear_cancel()  # only an Esc from here on counts
-        drv = driver_mod.Driver(port=args.port, follower_id=args.follower_id)
-        watcher.callback = lambda: freeze(drv)
+        if esc_during_connect(watcher, drv):
+            return 1
         drv.connect()  # the only place this CLI powers the arm
         try:
             if esc_during_connect(watcher, drv):
@@ -710,13 +971,14 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 def esc_during_connect(watcher: Any, driver: Any) -> bool:
-    """True when Esc landed while `driver.connect()` ran: `connect()` ends by clearing the driver's
-    stopped flag, so the freeze the watcher sent is redone on the now powered arm and the run is refused.
-    Both `--real` CLIs call this right after `connect()`."""
-    if not (getattr(watcher, "pressed", False) or cancelled()):
+    """Latch every STOP source before and after connecting; refuse motion while stopped."""
+    if not (getattr(watcher, "pressed", False) or getattr(driver, "stopped", False) or cancelled()):
         return False
     freeze(driver)
-    print("Esc pressed while connecting: arm frozen with torque on, nothing moved.")
+    if getattr(driver, "connected", False):
+        print("Esc pressed while connecting: arm frozen with torque on, nothing moved.")
+    else:
+        print("Stopped before connecting; nothing moved.")
     return True
 
 
