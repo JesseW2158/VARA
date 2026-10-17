@@ -639,21 +639,34 @@ class Orchestrator:
     def calibrate(self) -> dict[str, Any]:
         if self.fake_camera:
             return {"error_cm": FAKE_CALIBRATION_CM}
-        frame = None
-        last_frame = getattr(self.tracker, "last_frame", None)
-        if callable(last_frame):
-            frame = last_frame()
-        if frame is None:
-            frame = cameras.get_camera("overhead").read()
-        if frame is None:
-            raise HTTPException(status_code=503, detail="no frame from the overhead camera")
         try:
-            error = calibrate.calibration_error(
+            frame = None
+            last_frame = getattr(self.tracker, "last_frame", None)
+            if callable(last_frame):
+                frame = last_frame()
+            if frame is None:
+                camera = cameras.get_camera("overhead")
+                try:
+                    frame = camera.read()
+                finally:
+                    camera.release()
+            if frame is None:
+                raise ValueError("no frame from the overhead camera")
+            metrics = calibrate.calibration_metrics(
                 calibrate.load_homography(), markers.detect(frame), calibrate.calib_marker_centers()
             )
-        except (ValueError, OSError) as exc:
+        except (ValueError, OSError, RuntimeError) as exc:
             raise HTTPException(status_code=503, detail=f"calibration check failed: {exc}") from None
-        return {"error_cm": round(float(error), 2)}
+        if not metrics["accepted"]:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"calibration marker check failed: mean {metrics['mean_cm']:.3f} cm "
+                    f"(limit 1.0), max {metrics['max_cm']:.3f} cm (limit 1.5); "
+                    "repeat table calibration and independent check points"
+                ),
+            )
+        return {"error_cm": round(float(metrics["mean_cm"]), 2)}
 
     def reset_demo(self) -> dict[str, Any]:
         with self.lock:

@@ -32,17 +32,22 @@ and markers 4-7 sit exactly on the top edge (x = 0.46), so the brief's camera co
 calibration markers. 450 px is a 70 degree horizontal field (a Logitech C920 class webcam) and keeps every
 marker at least 29 px inside the frame.
 
-CLI: `python -m vision.calibrate --fake` writes the synthetic config/homography.npy (deterministic, so the
-committed file is rewritten byte for byte); `--live` fits from the overhead camera (hardware) and
-`--check` reports the error of the saved file on a live frame.
+CLI: `python -m vision.calibrate --fake` writes the synthetic config/homography.npy; `--live` fits from
+the overhead camera and saves only after mean error <= 1 cm and maximum error <= 1.5 cm. `--check`
+checks the saved matrix without writing it. Fit-marker residuals do not establish independent accuracy:
+`--check-points checks.json` supplies at least five separate measured pixel/table pairs. With --live it
+also gates the save; with --check it checks those recorded pairs offline without opening a camera.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import math
+import os
 import pathlib
 import sys
+import tempfile
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
@@ -57,10 +62,13 @@ __all__ = [
     "PRINCIPAL",
     "calib_marker_centers",
     "calibration_error",
+    "calibration_metrics",
     "camera_pose",
+    "check_points_metrics",
     "fit_homography",
     "height_correct",
     "load_homography",
+    "load_check_points",
     "load_scene_cfg",
     "pixel_to_table",
     "pixels_to_table",
@@ -77,6 +85,9 @@ FOCAL_PX = 450.0
 IMAGE_SIZE = (640, 480)  # width, height
 PRINCIPAL = (320.0, 240.0)
 RANSAC_THRESHOLD_M = 0.02  # a marker center farther than 2 cm from the fit is an outlier
+MAX_MEAN_ERROR_CM = 1.0
+MAX_POINT_ERROR_CM = 1.5
+MIN_CHECK_POINTS = 5
 
 
 def load_scene_cfg(path: pathlib.Path | str | None = None) -> dict[str, Any]:
@@ -148,6 +159,8 @@ def fit_homography(
         raise ValueError(f"a homography needs at least 4 points, got {len(src)}")
     if not (np.all(np.isfinite(src)) and np.all(np.isfinite(dst))):
         raise ValueError("non-finite calibration points")
+    if not math.isfinite(ransac_threshold) or ransac_threshold <= 0:
+        raise ValueError("RANSAC threshold must be finite and positive")
     h, _mask = cv2.findHomography(src, dst, cv2.RANSAC, ransac_threshold)
     if h is None or not np.all(np.isfinite(h)) or abs(h[2, 2]) < 1e-12:
         raise ValueError("findHomography failed: are the points spread over the table?")
@@ -157,8 +170,8 @@ def fit_homography(
 def pixel_to_table(h: np.ndarray, u: float, v: float) -> tuple[float, float]:
     """Map one pixel through H: `H @ [u, v, 1]` normalized, as (x, y) in meters."""
     x, y, w = np.asarray(h, dtype=np.float64) @ np.array([float(u), float(v), 1.0])
-    if abs(w) < 1e-12:
-        raise ValueError(f"pixel ({u}, {v}) maps to infinity")
+    if not all(math.isfinite(value) for value in (x, y, w)) or abs(w) < 1e-12:
+        raise ValueError(f"pixel ({u}, {v}) maps to a non-finite point or infinity")
     return float(x / w), float(y / w)
 
 
@@ -188,17 +201,123 @@ def calibration_error(
     `calib_markers` of config/scene.yaml). Detections of other ids are ignored. Raises ValueError when no
     calibration marker is in view, so a blocked camera never reports 0.0 cm.
     """
-    errors: list[float] = []
+    return float(calibration_metrics(h, dets, markers, min_markers=1)["mean_cm"])
+
+
+def _calibration_pairs(
+    dets: Iterable[tuple[int, np.ndarray]], markers: Mapping[int, Sequence[float]]
+) -> tuple[list[int], list[list[float]], list[list[float]]]:
+    ids: list[int] = []
+    pixels: list[list[float]] = []
+    measured: list[list[float]] = []
     for marker_id, corners in dets:
-        measured = markers.get(int(marker_id))
-        if measured is None:
+        marker_id = int(marker_id)
+        target = markers.get(marker_id)
+        if target is None:
             continue
-        u, v = np.asarray(corners, dtype=np.float64).reshape(-1, 2).mean(axis=0)
-        x, y = pixel_to_table(h, u, v)
-        errors.append(math.hypot(x - float(measured[0]), y - float(measured[1])))
-    if not errors:
+        if marker_id in ids:
+            raise ValueError(f"duplicate calibration marker id {marker_id}")
+        points = np.asarray(corners, dtype=np.float64)
+        xy = np.asarray(target, dtype=np.float64)
+        if points.shape != (4, 2) or xy.shape != (2,):
+            raise ValueError(f"marker {marker_id} needs four pixel corners and a measured (x, y)")
+        if not np.all(np.isfinite(points)) or not np.all(np.isfinite(xy)):
+            raise ValueError(f"non-finite coordinates for calibration marker {marker_id}")
+        ids.append(marker_id)
+        pixels.append(points.mean(axis=0).tolist())
+        measured.append(xy.tolist())
+    if not ids:
         raise ValueError("no calibration marker (ids 0-7) detected")
-    return float(np.mean(errors)) * 100.0
+    return ids, pixels, measured
+
+
+def _error_metrics(
+    h: np.ndarray, pixels: Iterable[Sequence[float]], table: Iterable[Sequence[float]]
+) -> dict[str, int | float | bool]:
+    h = _checked_homography(h)
+    errors = [
+        math.dist(pixel_to_table(h, *pixel), measured) * 100.0
+        for pixel, measured in zip(pixels, table, strict=True)
+    ]
+    if not errors or not all(math.isfinite(error) for error in errors):
+        raise ValueError("calibration errors must be finite and non-empty")
+    mean_cm, max_cm = float(np.mean(errors)), max(errors)
+    return {
+        "count": len(errors),
+        "mean_cm": mean_cm,
+        "max_cm": max_cm,
+        "accepted": mean_cm <= MAX_MEAN_ERROR_CM + 1e-9 and max_cm <= MAX_POINT_ERROR_CM + 1e-9,
+    }
+
+
+def calibration_metrics(
+    h: np.ndarray,
+    dets: Iterable[tuple[int, np.ndarray]],
+    markers: Mapping[int, Sequence[float]],
+    *,
+    min_markers: int = 4,
+) -> dict[str, int | float | bool]:
+    """Marker fit residuals: count, mean_cm, max_cm, accepted (mean <= 1 cm, max <= 1.5 cm).
+
+    At least four unique known markers are required by default. These points were used to fit H, so
+    passing is a consistency check; use check_points_metrics for independent measured accuracy.
+    calibration_error retains its older mean-only interface, accepting one or more markers.
+    """
+    if not isinstance(min_markers, int) or isinstance(min_markers, bool) or min_markers < 1:
+        raise ValueError("min_markers must be a positive integer")
+    ids, pixels, table = _calibration_pairs(dets, markers)
+    if len(ids) < min_markers:
+        raise ValueError(f"only {len(ids)} calibration markers detected; need {min_markers} or more")
+    return _error_metrics(h, pixels, table)
+
+
+def _check_point_pairs(points: Any) -> tuple[list[list[float]], list[list[float]]]:
+    if not isinstance(points, list) or len(points) < MIN_CHECK_POINTS:
+        raise ValueError(f"check points must be a JSON list of at least {MIN_CHECK_POINTS} measured spots")
+    pixels: list[list[float]] = []
+    table: list[list[float]] = []
+    for index, point in enumerate(points):
+        if not isinstance(point, dict) or set(point) != {"pixel", "table"}:
+            raise ValueError(f"check point {index} needs exactly pixel: [u, v] and table: [x, y]")
+        for name, collection in (("pixel", pixels), ("table", table)):
+            values = point[name]
+            if (
+                not isinstance(values, list)
+                or len(values) != 2
+                or any(isinstance(v, bool) or not isinstance(v, (int, float)) for v in values)
+            ):
+                raise ValueError(f"check point {index} {name} must have two finite numbers")
+            try:
+                pair = [float(v) for v in values]
+            except OverflowError as exc:
+                raise ValueError(f"check point {index} {name} must have two finite numbers") from exc
+            if not all(math.isfinite(v) for v in pair):
+                raise ValueError(f"check point {index} {name} must have two finite numbers")
+            collection.append(pair)
+    for name, pairs in (("pixel", pixels), ("table", table)):
+        if len({tuple(pair) for pair in pairs}) != len(pairs):
+            raise ValueError(f"check points need distinct {name} positions")
+        array = np.asarray(pairs)
+        if np.linalg.matrix_rank(array - array[0]) < 2:
+            raise ValueError(f"check points must span the table, not lie on one {name} line")
+    return pixels, table
+
+
+def check_points_metrics(h: np.ndarray, points: Any) -> dict[str, int | float | bool]:
+    """Accuracy on >=5 independent spots [{pixel: [u, v], table: [x, y]}, ...].
+
+    Pixels are image coordinates and table coordinates are measured meters at z=0. Every spot must be
+    distinct and the set must span two dimensions. Supply new measurements, never reused fit markers.
+    The return keys and acceptance limits are the same as calibration_metrics.
+    """
+    return _error_metrics(h, *_check_point_pairs(points))
+
+
+def load_check_points(path: pathlib.Path | str) -> list[dict[str, list[float]]]:
+    """Read and validate independent point measurements; never collect or manufacture measurements."""
+    points = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+    _check_point_pairs(points)
+    return points
 
 
 def synthetic_detections(
@@ -231,14 +350,33 @@ def synthetic_homography(scene_cfg: Mapping[str, Any] | None = None) -> np.ndarr
 
 
 def save_homography(h: np.ndarray, path: pathlib.Path | str | None = None) -> pathlib.Path:
-    """Write H to config/homography.npy (or `path`) and return the path."""
+    """Atomically save a finite invertible H. A failed write preserves the previous calibration."""
     file = pathlib.Path(path) if path is not None else HOMOGRAPHY_PATH
+    arr = _checked_homography(h)
+    file.parent.mkdir(parents=True, exist_ok=True)
+    temporary: pathlib.Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb", dir=file.parent, prefix=f".{file.name}.", suffix=".tmp", delete=False
+        ) as stream:
+            temporary = pathlib.Path(stream.name)
+            np.save(stream, arr, allow_pickle=False)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, file)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+    return file
+
+
+def _checked_homography(h: Any) -> np.ndarray:
     arr = np.asarray(h, dtype=np.float64)
     if arr.shape != (3, 3) or not np.all(np.isfinite(arr)):
         raise ValueError(f"a homography is a finite 3x3 matrix, got shape {arr.shape}")
-    file.parent.mkdir(parents=True, exist_ok=True)
-    np.save(file, arr)
-    return file
+    if np.linalg.matrix_rank(arr) != 3:
+        raise ValueError("a homography must be invertible")
+    return arr
 
 
 def load_homography(path: pathlib.Path | str | None = None) -> np.ndarray:
@@ -246,10 +384,7 @@ def load_homography(path: pathlib.Path | str | None = None) -> np.ndarray:
     file = pathlib.Path(path) if path is not None else HOMOGRAPHY_PATH
     if not file.exists():
         raise FileNotFoundError(f"{file} is missing: run python -m vision.calibrate --fake (or --live)")
-    arr = np.load(file)
-    if arr.shape != (3, 3) or not np.all(np.isfinite(arr)):
-        raise ValueError(f"{file} does not hold a finite 3x3 homography")
-    return np.asarray(arr, dtype=np.float64)
+    return _checked_homography(np.load(file, allow_pickle=False))
 
 
 def _collect_live(camera: Any, frames: int) -> list[tuple[int, np.ndarray]]:
@@ -269,7 +404,7 @@ def _collect_live(camera: Any, frames: int) -> list[tuple[int, np.ndarray]]:
 
 def _report(
     h: np.ndarray, dets: list[tuple[int, np.ndarray]], markers: Mapping[int, Sequence[float]]
-) -> float:
+) -> dict[str, int | float | bool]:
     for marker_id, corners in dets:
         measured = markers.get(marker_id)
         if measured is None:
@@ -278,9 +413,18 @@ def _report(
         x, y = pixel_to_table(h, u, v)
         err = math.hypot(x - measured[0], y - measured[1]) * 100.0
         print(f"marker {marker_id}: mapped ({x:.4f}, {y:.4f}) measured {tuple(measured)} error {err:.2f} cm")
-    err_cm = calibration_error(h, dets, markers)
-    print(f"mean calibration error {err_cm:.3f} cm over {len(dets)} markers")
-    return err_cm
+    metrics = calibration_metrics(h, dets, markers)
+    _report_metrics("fit-marker residuals", metrics)
+    return metrics
+
+
+def _report_metrics(label: str, metrics: Mapping[str, int | float | bool]) -> None:
+    status = "PASS" if metrics["accepted"] else "FAIL"
+    print(
+        f"{label}: mean {metrics['mean_cm']:.3f} cm, max {metrics['max_cm']:.3f} cm "
+        f"over {metrics['count']} points: {status} (limits: mean <= {MAX_MEAN_ERROR_CM:g} cm, "
+        f"max <= {MAX_POINT_ERROR_CM:g} cm)"
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -294,17 +438,43 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--frames", type=int, default=10, help="frames to average for --live/--check")
     parser.add_argument("--out", default=str(HOMOGRAPHY_PATH), help="where to write the .npy")
     parser.add_argument("--no-save", action="store_true", help="--live: fit and report, do not write")
+    parser.add_argument(
+        "--check-points",
+        type=pathlib.Path,
+        help="JSON of >=5 independent {pixel:[u,v],table:[x,y]} spots; --check uses it offline",
+    )
     args = parser.parse_args(argv)
+    if args.frames < 1:
+        parser.error("--frames must be positive")
+    if args.no_save and not args.live:
+        parser.error("--no-save requires --live")
+    if args.check_points and args.fake:
+        parser.error("--check-points requires --live or --check")
+    try:
+        return _run(args)
+    except (ValueError, OSError, RuntimeError, cv2.error) as exc:
+        print(f"calibration failed: {exc}; saved homography unchanged", file=sys.stderr)
+        return 1
 
+
+def _run(args: argparse.Namespace) -> int:
+    check_points = load_check_points(args.check_points) if args.check_points else None
+    if args.check and check_points is not None:
+        metrics = check_points_metrics(load_homography(args.out), check_points)
+        _report_metrics("independent measured check points (recorded pixels; no camera opened)", metrics)
+        return 0 if metrics["accepted"] else 1
     cfg = load_scene_cfg()
     markers = calib_marker_centers(cfg)
     if args.fake:
         h = synthetic_homography(cfg)
-        err_cm = _report(h, synthetic_detections(cfg), markers)
+        metrics = _report(h, synthetic_detections(cfg), markers)
+        if not metrics["accepted"]:
+            return 1
         out = save_homography(h, args.out)
         c, hc = camera_pose(cfg)
         print(f"wrote {out}: synthetic camera at ({c[0]}, {c[1]}, {hc}) m, f={FOCAL_PX:.0f} px, {IMAGE_SIZE}")
-        return 0 if err_cm < 0.1 else 1
+        print("Synthetic calibration only; physical table accuracy remains unverified.")
+        return 0
 
     from dotenv import load_dotenv
 
@@ -313,21 +483,29 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     camera = get_camera("overhead")
     try:
+        if getattr(camera, "is_fake", False):
+            raise ValueError("live calibration requires a real camera; use --fake for synthetic calibration")
         dets = _collect_live(camera, args.frames)
     finally:
         camera.release()
-    if len(dets) < 4:
-        print(f"only {len(dets)} calibration markers detected; need 4 or more", file=sys.stderr)
+    ids, pixels, table = _calibration_pairs(dets, markers)
+    if len(ids) < 4:
+        raise ValueError(f"only {len(ids)} calibration markers detected; need 4 or more")
+    h = load_homography(args.out) if args.check else fit_homography(pixels, table)
+    metrics = _report(h, dets, markers)
+    accepted = bool(metrics["accepted"])
+    if check_points is not None:
+        independent = check_points_metrics(h, check_points)
+        _report_metrics("independent measured check points", independent)
+        accepted = accepted and bool(independent["accepted"])
+    else:
+        print("Fit-marker residuals only; independent table accuracy remains unverified.")
+    if not accepted:
+        print("Calibration rejected; saved homography unchanged.", file=sys.stderr)
         return 1
-    if args.check:
-        h = load_homography(args.out)
-        err_cm = _report(h, dets, markers)
-        return 0 if err_cm <= 1.5 else 1
-    h = fit_homography([np.mean(c, axis=0) for _, c in dets], [markers[m] for m, _ in dets])
-    err_cm = _report(h, dets, markers)
-    if not args.no_save:
+    if args.live and not args.no_save:
         print(f"wrote {save_homography(h, args.out)}")
-    return 0 if err_cm <= 1.5 else 1
+    return 0
 
 
 if __name__ == "__main__":
