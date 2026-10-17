@@ -376,7 +376,7 @@ const JUNK_CURVES = { body: { variants: [
   const rows = h.doc.getElementById("skills").querySelectorAll("li.skill");
   const qrows = h.doc.getElementById("queue").querySelectorAll("li");
   check("junk /state entries: non-object skills and null queue entries are skipped, the object ones render, the pill stays 'state: idle'",
-    rows.length === 2 && rows[0].querySelector(".name").textContent === "ok skill" && /real \?\/\? /.test(rows[0].textContent) && qrows.length === 3 && qrows[0].textContent === "plain" && h.text("pill-state") === "state: idle" && clean(h),
+    rows.length === 2 && rows[0].querySelector(".name").textContent === "ok skill" && /execution \?\/\? /.test(rows[0].textContent) && qrows.length === 3 && qrows[0].textContent === "plain" && h.text("pill-state") === "state: idle" && clean(h),
     { rows: rows.length, first: rows[0] && rows[0].textContent, queue: qrows.map((q) => q.textContent), pill: h.text("pill-state"), errors: h.errors });
   const list = h.doc.getElementById("skills");
   list.appendChild = function () { throw new Error("append boom"); };
@@ -573,6 +573,18 @@ const JUNK_CURVES = { body: { variants: [
   check("Esc on the voice page posts /stop once and tells the parent dashboard (vara-stopped, source Esc) on our origin",
     h.net.count("POST /stop") === 1 && stopped.length === 1 && stopped[0].m.source === "Esc" && stopped[0].origin === ORIGIN && h.status() === "STOPPED" && clean(h),
     { stops: h.net.count("POST /stop"), stopped, status: h.status(), errors: h.errors });
+}
+
+{
+  const h = dashboard({ "GET /runtime": { body: { robot: "simulation", camera: "simulated", model: "fixtures", scoring: "local" } } });
+  await h.timers.flush();
+  check("runtime provenance labels fixture simulations explicitly", h.text("runtime-banner") === "Robot: simulation | Cameras: simulated | Responses: fixtures | Scoring: local" && clean(h), h.text("runtime-banner"));
+  const hung = dashboard({ "GET /runtime": "hang", "POST /stop": { body: { state: "stopped" } } });
+  await hung.timers.flush();
+  hung.fire("keydown", { key: "Escape" });
+  await hung.timers.flush();
+  await hung.timers.tick(8001);
+  check("unavailable runtime labels do not delay Esc or claim a physical run", hung.net.count("POST /stop") === 1 && /Runtime mode unavailable/.test(hung.text("runtime-banner")) && clean(hung), hung.text("runtime-banner"));
 }
 
 const failed = results.filter((r) => !r.ok);

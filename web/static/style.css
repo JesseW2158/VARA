@@ -376,3 +376,5 @@ video { width: 100%; margin-top: 10px; border-radius: 10px; background: #000; ma
   .spec-english { font-size: 24px; }
   .headline { font-size: 22px; }
 }
+/* Execution provenance stays visible in both offline and physical sessions. */
+.runtime-banner { padding: 8px 18px; background: #182839; color: #d4e9ff; font-size: 0.9rem; }

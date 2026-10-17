@@ -1449,6 +1449,23 @@ async def get_state() -> dict[str, Any]:
     return await asyncio.to_thread(orch.snapshot_state)
 
 
+@app.get("/runtime")
+async def get_runtime() -> dict[str, str]:
+    """Display execution provenance without changing the shared state contract or exposing keys."""
+    driver = orch.driver
+    robot = "simulation" if getattr(driver, "is_fake", _fake("FAKE_ROBOT")) else "physical"
+    if robot == "physical" and not getattr(driver, "connected", False):
+        robot = "physical, disconnected"
+    return {
+        "robot": robot,
+        "camera": "simulated" if _fake("FAKE_CAMERA") else "physical",
+        "model": "fixtures" if _fake("FAKE_LLM") else "xAI",
+        "scoring": "local"
+        if _fake("FAKE_SANDBOX") or not os.environ.get("DAYTONA_API_KEY")
+        else "Daytona with local fallback",
+    }
+
+
 @app.post("/command")
 async def post_command(body: CommandBody) -> dict[str, Any]:
     try:

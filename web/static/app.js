@@ -677,7 +677,7 @@
       li.appendChild(name);
       var real = isObject(s.real) ? s.real : {}, sim = isObject(s.sim) ? s.sim : {};
       var stats = el("span", "stats");
-      stats.appendChild(document.createTextNode("real "));
+      stats.appendChild(document.createTextNode("execution "));
       stats.appendChild(el("b", null, count(real.successes)));
       stats.appendChild(document.createTextNode("/" + count(real.runs) + " " + DOT + " sim " + count(sim.successes) + "/" + count(sim.trials)));
       li.appendChild(stats);
@@ -945,7 +945,7 @@
       if (!r.ok) throw new Error(errText(r));
       var cm = num(r.data && r.data.error_cm);
       if (cm === null) throw new Error("no error_cm in the reply");
-      setResult("calib-result", "calibration error " + cm.toFixed(2) + " cm" + (cm > 1.5 ? " - recalibrate" : " - ok"), cm > 1.5 ? "bad" : "ok");
+      setResult("calib-result", "marker check " + cm.toFixed(2) + " cm mean" + (cm > 1.0 ? " - recalibrate" : ""), cm > 1.0 ? "bad" : "ok");
     } catch (e) {
       setResult("calib-result", "calibration check failed: " + e.message, "bad");
     } finally {
@@ -1090,6 +1090,19 @@
     });
   }
 
+  async function loadRuntime() {
+    var banner = $("runtime-banner");
+    try {
+      var reply = await api("GET", "/runtime", undefined, STATE_TIMEOUT_MS);
+      if (!reply.ok || !isObject(reply.data)) throw new Error("unavailable");
+      var modes = reply.data;
+      if (!["robot", "camera", "model", "scoring"].every(function (k) { return typeof modes[k] === "string"; })) throw new Error("invalid modes");
+      banner.textContent = "Robot: " + modes.robot + " | Cameras: " + modes.camera + " | Responses: " + modes.model + " | Scoring: " + modes.scoring;
+    } catch (e) {
+      banner.textContent = "Runtime mode unavailable. Check the server setup before using the arm.";
+    }
+  }
+
   function init() {
     buildCards();
     bind();
@@ -1097,6 +1110,7 @@
     startFeed("feed-wrist");
     startVideo();
     pollState();
+    loadRuntime();
     setInterval(pollState, STATE_POLL_MS);
     connectEvents();
     loadRl();

@@ -42,6 +42,7 @@
   </div>
 </header>
 
+<div id="runtime-banner" class="runtime-banner" role="status">Checking runtime mode...</div>
 <div id="stopped-banner" class="stopped-banner" hidden>STOPPED - arm frozen with torque on. Press Resume to send it home.</div>
 
 <section id="headline" class="headline">Waiting for a command.</section>
@@ -113,7 +114,7 @@
   </section>
 
   <section class="panel rl">
-    <h2>RL hand-off reach <span class="sub">four Grok-written rewards, PPO in parallel sandboxes</span></h2>
+    <h2>RL hand-off reach <span class="sub">PPO policies evaluated in simulation</span></h2>
     <div class="rl-meta">
       <span id="rl-carry" class="carry">carry: ?</span>
       <span id="rl-chosen" class="muted">chosen variant: ?</span>
