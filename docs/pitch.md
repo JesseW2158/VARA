@@ -60,11 +60,13 @@ been measured; the fake STOP button can be shown with its mode label.
 - [ ] Record the continuous local learn using [the isolated demo setup](demo.md).
 - [ ] Capture saved-skill reuse, the queued task, and the PPO simulation clip.
 - [ ] Keep fixture/simulation labels visible; add captions and check their timing.
-- [ ] Verify every quoted number against the [verification record](verification-2026-10-17.md).
+- [ ] Verify every quoted number against the [verification record](verification-2026-10-17.md) and the
+      generated table from `python scripts/story_numbers.py --markdown`, which names the file behind each number.
 - [ ] Export a playable two-minute video and inspect the complete export with sound.
 - [ ] Review [the Devpost draft](devpost-draft.md), team names, repository visibility, and media rights.
 - [ ] Add the actual repository and video links, then publish from the team's account.
-- [ ] Select sponsor categories only after checking current event requirements and the integration evidence.
+- [ ] Select the two sponsor challenges, Best Use of Daytona and Make It Legendary, only after checking the
+      current event requirements and the evidence table in [the Devpost draft](devpost-draft.md#sponsor-challenges).
 
 Do not claim measured Daytona sandbox counts, cloud training, live voice success, or Cursor use without
 supporting records. Claude Code and Codex implementation assistance is recorded in repository history;

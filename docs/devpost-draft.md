@@ -4,6 +4,24 @@
 published. The video still needs recording/export. Replace no mode labels with stronger claims unless
 a newer run supplies the evidence.
 
+## Submission fields
+
+Fill these in on the Devpost form; they are the only fields the draft below does not already cover.
+
+- **Video URL:** (pending; the storyboard is in [pitch.md](pitch.md#two-minute-video-storyboard), and the
+  local backup of the recording belongs at `runs/demo-video/backup.mp4`, as [demo.md](demo.md) says)
+- **Repository URL:** (pending; make the repository public before M7, then paste the `https://github.com/...`
+  link here and in the README)
+- **Team:** (names as they appear on Devpost, one per lane A to D)
+- **Sponsor challenges:**
+  - [ ] Best Use of Daytona
+  - [ ] Make It Legendary
+
+Both challenges are named in [sources.md](sources.md) and [kickoff.md](kickoff.md); the
+[sponsor challenges](#sponsor-challenges) section below lists the evidence each one needs and what exists.
+Every number quoted on the page comes from `python scripts/story_numbers.py --markdown`, which reads
+`runs/`, `skills/` and the RL provenance files and names the file behind each figure.
+
 **Tagline:** A robot arm that builds a personal skill library from testable requests.
 
 ## Inspiration
@@ -104,11 +122,24 @@ consider enabling the RL handoff controller on the follower.
 Python 3.12, SO-ARM101, LeRobot, MuJoCo, FastAPI, OpenCV/ArUco, NumPy, JSON Schema, Gymnasium,
 Stable-Baselines3, PyTorch, and PyAV; implemented integrations with xAI Grok and Daytona.
 
+## Sponsor challenges
+
+Select both on the form only once the "Still missing" column is empty; the M7 row of the
+[gate ledger](gates.md) records who checked it and when.
+
+| Challenge | What the judges need to see | Where it lives today | Still missing |
+| --- | --- | --- | --- |
+| Best Use of Daytona | Generated programs scored in Daytona sandboxes, the RL reward variants trained in parallel sandboxes, and the account left clean afterwards | `agents/sandbox_pool.py` (cap 7, `auto_stop_interval=0`, every sandbox deleted on shutdown), `rl/train_parallel.py` (cap 4, `--build-snapshot`) and `scripts/daytona_smoke.py`; offline evidence only so far: `tests/test_pool_fake.py` and `tests/test_rl_glue.py` run against a fake Daytona | A keyed run. No `candidate_scored` event under `runs/` so far says `runner: daytona` (on 2026-10-17: 150 `local`, 19 `none` for candidates that never reached a scorer), and `rl/runs/parallel/result.json` says `runner: local` for all four variants (`python scripts/story_numbers.py --markdown` prints the runner counts). After the first keyed run, cite its `runs/<task_id>/scores.json`, the `python -m agents.sandbox_pool --bench` output and a screenshot of the Daytona dashboard showing zero sandboxes afterwards |
+| Make It Legendary | The project built with Cursor (per [kickoff.md](kickoff.md): Claude Code in Cursor's terminal, Cursor's agent for some tasks, screenshots in the README) and the xAI Grok path: routing, success specs, program generation, reward generation and the browser voice session | `.cursor/rules/project.mdc`; `agents/llm.py`, `agents/router.py`, `agents/candidates.py`, `rl/rewards/write_rewards.py`, `web/voice.html` with `web/static/voice.js`; offline evidence only so far: fixture replies under `FAKE_LLM=1` | No Cursor screenshots exist in the repository (there is no `docs/img/` folder and no image is tracked). Capture them while working in Cursor, add them under `docs/img/` and link them from the README. Also missing: a keyed xAI run (`python -m agents.llm --ping`, then a learn whose `runs/<task_id>/llm.jsonl` came from the live model) and the voice test in the judging room (M3) |
+
 ## Before publication
 
-- [ ] Add the actual team/member names and repository URL; verify repository visibility.
-- [ ] Record/export the [two-minute storyboard](pitch.md#two-minute-video-storyboard), then add its URL.
+- [ ] Fill in the [submission fields](#submission-fields): team names and the repository URL; verify
+      repository visibility.
+- [ ] Record/export the [two-minute storyboard](pitch.md#two-minute-video-storyboard), then add its URL to
+      the submission fields.
 - [ ] Keep local fixture/simulation labels visible and confirm captions match the actual footage.
 - [ ] Update live-service and hardware statements only from newly captured acceptance evidence.
-- [ ] Review event eligibility, sponsor categories, and all externally hosted media permissions.
+- [ ] Review event eligibility, confirm both sponsor challenges above against the current requirements and
+      the evidence table, and check all externally hosted media permissions.
 - [ ] Submit and confirm the published page from the team's account.
