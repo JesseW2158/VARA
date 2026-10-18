@@ -414,6 +414,14 @@ def test_parse_bench_run(tmp_path: pathlib.Path) -> None:
     assert lg.parse_bench_run(1, head + slow, "", tmp_path)["pass"] is False
     none = "no median (0 of 5 runs reached executing; target 5 s): FAIL\n"
     assert lg.parse_bench_run(1, head + none, "", tmp_path)["median_s"] is None
+    # measured 2026-10-18: the key was refused (403) and every run fell back to the keyword router, fast
+    fallback = (
+        "WARNING agents.router: router model call failed (ModelCallFailed: PermissionDeniedError: 403); "
+        "using the keyword router\n"
+    ) * 5
+    parsed = lg.parse_bench_run(0, head + line, fallback, tmp_path)
+    assert parsed["pass"] is False and parsed["keyword_fallbacks"] == 5
+    assert "fell back to the keyword router" in lg._one_line({"step": "bench-run", "parsed": parsed})
 
 
 def test_parse_voice() -> None:

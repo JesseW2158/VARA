@@ -134,6 +134,7 @@ BENCH_TASKS = 3
 BENCH_RUN_TEXT = "hand me my pills"
 BENCH_RUN_RUNS = 5
 BENCH_RUN_TARGET_S = 5.0
+KEYWORD_FALLBACK = "using the keyword router"  # agents.router logs this when a live model call failed
 INVENTORY_WAIT_S = 60
 CANDIDATES_TEXT = "put the juice box in the tray"
 SANDBOX_CAPS = {
@@ -390,8 +391,11 @@ def parse_bench(code: int | None, out: str, err: str, out_dir: pathlib.Path) -> 
 
 
 def parse_bench_run(code: int | None, out: str, err: str, out_dir: pathlib.Path) -> dict[str, Any]:
-    """C8: exit 0, the live xAI router (`router=xAI`), all 5 runs reached `executing` and the median is
-    within 5 s (`median ... : PASS`). The per-run seconds come from the summary.json it wrote."""
+    """C8: exit 0, the live xAI router (`router=xAI`) answering every run itself, all 5 runs reached
+    `executing` and the median is within 5 s (`median ... : PASS`). A run whose model call failed falls back
+    to the keyword router (`agents.router` logs "using the keyword router"); such a run is fast but says
+    nothing about the live router, so any fallback fails the gate. The per-run seconds come from the
+    summary.json it wrote."""
     head = BENCH_RUN_HEAD_RE.search(out)
     m = BENCH_RUN_RE.search(out)
     wrote = BENCH_RUN_WROTE_RE.search(out)
@@ -401,11 +405,13 @@ def parse_bench_run(code: int | None, out: str, err: str, out_dir: pathlib.Path)
     runs = int(m["runs"]) if m else None
     executed = int(m["executed"]) if m else None
     router = head["router"] if head else None
+    fallbacks = err.count(KEYWORD_FALLBACK)
     ok = (
         code == 0
         and m is not None
         and m["verdict"] == "PASS"
         and router == "xAI"
+        and fallbacks == 0
         and runs == BENCH_RUN_RUNS
         and executed == runs
         and median is not None
@@ -414,6 +420,7 @@ def parse_bench_run(code: int | None, out: str, err: str, out_dir: pathlib.Path)
     return {
         "pass": ok,
         "router": router,
+        "keyword_fallbacks": fallbacks,
         "runs": runs,
         "executed": executed,
         "median_s": median,
@@ -848,9 +855,15 @@ def _one_line(record: Mapping[str, Any]) -> str:
         )
         return f"pool {parsed.get('pool')}; {tasks or 'no task lines'}; remaining {parsed.get('remaining')}"
     if name == "bench-run":
+        fallbacks = parsed.get("keyword_fallbacks")
         return (
             f"router {parsed.get('router')}, {parsed.get('executed')} of {parsed.get('runs')} executing, "
             f"median {parsed.get('median_s')} s"
+            + (
+                f"; {fallbacks} run(s) fell back to the keyword router (the live model failed)"
+                if fallbacks
+                else ""
+            )
         )
     if name == "voice":
         return f"HTTP {parsed.get('status')}, token length {parsed.get('token_length')}"
