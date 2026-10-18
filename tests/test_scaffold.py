@@ -1,8 +1,9 @@
 """The scaffold (S0): every module of the repo map imports under FAKE=1 with its public names, and
 `scripts/e2e_fake.py "put the juice box in the tray"` runs end to end as a subprocess (the one slow test).
 
-The end-to-end run uses copies of skills/ and an empty runs/ under tmp_path (VARA_SKILLS_DIR, VARA_RUNS_DIR),
-so the repo's own folders stay untouched; a second run with `--reset` removes the learned skill again.
+The end-to-end run uses a copy of skills/ as shipped (starters and backups, without skills learned or loaded
+on this laptop) and an empty runs/ under tmp_path (VARA_SKILLS_DIR, VARA_RUNS_DIR), so the repo's own folders
+stay untouched; a second run with `--reset` removes the learned skill again.
 """
 
 from __future__ import annotations
@@ -150,9 +151,26 @@ def stage_lines(stdout: str) -> list[str]:
     return stages
 
 
+def copy_shipped_skills(src: Path, dst: Path) -> None:
+    """Copy skills/ as shipped: `_starter`, `_backup` and the starter live files.
+
+    Skills learned or loaded from the backup on this laptop stay behind, so a demo rehearsal that left
+    one in the live folder does not change what the fake learn starts from.
+    """
+    starters = {path.name for path in (src / "_starter").glob("*.json")}
+
+    def ignore(directory: str, names: list[str]) -> set[str]:
+        skipped = {name for name in names if name.endswith(".tmp")}
+        if Path(directory) == src:
+            skipped |= {name for name in names if name.endswith(".json") and name not in starters}
+        return skipped
+
+    shutil.copytree(src, dst, ignore=ignore)
+
+
 def test_e2e_fake_learns_and_saves_the_juice_box_skill(tmp_path: Path) -> None:
     skills = tmp_path / "skills"
-    shutil.copytree(ROOT / "skills", skills, ignore=shutil.ignore_patterns("*.tmp"))
+    copy_shipped_skills(ROOT / "skills", skills)
     runs = tmp_path / "runs"
     env = e2e_env(skills, runs)
     result = run_e2e(["put the juice box in the tray"], env)

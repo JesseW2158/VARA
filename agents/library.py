@@ -29,6 +29,26 @@ and from its worker thread.
   (`trusted: true` marks the hand-written starters only, so a backup claiming it is loaded untrusted with
   a warning); an invalid file or a backup named like a trusted live skill is skipped with a warning.
   Returns the names copied.
+- `save_backup(source, *, note, name=None, keep_real=False, force=False) -> Path`: copies the skill file
+  `source` (a live, archived or rehearsal-library file; a bare skill name with no such file means the live
+  `root/<name>.json`) into `backup_dir/<name>.json` after validating it against the schema, refusing
+  `trusted: true`, a starter's name and an empty `note`. `name` renames the backup (`name` and
+  `spec.name`); `real` is reset to zero runs unless `keep_real`, because the orchestrator counts a fake
+  replay as a real run, so only a backup taken after a rehearsal with the real arm keeps its counts;
+  nothing else changes. An existing backup is refused (`FileExistsError`) unless `force`. One line goes to
+  `backup_dir/provenance.jsonl` (`PROVENANCE_NAME`): `{"t", "name", "source", "note", "git_head",
+  "keep_real", "sim", "real"}`, the operator's `note` saying where the skill came from (a physical
+  rehearsal, or a fixture/fake learn) and `git_head` from `git rev-parse HEAD` (`git_head()`, None
+  without git). The backup file is written atomically first and put back as it was when that line cannot
+  be appended, so no backup exists without its provenance line.
+- `library_from_env(root=None, *, backup_dir=None, archive_root=None, backup_fallback=True)`: the CLI's
+  library. With `root` every folder lives under it (`<root>/_starter`, `<root>/_backup`, `<root>/_archive`),
+  so a scratch library never touches the repo; without it the orchestrator's layout: `VARA_SKILLS_DIR`
+  (default `skills/`) whose `_starter` and `_backup` fall back to the repo's when missing, and the archive
+  under `VARA_RUNS_DIR/archive` (default `runs/archive`). `backup_fallback=False` drops the `_backup`
+  fallback (the backup folder is always `<skills dir>/_backup`): `--save-backup` uses it, so only reading
+  backups falls back and a library isolated by `VARA_SKILLS_DIR` never writes into the repo's
+  `skills/_backup`. `backup_dir` and `archive_root` override either.
 - `make_skill(spec, code, sim, real, trusted=False) -> dict`: a validated skill with `created` in ISO 8601
   carrying the local UTC offset; `sim` and `real` may be any mapping holding the counts (a score dict
   works), or None for zeros.
@@ -40,10 +60,14 @@ and from its worker thread.
   bad name, empty steps or a result that does not validate against `schemas/task_spec.json`. `library`
   is anything with `get(name) -> dict | None`, a `Library` or a plain dict of skills. Both helpers also
   exist on the class (`Library.make_skill(...)`, `library.routine_spec(name, steps)`).
-- `python -m agents.library --list | --reset-demo | --load-backup [--root DIR] [--archive-root DIR]`:
-  loads `.env` by convention and reads nothing from it; no network. `--list` seeds the starters first
-  when the library is empty, as the orchestrator does at startup. With `--root` the archive defaults to
-  `<root>/_archive`, so a scratch library never archives into the repo.
+- `python -m agents.library --list | --reset-demo | --load-backup | --save-backup PATH --note TEXT
+  [--name NAME] [--keep-real] [--force] [--root DIR] [--backup-dir DIR] [--archive-root DIR]`: loads
+  `.env` by convention and reads nothing from it but the folder variables above; no network. The library
+  is `library_from_env(...)`, so `--root` keeps every folder under that directory and `--backup-dir`
+  overrides the backup folder for `--save-backup` and `--load-backup`; without either, `--save-backup`
+  writes to `<VARA_SKILLS_DIR or skills/>/_backup` and never falls back to the repo's folder. `--list`
+  seeds the starters first when the library is empty, as the orchestrator does at startup. Exit 0; 1 when
+  a backup is refused; 2 on misuse (no action, `--save-backup` without `--note`).
 """
 
 from __future__ import annotations
@@ -54,6 +78,7 @@ import logging
 import os
 import re
 import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -71,6 +96,7 @@ __all__ = [
     "LibraryError",
     "MissingArgument",
     "NAME_RE",
+    "PROVENANCE_NAME",
     "ROOT",
     "ROUTINE_PREFIX",
     "SKILL_SCHEMA",
@@ -80,6 +106,8 @@ __all__ = [
     "TASK_SPEC_VALIDATOR",
     "UnknownSkill",
     "format_listing",
+    "git_head",
+    "library_from_env",
     "main",
     "make_skill",
     "routine_spec",
@@ -97,6 +125,9 @@ NAME_RE = re.compile(SKILL_SCHEMA["properties"]["name"]["pattern"])
 ROUTINE_PREFIX = "Routine: "
 STEP_JOINER = "; then "
 ARCHIVE_STAMP = "%Y%m%d-%H%M%S"
+PROVENANCE_NAME = "provenance.jsonl"  # one line per save_backup, beside the backups
+_GIT_TIMEOUT_S = 5.0
+_GIT_HEAD_RE = re.compile(r"^[0-9a-f]{7,64}$")
 _REPLACE_TRIES = 5  # replace/move retries on Windows while a reader briefly holds a file open
 _TEMP_TRIES = 8  # temp-file name attempts; bounded so a write-denied directory fails loud (_open_temp)
 _TEMP_FLAGS = (
@@ -213,9 +244,69 @@ def _open_temp(directory: Path, stem: str) -> tuple[int, Path]:
     raise FileExistsError(f"no free temp file name in {directory} after {_TEMP_TRIES} tries")
 
 
+def _write_atomic(path: Path, data: bytes) -> None:
+    """Write `data` to `path` atomically: an exclusive temp file beside it (`_open_temp`), fsync, then
+    `os.replace` (`_replace`); the temp file is removed when anything fails."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = _open_temp(path.parent, path.stem)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        _replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
 def _now_iso() -> str:
     """ISO 8601 to the second with the local UTC offset, like `2026-10-17T08:29:40-04:00`."""
     return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def git_head() -> str | None:
+    """The repo's `git rev-parse HEAD`, or None when git is missing, fails or does not answer in time."""
+    try:
+        done = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=_GIT_TIMEOUT_S,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    head = done.stdout.strip()
+    return head if done.returncode == 0 and _GIT_HEAD_RE.fullmatch(head) else None
+
+
+def _describe_path(path: Path) -> str:
+    """`path` relative to the repo (POSIX form) when inside it, else absolute: what provenance records."""
+    resolved = path.resolve()
+    try:
+        return resolved.relative_to(ROOT).as_posix()
+    except ValueError:
+        return str(resolved)
+
+
+def _append_line(path: Path, data: Mapping[str, Any]) -> None:
+    """Append one JSON line to `path` (UTF-8, LF, fsync); the file and its folder are created as needed."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8", newline="\n") as handle:
+        handle.write(json.dumps(data, ensure_ascii=False, allow_nan=False) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def _env_dir(name: str, default: Path) -> Path:
+    """The directory named by the environment variable `name`, or `default` when unset or blank."""
+    value = os.environ.get(name, "").strip()
+    return Path(value) if value else default
 
 
 def _created_key(skill: Mapping[str, Any]) -> tuple[float, str]:
@@ -475,6 +566,102 @@ class Library:
                 copied.append(skill["name"])
         return copied
 
+    def save_backup(
+        self,
+        source: str | Path,
+        *,
+        note: str,
+        name: str | None = None,
+        keep_real: bool = False,
+        force: bool = False,
+    ) -> Path:
+        """Copy the skill file `source` into `backup_dir` as `<name>.json` and record where it came from.
+
+        `source` is a skill file, or a bare skill name with no file of that name, which means the live
+        `root/<source>.json`. The file must validate against schemas/skill.json; `trusted: true` (the
+        starters' mark), a starter's name and an empty `note` are refused with `LibraryError`, so every
+        backup states whether it came from a rehearsal with the real arm or from a fixture/fake learn.
+        `name` renames the backup (`name` and `spec.name`). `real` is reset to `{"runs": 0,
+        "successes": 0}` unless `keep_real`, because the orchestrator counts a fake replay as a real run;
+        nothing else is changed. An existing backup is refused with `FileExistsError` unless `force`. One
+        JSON line is appended to `backup_dir/provenance.jsonl`: `t` (ISO 8601, local offset), `name`,
+        `source` (repo-relative when inside the repo), `note`, `git_head`, `keep_real`, and the `sim` and
+        `real` counts written. When that line cannot be appended, the backup file is put back as it was
+        (removed, or its previous bytes restored) and the error propagates. Returns the backup's path.
+        """
+        path = self._backup_source(source)
+        try:
+            skill = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError) as exc:  # JSONDecodeError and UnicodeDecodeError included
+            raise LibraryError(f"cannot read {path} as JSON: {exc}") from None
+        validate_skill(skill)
+        backup_name = _check_name(skill["name"] if name is None else name)
+        text = note.strip() if isinstance(note, str) else ""
+        if not text:
+            raise LibraryError(
+                "a backup needs a note saying where the skill came from "
+                "(a rehearsal with the real arm, or a fixture/fake learn)"
+            )
+        if skill["trusted"]:
+            raise LibraryError(
+                f"{path} is trusted: true; trusted marks the hand-written starters only, a backup never is"
+            )
+        if backup_name in self.starter_names():
+            raise LibraryError(f"{backup_name!r} is a trusted starter skill; a backup may not carry its name")
+        skill = {**skill, "name": backup_name, "spec": {**skill["spec"], "name": backup_name}}
+        if not keep_real:
+            skill["real"] = {"runs": 0, "successes": 0}
+        validate_skill(skill)
+        target = self.backup_dir / f"{backup_name}.json"
+        line = {
+            "t": _now_iso(),
+            "name": backup_name,
+            "source": _describe_path(path),
+            "note": text,
+            "git_head": git_head(),
+            "keep_real": bool(keep_real),
+            "sim": dict(skill["sim"]),
+            "real": dict(skill["real"]),
+        }
+        with self.lock:
+            if target.exists() and not force:
+                raise FileExistsError(f"{target} exists; pass force=True (--force) to replace it")
+            previous = target.read_bytes() if target.is_file() else None
+            self._write(target, skill)
+            try:
+                _append_line(self.backup_dir / PROVENANCE_NAME, line)
+            except BaseException:
+                self._undo_write(target, previous)
+                raise
+        logger.info("backed up %s from %s: %s", backup_name, line["source"], text)
+        return target
+
+    def _backup_source(self, source: str | Path) -> Path:
+        """The file `save_backup` reads: `source` itself, or the live `root/<source>.json` when `source` is
+        a bare skill name and no file of that name exists; `LibraryError` when neither is a file."""
+        path = Path(source)
+        if path.is_file():
+            return path
+        text = str(source)
+        if _valid_name(text):
+            live = self.root / f"{text}.json"
+            if live.is_file():
+                return live
+            raise LibraryError(f"no skill file at {path} and no live skill {text!r} in {self.root}")
+        raise LibraryError(f"no skill file at {path}")
+
+    def _undo_write(self, path: Path, previous: bytes | None) -> None:
+        """Put `path` back after its provenance line failed: removed, or its old bytes rewritten
+        atomically. Never raises; a failed undo is logged, and the caller re-raises the original error."""
+        try:
+            if previous is None:
+                path.unlink(missing_ok=True)
+            else:
+                _write_atomic(path, previous)
+        except OSError as exc:
+            logger.error("could not undo the backup %s after its provenance write failed: %s", path, exc)
+        self._warned.pop(path, None)
+
     # --- construction helpers, also usable as module functions ---
 
     @staticmethod
@@ -543,22 +730,8 @@ class Library:
         return names
 
     def _write(self, path: Path, data: Mapping[str, Any]) -> None:
-        """Atomic write: dump first, then an exclusive temp file beside `path`, fsync, `os.replace`."""
-        text = _dump(data)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp = _open_temp(path.parent, path.stem)
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
-                handle.write(text)
-                handle.flush()
-                os.fsync(handle.fileno())
-            _replace(tmp, path)
-        except BaseException:
-            try:
-                tmp.unlink()
-            except OSError:
-                pass
-            raise
+        """Atomic write: dump first (UTF-8, LF), then `_write_atomic`."""
+        _write_atomic(path, _dump(data).encode("utf-8"))
         self._warned.pop(path, None)
 
     def _new_archive_dir(self) -> Path:
@@ -604,14 +777,59 @@ def format_listing(skills: Sequence[Mapping[str, Any]], root: Path) -> str:
     return "\n".join(lines)
 
 
+def library_from_env(
+    root: str | Path | None = None,
+    *,
+    backup_dir: str | Path | None = None,
+    archive_root: str | Path | None = None,
+    backup_fallback: bool = True,
+) -> Library:
+    """The CLI's library (module docstring): with `root` every folder lives under it; without, the
+    orchestrator's layout from `VARA_SKILLS_DIR` and `VARA_RUNS_DIR`, the repo's `_starter` and `_backup`
+    standing in when that skills directory has none. `backup_fallback=False` (what `--save-backup` uses)
+    drops the `_backup` stand-in: the backup folder is then always `<skills dir>/_backup`, so a library
+    isolated by `VARA_SKILLS_DIR` never writes into the repo's `skills/_backup`. `backup_dir` and
+    `archive_root` override either."""
+    if root is not None:
+        base = Path(root)
+        return Library(
+            base,
+            backup_dir=base / "_backup" if backup_dir is None else backup_dir,
+            archive_root=base / "_archive" if archive_root is None else archive_root,
+        )
+    skills_dir = _env_dir("VARA_SKILLS_DIR", ROOT / "skills")
+    runs_dir = _env_dir("VARA_RUNS_DIR", ROOT / "runs")
+    starter = skills_dir / "_starter"
+    backup = skills_dir / "_backup"
+    if backup_dir is None:
+        backup_dir = backup if backup.is_dir() or not backup_fallback else ROOT / "skills" / "_backup"
+    return Library(
+        skills_dir,
+        starter_dir=starter if starter.is_dir() else ROOT / "skills" / "_starter",
+        backup_dir=backup_dir,
+        archive_root=runs_dir / "archive" if archive_root is None else archive_root,
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
-    """`python -m agents.library --list | --reset-demo | --load-backup [--root DIR] [--archive-root DIR]`."""
+    """`python -m agents.library --list | --reset-demo | --load-backup | --save-backup PATH --note TEXT ...`
+    (module docstring). Exit 0; 1 when a backup is refused; 2 on misuse."""
     parser = argparse.ArgumentParser(prog="python -m agents.library", description="the saved-skill library")
-    parser.add_argument("--root", default=None, help="skills directory (default: skills/ in the repo)")
+    parser.add_argument(
+        "--root", default=None, help="skills directory (default: VARA_SKILLS_DIR, else skills/ in the repo)"
+    )
     parser.add_argument(
         "--archive-root",
         default=None,
-        help="archive dir for --reset-demo (default: runs/archive, or <root>/_archive with --root)",
+        help="archive dir for --reset-demo (default: VARA_RUNS_DIR/archive or runs/archive; "
+        "<root>/_archive with --root)",
+    )
+    parser.add_argument(
+        "--backup-dir",
+        default=None,
+        help="backup folder for --save-backup and --load-backup (default: <VARA_SKILLS_DIR or "
+        "skills/>/_backup; --load-backup reads the repo's skills/_backup when VARA_SKILLS_DIR has none, "
+        "--save-backup never does; <root>/_backup with --root)",
     )
     parser.add_argument(
         "--list",
@@ -622,18 +840,66 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--reset-demo", action="store_true", help="archive learned skills and restore exactly the starters"
     )
     parser.add_argument(
-        "--load-backup", action="store_true", help="copy skills/_backup/*.json into the library"
+        "--load-backup",
+        action="store_true",
+        help="copy every backup skill (<backup dir>/*.json) into the library",
+    )
+    parser.add_argument(
+        "--save-backup",
+        metavar="PATH",
+        default=None,
+        help="validate this skill file (or the live skill of this name) and copy it into the backup folder "
+        "(needs --note; refuses trusted skills, starter names and an existing backup unless --force)",
+    )
+    parser.add_argument(
+        "--note",
+        default=None,
+        help="with --save-backup: where the skill came from (real rehearsal or fake learn), kept in "
+        "provenance.jsonl",
+    )
+    parser.add_argument("--name", default=None, help="with --save-backup: save the backup under this name")
+    parser.add_argument(
+        "--keep-real",
+        action="store_true",
+        help="with --save-backup: keep the real run counts (only for a skill learned with --real on the "
+        "physical arm; otherwise they are reset to 0)",
+    )
+    parser.add_argument(
+        "--force", action="store_true", help="with --save-backup: replace an existing backup of that name"
     )
     args = parser.parse_args(argv)
-    if not (args.list or args.reset_demo or args.load_backup):
+    if not (args.list or args.reset_demo or args.load_backup or args.save_backup is not None):
         parser.print_help()
         return 2
+    if args.save_backup is None:
+        for flag, value in (
+            ("--note", args.note),
+            ("--name", args.name),
+            ("--keep-real", args.keep_real),
+            ("--force", args.force),
+        ):
+            if value:
+                parser.error(f"{flag} only applies with --save-backup")
+    elif not (args.note or "").strip():
+        parser.error("--save-backup needs --note TEXT saying where the skill came from")
     load_dotenv()  # the convention for CLIs; nothing here reads a key
     logging.basicConfig(level=logging.INFO, stream=sys.stderr, format="%(levelname)s %(name)s: %(message)s")
-    archive_root = args.archive_root
-    if archive_root is None and args.root is not None:
-        archive_root = Path(args.root) / "_archive"  # a scratch library never archives into the repo
-    library = Library(args.root, archive_root=archive_root)
+    library = library_from_env(
+        args.root,
+        backup_dir=args.backup_dir,
+        archive_root=args.archive_root,
+        backup_fallback=args.save_backup is None,  # writes stay under VARA_SKILLS_DIR (library_from_env)
+    )
+    if args.save_backup is not None:
+        try:
+            path = library.save_backup(
+                args.save_backup, note=args.note, name=args.name, keep_real=args.keep_real, force=args.force
+            )
+        except (LibraryError, OSError) as exc:  # FileExistsError included
+            print(f"backup refused: {exc}", file=sys.stderr)
+            return 1
+        print(f"backed up: {path.stem} -> {path}")
+        print(f"provenance: {path.parent / PROVENANCE_NAME}")
     if args.reset_demo:
         names = library.reset_demo()
         print("reset demo, live skills: " + (", ".join(names) or "(none)"))

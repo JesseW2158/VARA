@@ -898,3 +898,359 @@ def test_format_listing_without_skills(tmp_path: Path):
         "created",
     ]
     assert text.splitlines()[-1] == f"0 skill(s) in {tmp_path}"
+
+
+# --- save_backup and provenance ---------------------------------------------------------------------------
+
+
+def provenance(root: Path) -> list[dict[str, Any]]:
+    path = root / "_backup" / lib.PROVENANCE_NAME
+    if not path.is_file():
+        return []
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def test_save_backup_copies_resets_real_counts_and_records_provenance(seeded: Library, root: Path, tmp_path):
+    source = tmp_path / "archive" / "20261017-194857" / "clear_table.json"
+    write_json(source, learned("clear_table"))  # real 1/1: what the orchestrator writes after a fake replay
+    path = seeded.save_backup(source, note="fake learn, fixture replies, sim 5/5, not a rehearsal")
+    assert path == root / "_backup" / "clear_table.json"
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    SKILL_VALIDATOR.validate(saved)
+    expected = learned("clear_table")
+    expected["real"] = {"runs": 0, "successes": 0}
+    assert saved == expected  # trusted false and sim 5/5 kept, spec and code untouched, real reset
+    assert list(saved) == ["name", "trusted", "spec", "code", "sim", "real", "created"]
+    raw = path.read_bytes()
+    assert b"\r" not in raw and raw.endswith(b"}\n")
+    assert not list((root / "_backup").glob("*.tmp"))
+
+    lines = provenance(root)
+    assert len(lines) == 1
+    line = lines[0]
+    assert list(line) == ["t", "name", "source", "note", "git_head", "keep_real", "sim", "real"]
+    assert ISO_WITH_OFFSET.match(line["t"])
+    assert line["name"] == "clear_table"
+    assert line["note"] == "fake learn, fixture replies, sim 5/5, not a rehearsal"
+    assert line["source"] == str(source.resolve())  # outside the repo: absolute
+    assert line["keep_real"] is False
+    assert line["sim"] == {"successes": 5, "trials": 5} and line["real"] == {"runs": 0, "successes": 0}
+    assert line["git_head"] is None or re.fullmatch(r"[0-9a-f]{7,64}", line["git_head"])
+    assert b"\r" not in (root / "_backup" / lib.PROVENANCE_NAME).read_bytes()
+
+    # the backup is what Load backup restores after a reset: untrusted, zero real runs
+    seeded.save(learned("clear_table"))
+    assert seeded.reset_demo() == STARTERS
+    assert seeded.load_backup() == ["clear_table"]
+    restored = seeded.get("clear_table")
+    assert restored["trusted"] is False and restored["real"] == {"runs": 0, "successes": 0}
+    assert restored["sim"] == {"successes": 5, "trials": 5}
+
+
+def test_save_backup_force_keep_real_name_and_repo_relative_source(seeded: Library, root: Path, tmp_path):
+    source = tmp_path / "clear_table.json"
+    write_json(source, learned("clear_table"))
+    first = seeded.save_backup(source, note="first")
+    before = first.read_bytes()
+    with pytest.raises(FileExistsError, match="force"):
+        seeded.save_backup(source, note="second")
+    assert first.read_bytes() == before and len(provenance(root)) == 1
+
+    # force replaces it, keep_real keeps the counts of a real rehearsal, and a second line is appended
+    path = seeded.save_backup(source, note="real rehearsal, real 1/1", keep_real=True, force=True)
+    assert path == first
+    assert json.loads(path.read_text(encoding="utf-8"))["real"] == {"runs": 1, "successes": 1}
+    lines = provenance(root)
+    assert len(lines) == 2
+    assert lines[1]["keep_real"] is True and lines[1]["real"] == {"runs": 1, "successes": 1}
+    assert lines[1]["note"] == "real rehearsal, real 1/1"
+
+    # name renames the file, the skill and its spec; a source inside the repo is recorded repo-relative
+    renamed = seeded.save_backup(FIXTURES / "skill_clear_table.json", note="fixture", name="clear_table_two")
+    assert renamed == root / "_backup" / "clear_table_two.json"
+    skill = json.loads(renamed.read_text(encoding="utf-8"))
+    SKILL_VALIDATOR.validate(skill)
+    assert skill["name"] == "clear_table_two" == skill["spec"]["name"]
+    assert skill["code"] == CLEAR_TABLE["code"]
+    assert provenance(root)[2]["source"] == "tests/fixtures/skill_clear_table.json"
+    assert provenance(root)[2]["name"] == "clear_table_two"
+    assert seeded.load_backup() == ["clear_table", "clear_table_two"]
+    assert seeded.get("clear_table_two")["spec"]["name"] == "clear_table_two"
+
+
+def test_save_backup_refusals_leave_nothing_behind(seeded: Library, root: Path, tmp_path: Path):
+    counter = iter(range(1, 100))
+
+    def file_with(data: Any) -> Path:
+        path = tmp_path / "src" / f"case_{next(counter)}.json"  # one file per case
+        if isinstance(data, str):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(data, encoding="utf-8")
+        else:
+            write_json(path, data)
+        return path
+
+    no_code = learned("no_code")
+    del no_code["code"]
+    cases: list[tuple[Path, dict[str, Any], str]] = [
+        (file_with(learned("rehearsal", trusted=True)), {}, "trusted"),
+        (file_with(learned("rehearsal", trusted=True)), {"keep_real": True}, "trusted"),
+        (file_with(learned("hand_over")), {}, "starter"),
+        (file_with(learned("clear_table")), {"name": "place_in_tray"}, "starter"),
+        (file_with(learned("clear_table")), {"name": "Bad Name"}, "invalid skill name"),
+        (file_with(learned("clear_table")), {"name": "_hidden"}, "invalid skill name"),
+        (file_with(learned("clear_table\n")), {}, "invalid skill name"),
+        (file_with(no_code), {}, "skill invalid"),
+        (file_with("{broken"), {}, "cannot read"),
+        (tmp_path / "src" / "missing.json", {}, "no skill file"),
+        (file_with(learned("clear_table")), {"note": ""}, "note"),
+        (file_with(learned("clear_table")), {"note": "   "}, "note"),
+    ]
+    for source, kwargs, message in cases:
+        with pytest.raises(LibraryError, match=message):
+            seeded.save_backup(source, **{"note": "x", **kwargs})
+    assert list((root / "_backup").iterdir()) == []
+    assert provenance(root) == []
+
+
+def test_git_head_is_a_hash_or_none(monkeypatch):
+    head = lib.git_head()
+    assert head is None or re.fullmatch(r"[0-9a-f]{7,64}", head)
+
+    def missing(*args, **kwargs):
+        raise OSError("git is not installed")
+
+    monkeypatch.setattr(lib.subprocess, "run", missing)
+    assert lib.git_head() is None
+
+    class NotARepo:
+        returncode = 128
+        stdout = "fatal: not a git repository\n"
+
+    monkeypatch.setattr(lib.subprocess, "run", lambda *args, **kwargs: NotARepo())
+    assert lib.git_head() is None
+
+
+def test_library_from_env_layouts(tmp_path: Path, monkeypatch):
+    monkeypatch.delenv("VARA_SKILLS_DIR", raising=False)
+    monkeypatch.delenv("VARA_RUNS_DIR", raising=False)
+    default = lib.library_from_env()
+    assert (default.root, default.starter_dir, default.backup_dir, default.archive_root) == (
+        ROOT / "skills",
+        ROOT / "skills" / "_starter",
+        ROOT / "skills" / "_backup",
+        ROOT / "runs" / "archive",
+    )
+    # --root: every folder under it, so a scratch library never touches the repo
+    scratch = lib.library_from_env(tmp_path / "lib")
+    assert (scratch.root, scratch.starter_dir, scratch.backup_dir, scratch.archive_root) == (
+        tmp_path / "lib",
+        tmp_path / "lib" / "_starter",
+        tmp_path / "lib" / "_backup",
+        tmp_path / "lib" / "_archive",
+    )
+    custom = lib.library_from_env(tmp_path / "lib", backup_dir=tmp_path / "b", archive_root=tmp_path / "a")
+    assert (custom.backup_dir, custom.archive_root) == (tmp_path / "b", tmp_path / "a")
+
+    # the orchestrator's layout: an isolated VARA_SKILLS_DIR without _backup/_starter uses the repo's
+    isolated = tmp_path / "demo" / "skills"
+    isolated.mkdir(parents=True)
+    monkeypatch.setenv("VARA_SKILLS_DIR", str(isolated))
+    monkeypatch.setenv("VARA_RUNS_DIR", str(tmp_path / "demo" / "runs"))
+    env_library = lib.library_from_env()
+    assert env_library.root == isolated
+    assert env_library.starter_dir == ROOT / "skills" / "_starter"
+    assert env_library.backup_dir == ROOT / "skills" / "_backup"
+    assert env_library.archive_root == tmp_path / "demo" / "runs" / "archive"
+    # what --save-backup uses: no fallback, so an isolated library never writes into the repo's backups
+    writer = lib.library_from_env(backup_fallback=False)
+    assert writer.backup_dir == isolated / "_backup" and writer.starter_dir == ROOT / "skills" / "_starter"
+    (isolated / "_backup").mkdir()
+    (isolated / "_starter").mkdir()
+    own = lib.library_from_env()
+    assert own.backup_dir == isolated / "_backup" and own.starter_dir == isolated / "_starter"
+    assert lib.library_from_env(backup_dir=tmp_path / "elsewhere").backup_dir == tmp_path / "elsewhere"
+    assert lib.library_from_env(archive_root=tmp_path / "arch").archive_root == tmp_path / "arch"
+
+
+def test_cli_save_backup(root: Path, tmp_path: Path, capsys, monkeypatch):
+    monkeypatch.setattr(lib, "load_dotenv", lambda *args, **kwargs: None)
+    source = tmp_path / "learned" / "clear_table.json"
+    write_json(source, learned("clear_table"))
+    assert lib.main(["--root", str(root), "--save-backup", str(source), "--note", "fake learn"]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0] == f"backed up: clear_table -> {root / '_backup' / 'clear_table.json'}"
+    assert lines[1] == f"provenance: {root / '_backup' / lib.PROVENANCE_NAME}"
+    saved = json.loads((root / "_backup" / "clear_table.json").read_text(encoding="utf-8"))
+    assert saved["trusted"] is False and saved["real"] == {"runs": 0, "successes": 0}
+    assert provenance(root)[0]["note"] == "fake learn"
+
+    # a refusal exits 1 with the reason on stderr
+    assert lib.main(["--root", str(root), "--save-backup", str(source), "--note", "again"]) == 1
+    assert "exists" in capsys.readouterr().err
+    starter = STARTER_DIR / "hand_over.json"
+    assert lib.main(["--root", str(root), "--save-backup", str(starter), "--note", "x"]) == 1
+    assert "trusted" in capsys.readouterr().err
+    assert lib.main(["--root", str(root), "--save-backup", str(tmp_path / "nope.json"), "--note", "x"]) == 1
+    assert "no skill file" in capsys.readouterr().err
+    assert len(provenance(root)) == 1
+
+    # misuse exits 2: no note, a blank note, backup flags without --save-backup
+    for argv in (
+        ["--root", str(root), "--save-backup", str(source)],
+        ["--root", str(root), "--save-backup", str(source), "--note", " "],
+        ["--root", str(root), "--list", "--note", "x"],
+        ["--root", str(root), "--list", "--force"],
+        ["--root", str(root), "--list", "--keep-real"],
+        ["--root", str(root), "--list", "--name", "x"],
+    ):
+        with pytest.raises(SystemExit) as info:
+            lib.main(argv)
+        assert info.value.code == 2, argv
+        capsys.readouterr()
+
+    # --force, --keep-real, --name and --backup-dir; --load-backup honours --backup-dir too
+    elsewhere = tmp_path / "elsewhere"
+    argv = ["--root", str(root), "--backup-dir", str(elsewhere), "--save-backup", str(source)]
+    argv += ["--note", "real rehearsal", "--keep-real", "--name", "clear_table_real"]
+    assert lib.main(argv) == 0
+    capsys.readouterr()
+    saved = json.loads((elsewhere / "clear_table_real.json").read_text(encoding="utf-8"))
+    assert saved["name"] == "clear_table_real" and saved["real"] == {"runs": 1, "successes": 1}
+    assert (elsewhere / lib.PROVENANCE_NAME).is_file()
+    assert lib.main(["--root", str(root), "--save-backup", str(source), "--note", "replaced", "--force"]) == 0
+    capsys.readouterr()
+    assert [line["note"] for line in provenance(root)] == ["fake learn", "replaced"]
+    assert lib.main(["--root", str(root), "--backup-dir", str(elsewhere), "--load-backup", "--list"]) == 0
+    out = capsys.readouterr().out
+    assert out.startswith("loaded from backup: clear_table_real\n")
+    assert live_files(root) == ["clear_table_real.json"]
+    assert out.strip().splitlines()[2].split()[:4] == ["clear_table_real", "no", "1/1", "5/5"]
+
+
+def test_save_backup_by_live_skill_name(seeded: Library, root: Path, tmp_path: Path, monkeypatch):
+    monkeypatch.chdir(tmp_path)  # a bare name resolves against the library, not the working directory
+    seeded.save(learned("clear_table"))
+    path = seeded.save_backup("clear_table", note="fake learn")
+    assert path == root / "_backup" / "clear_table.json"
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["real"] == {"runs": 0, "successes": 0} and saved["code"] == CLEAR_TABLE["code"]
+    assert provenance(root)[0]["source"] == str((root / "clear_table.json").resolve())
+
+    # an existing file of that name wins over the live skill
+    write_json(tmp_path / "juice_box_to_tray", learned("juice_box_to_tray"))
+    seeded.save(learned("juice_box_to_tray", sim={"successes": 4, "trials": 5}))
+    seeded.save_backup("juice_box_to_tray", note="from the working directory")
+    assert provenance(root)[1]["source"] == str((tmp_path / "juice_box_to_tray").resolve())
+    assert provenance(root)[1]["sim"] == {"successes": 5, "trials": 5}
+
+    # the live starter is trusted; a name with no live skill and a non-name say what is missing
+    with pytest.raises(LibraryError, match="trusted"):
+        seeded.save_backup("hand_over", note="x")
+    with pytest.raises(LibraryError, match="no live skill 'tea_tin_to_tray' in"):
+        seeded.save_backup("tea_tin_to_tray", note="x")
+    with pytest.raises(LibraryError, match="^no skill file at Not A Name$"):
+        seeded.save_backup("Not A Name", note="x")
+    assert len(provenance(root)) == 2
+
+
+def test_save_backup_rolls_back_when_the_provenance_line_fails(
+    seeded: Library, root: Path, tmp_path: Path, monkeypatch
+):
+    source = tmp_path / "clear_table.json"
+    write_json(source, learned("clear_table"))
+    real_append = lib._append_line
+
+    def full_disk(path: Path, data: Any) -> None:
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(lib, "_append_line", full_disk)
+    with pytest.raises(OSError, match="No space"):
+        seeded.save_backup(source, note="first")
+    assert list((root / "_backup").iterdir()) == []  # no backup without its provenance line
+
+    monkeypatch.setattr(lib, "_append_line", real_append)
+    first = seeded.save_backup(source, note="first")
+    before = first.read_bytes()
+    monkeypatch.setattr(lib, "_append_line", full_disk)
+    with pytest.raises(OSError, match="No space"):
+        seeded.save_backup(source, note="second", keep_real=True, force=True)
+    assert first.read_bytes() == before  # the replaced backup is restored byte for byte
+    assert sorted(p.name for p in (root / "_backup").iterdir()) == ["clear_table.json", lib.PROVENANCE_NAME]
+    assert [line["note"] for line in provenance(root)] == ["first"]
+
+
+def test_cli_save_backup_by_name(root: Path, tmp_path: Path, capsys, monkeypatch):
+    monkeypatch.setattr(lib, "load_dotenv", lambda *args, **kwargs: None)
+    monkeypatch.chdir(tmp_path)
+    shutil.copy(STARTER_DIR / "hand_over.json", root / "hand_over.json")
+    write_json(root / "clear_table.json", learned("clear_table"))
+    assert lib.main(["--root", str(root), "--save-backup", "clear_table", "--note", "fake learn"]) == 0
+    assert capsys.readouterr().out.startswith(f"backed up: clear_table -> {root / '_backup'}")
+    assert lib.main(["--root", str(root), "--save-backup", "hand_over", "--note", "x"]) == 1
+    assert "trusted" in capsys.readouterr().err
+    assert lib.main(["--root", str(root), "--save-backup", "juice_box_to_tray", "--note", "x"]) == 1
+    assert "no live skill 'juice_box_to_tray'" in capsys.readouterr().err
+    assert [line["name"] for line in provenance(root)] == ["clear_table"]
+
+
+def test_cli_save_backup_stays_under_vara_skills_dir(tmp_path: Path, capsys, monkeypatch):
+    """With VARA_SKILLS_DIR isolating the library and no --root, --load-backup still reads the repo's
+    skills/_backup while the isolated folder has none, but --save-backup writes only to
+    <VARA_SKILLS_DIR>/_backup; --backup-dir is the explicit way to write anywhere else."""
+    monkeypatch.setattr(lib, "load_dotenv", lambda *args, **kwargs: None)
+    monkeypatch.setattr(lib, "git_head", lambda: None)
+    repo = tmp_path / "repo"  # stands in for the repo, so even a regression cannot write into the real one
+    monkeypatch.setattr(lib, "ROOT", repo)
+    shutil.copytree(STARTER_DIR, repo / "skills" / "_starter")
+    write_json(repo / "skills" / "_backup" / "repo_backup.json", learned("repo_backup"))
+    isolated = tmp_path / "demo" / "skills"
+    isolated.mkdir(parents=True)
+    monkeypatch.setenv("VARA_SKILLS_DIR", str(isolated))
+    monkeypatch.setenv("VARA_RUNS_DIR", str(tmp_path / "demo" / "runs"))
+    source = tmp_path / "learned" / "clear_table.json"
+    write_json(source, learned("clear_table"))
+
+    assert lib.main(["--load-backup"]) == 0  # reading falls back to the repo's backups
+    assert capsys.readouterr().out.startswith("loaded from backup: repo_backup")
+    assert live_files(isolated) == ["repo_backup.json"]
+
+    assert lib.main(["--save-backup", str(source), "--note", "fake learn"]) == 0
+    target = isolated / "_backup" / "clear_table.json"
+    assert capsys.readouterr().out.startswith(f"backed up: clear_table -> {target}")
+    written = sorted(p.name for p in (isolated / "_backup").iterdir())
+    assert written == ["clear_table.json", lib.PROVENANCE_NAME]
+    assert sorted(p.name for p in (repo / "skills" / "_backup").iterdir()) == ["repo_backup.json"]
+    assert lib.main(["--load-backup"]) == 0  # the isolated folder now exists, so it is the one read
+    assert capsys.readouterr().out.startswith("loaded from backup: clear_table\n")
+
+    explicit = ["--backup-dir", str(repo / "skills" / "_backup"), "--save-backup", str(source)]
+    assert lib.main([*explicit, "--note", "into the repo on purpose"]) == 0
+    capsys.readouterr()
+    assert (repo / "skills" / "_backup" / "clear_table.json").is_file()
+    assert (repo / "skills" / "_backup" / lib.PROVENANCE_NAME).is_file()
+
+
+def test_repo_backup_folder_is_declared():
+    """The checked-in skills/_backup: untrusted, valid skills, each with a provenance line saying what it
+    is; a backup that did not keep its real counts shows zero real runs."""
+    folder = ROOT / "skills" / "_backup"
+    assert (folder / ".gitkeep").is_file()  # the folder exists in every clone
+    record = folder / lib.PROVENANCE_NAME
+    lines = (
+        [json.loads(line) for line in record.read_text(encoding="utf-8").splitlines() if line.strip()]
+        if record.is_file()
+        else []
+    )
+    for path in sorted(folder.glob("*.json")):
+        skill = json.loads(path.read_text(encoding="utf-8"))
+        SKILL_VALIDATOR.validate(skill)
+        assert skill["name"] == path.stem and skill["trusted"] is False
+        assert path.stem not in STARTERS
+        mine = [line for line in lines if line["name"] == path.stem]
+        assert mine, f"{path.name} has no line in {record.name}"
+        last = mine[-1]
+        assert last["note"].strip() and ISO_WITH_OFFSET.match(last["t"])
+        assert last["sim"] == skill["sim"] and last["real"] == skill["real"]
+        if not last["keep_real"]:
+            assert skill["real"] == {"runs": 0, "successes": 0}

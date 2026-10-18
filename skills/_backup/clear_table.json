@@ -1,0 +1,30 @@
+{
+  "name": "clear_table",
+  "trusted": false,
+  "spec": {
+    "name": "clear_table",
+    "description": "Put every object on the table into the tray.",
+    "params": {},
+    "success": {
+      "all": [
+        {
+          "in_zone": {
+            "object": "*",
+            "zone": "tray"
+          }
+        }
+      ]
+    },
+    "english": "Every object ends inside the tray."
+  },
+  "code": "\"\"\"Clear the table: shortest first, with clearance above objects already in the tray.\"\"\"\n\n\ndef run(robot, args):\n    scene = robot.scene()\n    objs = scene[\"objects\"]\n    tray = scene[\"zones\"][\"tray\"]\n    tallest = max([o[\"h\"] for o in scene[\"obstacles\"].values()] + [0.0])\n    transit = tallest + 0.08\n    todo = [name for name in objs if objs[name][\"seen\"]]\n    # The far tray slots require the forearm to cross the cereal box. Use the near-center\n    # region and release above the accumulated contents, instead of reaching into a full slot.\n    release = tray[\"wall\"] + max([objs[name][\"h\"] for name in todo] + [0.0]) + 0.01\n    for name in sorted(todo, key=lambda n: objs[n][\"h\"]):\n        if not robot.pick(name, transit_z=transit):\n            return False\n        if not robot.place(tray[\"x\"] - 0.02, tray[\"y\"], release_z=release, approach=0.05, transit_z=transit):\n            return False\n    robot.home()\n    return True\n",
+  "sim": {
+    "successes": 5,
+    "trials": 5
+  },
+  "real": {
+    "runs": 0,
+    "successes": 0
+  },
+  "created": "2026-10-17T17:50:54-04:00"
+}
