@@ -37,11 +37,28 @@ the overhead camera and saves only after mean error <= 1 cm and maximum error <=
 checks the saved matrix without writing it. Fit-marker residuals do not establish independent accuracy:
 `--check-points checks.json` supplies at least five separate measured pixel/table pairs. With --live it
 also gates the save; with --check it checks those recorded pairs offline without opening a camera.
+
+Lens undistortion (B5's fallback, vision/lens.py)
+-------------------------------------------------
+When config/lens.npz exists, every physical marker detection happens on undistorted frames:
+`load_active_lens()` loads it once per process or tool run (`vision.lens.load_lens` plus `sha256`, the hex
+digest of the file's bytes, and the `cv2.remap` tables `maps` built once) and `undistort_frame(frame,
+lens)` remaps each frame right after it is read and before `detect` (a None lens returns the frame
+untouched). A missing file means raw frames; a corrupt or incomplete one raises ValueError, so the tool
+fails at startup instead of silently detecting on raw frames; a frame whose size differs from the lens's
+image size raises ValueError (the lens was calibrated in another camera mode). `lens_hash(lens)` is the
+evidence value: the file's sha256, or None when frames are raw. `--live` and `--check` load the lens
+before opening the camera and print `lens: <sha256>` or `lens: null`; the offline `--check
+--check-points` prints the same line about the lens the tracker would use, since the recorded pixels must
+come from frames with the same undistortion as the homography's fit. Creating or replacing the lens file
+changes every pixel, so refit `--live` and re-capture the check points afterwards. `--fake` and the
+FakeCamera (an ideal pinhole, `project`) are never undistorted.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -67,6 +84,8 @@ __all__ = [
     "check_points_metrics",
     "fit_homography",
     "height_correct",
+    "lens_hash",
+    "load_active_lens",
     "load_homography",
     "load_check_points",
     "load_scene_cfg",
@@ -75,6 +94,7 @@ __all__ = [
     "project",
     "save_homography",
     "synthetic_homography",
+    "undistort_frame",
 ]
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -387,8 +407,65 @@ def load_homography(path: pathlib.Path | str | None = None) -> np.ndarray:
     return _checked_homography(np.load(file, allow_pickle=False))
 
 
-def _collect_live(camera: Any, frames: int) -> list[tuple[int, np.ndarray]]:
-    """Median corners per calibration id over `frames` frames from a camera with `read()`."""
+def load_active_lens(path: pathlib.Path | str | None = None) -> dict[str, Any] | None:
+    """The lens every physical detection undistorts with: `vision.lens.load_lens(path)` (default
+    config/lens.npz, `vision.lens.LENS_PATH`) plus `sha256` (hex digest of the file's bytes) and `maps`
+    (the `cv2.remap` tables, built once). None when the file does not exist (frames stay raw). A corrupt or
+    incomplete file raises ValueError: fail at startup, never silently fall back to raw frames. Load it
+    once per process or tool run, never per frame."""
+    from vision.lens import load_lens, undistort_maps  # lazy: vision.lens imports this module
+
+    lens = load_lens(path)
+    if lens is None:
+        return None
+    lens["sha256"] = hashlib.sha256(pathlib.Path(lens["path"]).read_bytes()).hexdigest()
+    lens["maps"] = undistort_maps(lens)
+    return lens
+
+
+def lens_hash(lens: Mapping[str, Any] | None) -> str | None:
+    """The evidence value "lens": the lens file's sha256 (from `load_active_lens`), None for raw frames."""
+    return None if lens is None else str(lens["sha256"])
+
+
+def undistort_frame(frame: np.ndarray, lens: Mapping[str, Any] | None) -> np.ndarray:
+    """`frame` untouched when `lens` is None, else remapped through the lens (a `load_active_lens` result;
+    a plain `vision.lens.load_lens` dict has its maps built on this call). ValueError when the frame is not
+    a 2-D gray or 3-channel image of the lens's image size (the lens was calibrated in another mode)."""
+    if lens is None:
+        return frame
+    width, height = (int(v) for v in lens["image_size"])
+    if not isinstance(frame, np.ndarray) or frame.ndim not in (2, 3) or frame.size == 0:
+        raise ValueError("undistort_frame needs a 2-D gray or 3-channel BGR frame")
+    if frame.shape[1] != width or frame.shape[0] != height:
+        raise ValueError(
+            f"frame is {frame.shape[1]}x{frame.shape[0]} but the lens was calibrated at {width}x{height}: "
+            "recalibrate the lens (python -m vision.lens) in the camera mode the tools use"
+        )
+    maps = lens.get("maps")
+    if maps is None:
+        from vision.lens import undistort_maps  # lazy: vision.lens imports this module
+
+        maps = undistort_maps(lens)
+    return cv2.remap(frame, maps[0], maps[1], cv2.INTER_LINEAR)
+
+
+def _lens_line(lens: Mapping[str, Any] | None) -> str:
+    """The `lens:` line of a calibration report."""
+    if lens is None:
+        return "lens: null (no config/lens.npz: markers detected on raw frames)"
+    width, height = (int(v) for v in lens["image_size"])
+    return (
+        f"lens: {lens['sha256']} ({lens['path']}, fit RMS {float(lens['rms']):.3f} px, {width}x{height}): "
+        "every frame undistorted before detection"
+    )
+
+
+def _collect_live(
+    camera: Any, frames: int, lens: Mapping[str, Any] | None = None
+) -> list[tuple[int, np.ndarray]]:
+    """Median corners per calibration id over `frames` frames from a camera with `read()`, each frame
+    undistorted through `lens` (None: raw) before detection."""
     from vision.markers import CALIB_IDS, detect
 
     seen: dict[int, list[np.ndarray]] = {}
@@ -396,6 +473,7 @@ def _collect_live(camera: Any, frames: int) -> list[tuple[int, np.ndarray]]:
         frame = camera.read()
         if frame is None:
             continue
+        frame = undistort_frame(frame, lens)
         for marker_id, corners in detect(frame):
             if marker_id in CALIB_IDS:
                 seen.setdefault(marker_id, []).append(corners)
@@ -460,7 +538,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 def _run(args: argparse.Namespace) -> int:
     check_points = load_check_points(args.check_points) if args.check_points else None
     if args.check and check_points is not None:
-        metrics = check_points_metrics(load_homography(args.out), check_points)
+        h = load_homography(args.out)
+        lens = load_active_lens()  # loaded only to report it (no frame is read); a corrupt file fails here
+        print(f"{_lens_line(lens)}; the recorded pixels must come from frames with this same undistortion")
+        metrics = check_points_metrics(h, check_points)
         _report_metrics("independent measured check points (recorded pixels; no camera opened)", metrics)
         return 0 if metrics["accepted"] else 1
     cfg = load_scene_cfg()
@@ -473,6 +554,7 @@ def _run(args: argparse.Namespace) -> int:
         out = save_homography(h, args.out)
         c, hc = camera_pose(cfg)
         print(f"wrote {out}: synthetic camera at ({c[0]}, {c[1]}, {hc}) m, f={FOCAL_PX:.0f} px, {IMAGE_SIZE}")
+        print("lens: null (synthetic pinhole camera: config/lens.npz is never used)")
         print("Synthetic calibration only; physical table accuracy remains unverified.")
         return 0
 
@@ -481,13 +563,17 @@ def _run(args: argparse.Namespace) -> int:
     load_dotenv()
     from vision.cameras import get_camera
 
+    lens = load_active_lens()  # once, before the camera opens: a corrupt lens file fails here
     camera = get_camera("overhead")
     try:
         if getattr(camera, "is_fake", False):
             raise ValueError("live calibration requires a real camera; use --fake for synthetic calibration")
-        dets = _collect_live(camera, args.frames)
+        dets = _collect_live(camera, args.frames, lens)
     finally:
         camera.release()
+    print(_lens_line(lens))
+    if lens is not None and check_points is not None:
+        print("the check points' pixels must come from undistorted frames (re-capture them after a new lens)")
     ids, pixels, table = _calibration_pairs(dets, markers)
     if len(ids) < 4:
         raise ValueError(f"only {len(ids)} calibration markers detected; need 4 or more")
