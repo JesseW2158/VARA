@@ -689,3 +689,89 @@ def test_elapsed_rounded_to_the_millisecond_is_not_a_short_run():
     assert cameras.apply_criterion(saved, "strict")["passed"] is True
     short = cameras.apply_criterion({**saved, "elapsed_s": 1799.99}, "strict")
     assert short["passed"] is False and "shorter than requested" in short["problems"][0]
+
+
+# -- per-camera image settings (the wrist camera opened dark with auto exposure off, 2026-10-17) -------------
+
+
+class _RecordingCapture:
+    """A VideoCapture stand-in that accepts every setting and records the calls."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[int, float]] = []
+        self.settings: dict[int, float] = {}
+
+    def isOpened(self) -> bool:
+        return True
+
+    def set(self, prop, value) -> bool:
+        self.calls.append((prop, value))
+        self.settings[prop] = value
+        return True
+
+    def get(self, prop):
+        return self.settings.get(prop, 0.0)
+
+    def release(self) -> None:
+        pass
+
+
+@pytest.mark.parametrize(("platform", "auto"), [("nt", 1), ("posix", 3)])
+def test_auto_exposure_and_image_settings_reach_the_driver(monkeypatch, platform, auto):
+    from types import SimpleNamespace
+
+    capture = _RecordingCapture()
+    monkeypatch.setattr(cameras, "os", SimpleNamespace(name=platform))
+    monkeypatch.setattr(cameras.cv2, "VideoCapture", lambda *args: capture)
+    cameras.open_camera(1, auto_exposure=True, exposure=-5, gain=10, brightness=20)
+    cv2 = cameras.cv2
+    assert (cv2.CAP_PROP_AUTO_EXPOSURE, auto) in capture.calls
+    for prop, value in (
+        (cv2.CAP_PROP_EXPOSURE, -5.0),
+        (cv2.CAP_PROP_GAIN, 10.0),
+        (cv2.CAP_PROP_BRIGHTNESS, 20.0),
+    ):
+        assert (prop, value) in capture.calls
+
+
+def test_the_default_keeps_auto_exposure_off_and_writes_no_image_settings(monkeypatch):
+    capture = _RecordingCapture()
+    monkeypatch.setattr(cameras.cv2, "VideoCapture", lambda *args: capture)
+    cameras.open_camera(2)
+    cv2 = cameras.cv2
+    written = {prop for prop, _ in capture.calls}
+    assert not written & {cv2.CAP_PROP_EXPOSURE, cv2.CAP_PROP_GAIN, cv2.CAP_PROP_BRIGHTNESS}
+
+
+def test_config_image_settings_are_validated_and_reach_get_camera(monkeypatch, tmp_path):
+    good = tmp_path / "cameras.yaml"
+    good.write_text(
+        "wrist: {index: 1, auto_exposure: true, gain: 12}\noverhead: {index: 2}\n", encoding="utf-8"
+    )
+    cfg = cameras.load_config(good)
+    assert cfg["wrist"]["auto_exposure"] is True and cfg["wrist"]["gain"] == 12
+    opened: list[dict] = []
+
+    def fake_open(index, **kwargs):
+        opened.append({"index": index, **kwargs})
+        return _RecordingCapture()
+
+    for name in ("FAKE", "FAKE_CAMERA", "WRIST_CAM", "OVERHEAD_CAM"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(cameras, "CONFIG_PATH", good)
+    monkeypatch.setattr(cameras, "open_camera", fake_open)
+    cameras.get_camera("wrist")
+    cameras.get_camera("overhead")
+    assert opened[0]["auto_exposure"] is True and opened[0]["gain"] == 12
+    assert opened[1]["auto_exposure"] is False and opened[1]["exposure"] is None
+    for bad in ("wrist: {index: 1, auto_exposure: yes please}\n", "wrist: {index: 1, exposure: dark}\n"):
+        f = tmp_path / "bad.yaml"
+        f.write_text(bad, encoding="utf-8")
+        with pytest.raises(ValueError):
+            cameras.load_config(f)
+
+
+def test_the_shipped_config_keeps_auto_exposure_on_the_wrist_camera_only():
+    cfg = cameras.load_config()
+    assert cfg["wrist"].get("auto_exposure") is True
+    assert not cfg["overhead"].get("auto_exposure", False)  # exposure changes move marker detections

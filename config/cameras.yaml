@@ -4,4 +4,8 @@
 # and the current USB overhead camera is 2 and wrist camera is 1. With FAKE_CAMERA=1 (or FAKE=1)
 # vision.cameras.get_camera() returns a FakeCamera that renders config/fake_scene.json instead.
 overhead: {index: 0, width: 640, height: 480, fps: 30, fourcc: MJPG}
-wrist: {index: 1, width: 640, height: 480, fps: 30, fourcc: MJPG}
+# The wrist camera only shows the scene to people (and one still per grasp), so it keeps the camera's auto
+# exposure: with it switched off it kept the dark exposure it opened with (2026-10-17). The overhead camera
+# keeps auto exposure off, because exposure changes move marker detections. Optional per camera:
+# exposure (DSHOW: log2 seconds, e.g. -5 = 1/32 s), gain, brightness (driver units).
+wrist: {index: 1, width: 640, height: 480, fps: 30, fourcc: MJPG, auto_exposure: true}

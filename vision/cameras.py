@@ -130,6 +130,9 @@ CONFIG_PATH = ROOT / "config" / "cameras.yaml"
 FAKE_SCENE_PATH = ROOT / "config" / "fake_scene.json"
 
 DEFAULTS: dict[str, Any] = {"index": 0, "width": 640, "height": 480, "fps": 30, "fourcc": "MJPG"}
+# Optional per-camera image settings in config/cameras.yaml, written by `open_camera` when given:
+# `auto_exposure` (true leaves the camera's auto exposure on) and these numbers in driver units.
+IMAGE_SETTINGS = ("exposure", "gain", "brightness")
 ENV_INDEX = {"overhead": "OVERHEAD_CAM", "wrist": "WRIST_CAM"}
 LATE_FACTOR = 2.5  # a gap longer than this many frame periods counts as a dropped frame
 LONG_GAP_S = 0.5  # a gap longer than this flips the tracker's `seen` (vision.scene.SEEN_TIMEOUT_S)
@@ -176,7 +179,10 @@ def _fake(flag: str) -> bool:
 
 
 def load_config(path: pathlib.Path | str | None = None) -> dict[str, dict[str, Any]]:
-    """config/cameras.yaml as `{name: {index, width, height, fps, fourcc}}` (defaults filled in)."""
+    """config/cameras.yaml as `{name: {index, width, height, fps, fourcc, ...}}` (defaults filled in).
+
+    Optional per camera: `auto_exposure` (bool) and `exposure`, `gain`, `brightness` (numbers in driver
+    units), passed to `open_camera`; ValueError for a wrong type."""
     file = pathlib.Path(path) if path is not None else CONFIG_PATH
     raw = yaml.safe_load(file.read_text(encoding="utf-8")) if file.exists() else {}
     if raw is None:
@@ -187,6 +193,12 @@ def load_config(path: pathlib.Path | str | None = None) -> dict[str, dict[str, A
     for name, entry in raw.items():
         if not isinstance(entry, dict):
             raise ValueError(f"{file}: camera {name!r} must be a mapping")
+        if not isinstance(entry.get("auto_exposure", False), bool):
+            raise ValueError(f"{file}: camera {name!r}: auto_exposure must be true or false")
+        for key in IMAGE_SETTINGS:
+            value = entry.get(key)
+            if value is not None and (isinstance(value, bool) or not isinstance(value, int | float)):
+                raise ValueError(f"{file}: camera {name!r}: {key} must be a number (driver units)")
         out[str(name)] = {**DEFAULTS, **entry}
     return out
 
@@ -215,10 +227,19 @@ def open_camera(
     height: int = 480,
     fps: int = 30,
     fourcc: str = "MJPG",
+    auto_exposure: bool = False,
+    exposure: float | None = None,
+    gain: float | None = None,
+    brightness: float | None = None,
 ) -> cv2.VideoCapture:
-    """Open a capture (DSHOW on Windows), request MJPG at width x height and fps, disable auto modes.
+    """Open a capture (DSHOW on Windows), request MJPG at width x height and fps, disable autofocus.
 
-    Raises RuntimeError when the device does not open. Settings the driver refuses are logged, not fatal.
+    Auto exposure is switched off by default (exposure flicker moves marker detections), which keeps
+    whatever exposure the camera had; `auto_exposure=True` leaves it on instead, for a camera that only
+    shows the scene to people (the wrist camera: config/cameras.yaml). `exposure` (DSHOW: log2 seconds,
+    e.g. -5 for 1/32 s), `gain` and `brightness` are written as given when set (driver units; a refused
+    value is logged). Raises RuntimeError when the device does not open. Settings the driver refuses are
+    logged, not fatal.
     """
     cap = cv2.VideoCapture(int(index), cv2.CAP_DSHOW) if os.name == "nt" else cv2.VideoCapture(int(index))
     try:
@@ -236,11 +257,24 @@ def open_camera(
                 log.warning("camera %s: requested stream property %s=%s refused", index, prop, value)
         # Exposure flicker and focus hunting move detections; the property semantics differ by backend:
         # DSHOW rounds to a boolean (0 manual / 1 auto); V4L2 defaults to raw 1 manual / 3 auto.
-        # Disabling auto exposure retains the current exposure; it does not select a suitable value.
-        for prop, value in (
+        # Disabling auto exposure retains the current exposure; it does not select a suitable value, so a
+        # camera that opened dark stays dark (seen on the wrist camera, 2026-10-17): see `auto_exposure`.
+        if auto_exposure:
+            exposure_mode = 1 if os.name == "nt" else 3
+        else:
+            exposure_mode = 0 if os.name == "nt" else 1
+        image_settings: list[tuple[int, float]] = [
             (cv2.CAP_PROP_AUTOFOCUS, 0),
-            (cv2.CAP_PROP_AUTO_EXPOSURE, 0 if os.name == "nt" else 1),
+            (cv2.CAP_PROP_AUTO_EXPOSURE, exposure_mode),
+        ]
+        for prop, setting in (
+            (cv2.CAP_PROP_EXPOSURE, exposure),
+            (cv2.CAP_PROP_GAIN, gain),
+            (cv2.CAP_PROP_BRIGHTNESS, brightness),
         ):
+            if setting is not None:
+                image_settings.append((prop, float(setting)))
+        for prop, value in image_settings:
             try:
                 if not cap.set(prop, value):
                     log.info("camera %s: property %s not supported", index, prop)
@@ -365,6 +399,10 @@ class Camera:
         fps: int = 30,
         fourcc: str = "MJPG",
         capture: Any | None = None,
+        auto_exposure: bool = False,
+        exposure: float | None = None,
+        gain: float | None = None,
+        brightness: float | None = None,
     ) -> None:
         self.index = int(index)
         self.name = name
@@ -373,7 +411,17 @@ class Camera:
         self._cap = (
             capture
             if capture is not None
-            else open_camera(index, width=width, height=height, fps=fps, fourcc=fourcc)
+            else open_camera(
+                index,
+                width=width,
+                height=height,
+                fps=fps,
+                fourcc=fourcc,
+                auto_exposure=auto_exposure,
+                exposure=exposure,
+                gain=gain,
+                brightness=brightness,
+            )
         )
         self.reported: dict[str, Any] = read_back(self._cap)
 
@@ -749,6 +797,10 @@ def get_camera(name: str) -> Camera | FakeCamera:
         height=settings["height"],
         fps=settings["fps"],
         fourcc=str(settings["fourcc"]),
+        auto_exposure=bool(settings.get("auto_exposure", False)),
+        exposure=settings.get("exposure"),
+        gain=settings.get("gain"),
+        brightness=settings.get("brightness"),
     )
 
 
