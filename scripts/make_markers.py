@@ -1,14 +1,24 @@
 """Print-ready ArUco markers (B3).
 
 Writes one PNG per marker at 300 dpi into runs/markers/ (gitignored) or `--out DIR`: ids 0-7 at 6 cm
-(table calibration), the object ids of config/objects.yaml at 3 cm, the obstacle ids at 4 cm and 40 (the
-wristband) at 4 cm, each inside a white border at least one marker bit wide with "id N  S cm  name" printed
-under it, plus A4 sheets (`a4_sheet.png`, then `a4_sheet_2.png`, ...) that tile every card with thin gray cut
-lines, and `markers.json` listing what was written. The PNGs carry a 300 dpi pHYs chunk so viewers and
-printers know the physical size. Print at 100 % scale (never "fit to page"), measure the printed side with a
-ruler, cut along the gray lines and glue each marker flat keeping its white border.
+(table calibration), the object ids of config/objects.yaml at 3 cm, the obstacle ids at 4 cm, 40 (the
+wristband) at 4 cm and, for I2 (five loose markers on the table), spare object-size cards at 3 cm labelled
+"spare, I2 check": ids 13-17 by default (`default_spare_ids`: an id config/objects.yaml assigns is skipped
+and the next free one up to 19 takes its place, with a note), or the unconfigured ids in 10-19 that
+`--spare-ids ID...` names (the flag alone prints none; another id is a usage error, exit 2). Each card has
+a white border at least one marker bit wide with "id N  S cm  name" printed under it, plus A4 sheets
+(`a4_sheet.png`, then `a4_sheet_2.png`, ...) that tile every card with thin gray cut lines, and
+`markers.json` listing what was written (every entry carries `spare`, true for the I2 cards); card or sheet
+PNGs of an earlier run in the same directory that markers.json does not list are named in a note
+(`stale_files`), never deleted. The PNGs carry a 300 dpi pHYs chunk so viewers and printers know the
+physical size. Print at 100 % scale (never "fit to page"), measure the printed side with a ruler, cut along
+the gray lines and glue each marker flat keeping its white border; the spare cards stay loose for
+`scripts/touch_markers.py --loose`. That I2 check targets only the spare cards: it leaves out every id
+config/objects.yaml assigns, because those cards are glued on top of objects standing on the table and a
+hover planned from the table there would drive the tip into the object (`--object-cards-flat` includes them
+only while they lie flat on the table with the objects taken away).
 
-    python scripts/make_markers.py [--out DIR]
+    python scripts/make_markers.py [--out DIR] [--spare-ids ID ...]
 """
 
 from __future__ import annotations
@@ -36,6 +46,11 @@ PAGE_MARGIN_CM = 0.5
 CARD_GAP_CM = 0.3
 LABEL_CM = 0.8
 DEFAULT_OUT = ROOT / "runs" / "markers"
+# The object-size ids of vision.markers (3 cm): what scripts/touch_markers.py --loose looks for.
+OBJECT_IDS = range(10, 20)
+# I2's spare cards, printed by default: five, so five loose markers exist with every object card glued.
+SPARE_IDS = (13, 14, 15, 16, 17)
+SPARE_NAME = "spare, I2 check"
 
 
 def px(cm: float) -> int:
@@ -43,21 +58,92 @@ def px(cm: float) -> int:
     return int(round(cm / 2.54 * DPI))
 
 
-def marker_specs(objects: Mapping[int, Mapping[str, Any]] | None = None) -> list[dict[str, Any]]:
-    """What to print: `[{"id", "side_cm", "name", "kind"}]`, calibration ids first, then objects.yaml."""
+def spare_specs(
+    spare_ids: Sequence[int], objects: Mapping[int, Mapping[str, Any]] | None = None
+) -> list[dict[str, Any]]:
+    """Print specs for the spare object-size cards of I2: 3 cm, named "spare, I2 check", `spare: True`.
+
+    ValueError for an id outside 10-19 (not object-size: `touch_markers.py --loose` would never look for
+    it), one that config/objects.yaml (or `objects`) already assigns to an object, or a repeated id.
+    """
     table = objects if objects is not None else load_objects()
-    specs = [
-        {"id": i, "side_cm": MARKER_SIDE_M["calib"] * 100, "name": f"calibration {i}", "kind": "calib"}
+    specs: list[dict[str, Any]] = []
+    for raw in spare_ids:
+        marker_id = int(raw)
+        if marker_id not in OBJECT_IDS:
+            raise ValueError(f"spare id {marker_id} is not an object-size id (10-19)")
+        if marker_id in table:
+            raise ValueError(
+                f"spare id {marker_id} is already {table[marker_id]['name']} in config/objects.yaml"
+            )
+        if any(spec["id"] == marker_id for spec in specs):
+            raise ValueError(f"spare id {marker_id} is given twice")
+        specs.append(
+            {
+                "id": marker_id,
+                "side_cm": MARKER_SIDE_M["object"] * 100,
+                "name": SPARE_NAME,
+                "kind": "object",
+                "spare": True,
+            }
+        )
+    return specs
+
+
+def default_spare_ids(objects: Mapping[int, Mapping[str, Any]] | None = None) -> list[int]:
+    """The spare cards printed when `--spare-ids` is not given: SPARE_IDS (13-17), except that an id
+    config/objects.yaml (or `objects`) assigns is skipped and the next free object-size id up to 19 takes
+    its place, so the default run keeps printing five spare cards after A11 adds objects (fewer only when
+    fewer than five of 13-19 are free)."""
+    table = objects if objects is not None else load_objects()
+    free = [i for i in range(SPARE_IDS[0], OBJECT_IDS.stop) if i not in table]
+    return free[: len(SPARE_IDS)]
+
+
+def marker_specs(
+    objects: Mapping[int, Mapping[str, Any]] | None = None, spare_ids: Sequence[int] | None = None
+) -> list[dict[str, Any]]:
+    """What to print: `[{"id", "side_cm", "name", "kind", "spare"}]`, calibration ids first, then
+    objects.yaml (and the wristband), then the spare cards of `spare_ids` (see `spare_specs`; None means
+    `default_spare_ids`)."""
+    table = objects if objects is not None else load_objects()
+    if spare_ids is None:
+        spare_ids = default_spare_ids(table)
+    specs: list[dict[str, Any]] = [
+        {
+            "id": i,
+            "side_cm": MARKER_SIDE_M["calib"] * 100,
+            "name": f"calibration {i}",
+            "kind": "calib",
+            "spare": False,
+        }
         for i in CALIB_IDS
     ]
     hand_seen = False
     for marker_id, entry in sorted(table.items()):
         kind = entry["kind"]
         side_cm = MARKER_SIDE_M[kind] * 100
-        specs.append({"id": int(marker_id), "side_cm": side_cm, "name": str(entry["name"]), "kind": kind})
+        specs.append(
+            {
+                "id": int(marker_id),
+                "side_cm": side_cm,
+                "name": str(entry["name"]),
+                "kind": kind,
+                "spare": False,
+            }
+        )
         hand_seen = hand_seen or int(marker_id) == HAND_ID
     if not hand_seen:
-        specs.append({"id": HAND_ID, "side_cm": MARKER_SIDE_M["hand"] * 100, "name": "hand", "kind": "hand"})
+        specs.append(
+            {
+                "id": HAND_ID,
+                "side_cm": MARKER_SIDE_M["hand"] * 100,
+                "name": "hand",
+                "kind": "hand",
+                "spare": False,
+            }
+        )
+    specs.extend(spare_specs(spare_ids, table))
     return specs
 
 
@@ -139,15 +225,44 @@ def make_sheets(cards: Sequence[np.ndarray]) -> list[np.ndarray]:
     return pages
 
 
+def stale_files(out: Path, manifest: Mapping[str, Any]) -> list[str]:
+    """Card and sheet PNGs in `out` that `manifest` does not list: leftovers of an earlier run with more
+    cards or sheets (other spare ids, a longer object list), which would otherwise be printed as well."""
+    written = {str(entry["file"]) for entry in manifest["markers"]} | {str(s) for s in manifest["sheets"]}
+    found = {p.name for pattern in ("marker_*.png", "a4_sheet*.png") for p in out.glob(pattern)}
+    return sorted(found - written)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Write print-ready ArUco marker PNGs (B3).")
     parser.add_argument("--out", default=str(DEFAULT_OUT), help="output directory (default runs/markers)")
+    parser.add_argument(
+        "--spare-ids",
+        type=int,
+        nargs="*",
+        default=None,
+        metavar="ID",
+        help="spare object-size cards for I2's loose markers: ids 10-19 not in config/objects.yaml "
+        "(default 13 14 15 16 17, an id objects.yaml assigns replaced by the next free one; the flag "
+        "with no ids prints none)",
+    )
     args = parser.parse_args(argv)
+    table = load_objects()
+    spare_ids = default_spare_ids(table) if args.spare_ids is None else args.spare_ids
+    if args.spare_ids is None and tuple(spare_ids) != SPARE_IDS:
+        print(
+            f"note: config/objects.yaml assigns some of {SPARE_IDS[0]}-{SPARE_IDS[-1]}; the spare cards "
+            f"are {' '.join(str(i) for i in spare_ids) or 'none'}"
+        )
+    try:
+        specs = marker_specs(table, spare_ids=spare_ids)
+    except ValueError as exc:
+        parser.error(str(exc))
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     manifest: dict[str, Any] = {"dpi": DPI, "markers": [], "sheets": []}
     cards: list[np.ndarray] = []
-    for spec in marker_specs():
+    for spec in specs:
         card = render_card(spec)
         cards.append(card)
         file = write_png(out / f"marker_{spec['id']:02d}.png", card)
@@ -159,7 +274,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         manifest["sheets"].append(name)
         print(f"{name}: A4 at {DPI} dpi")
     (out / "markers.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-    print(f"wrote {len(cards)} markers and {len(manifest['sheets'])} sheet(s) to {out}")
+    spares = sum(1 for spec in specs if spec["spare"])
+    print(f"wrote {len(cards)} markers ({spares} spare) and {len(manifest['sheets'])} sheet(s) to {out}")
+    if spares:
+        print(
+            "I2: lay the spare cards flat on the table; touch_markers.py --loose leaves out the object ids "
+            "(glued on objects), so the spares are its targets"
+        )
+    stale = stale_files(out, manifest)
+    if stale:
+        print(
+            f"note: {out} also holds {len(stale)} file(s) of an earlier run that markers.json does not "
+            f"list; delete them before printing: {' '.join(stale)}"
+        )
     return 0
 
 

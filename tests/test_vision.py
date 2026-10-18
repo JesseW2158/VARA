@@ -539,8 +539,9 @@ def test_make_markers_writes_detectable_pngs(tmp_path):
     assert make_markers.main(["--out", str(out)]) == 0
     manifest = json.loads((out / "markers.json").read_text(encoding="utf-8"))
     ids = {m["id"] for m in manifest["markers"]}
-    expected = set(CALIB_IDS) | {10, 11, 12, 30, HAND_ID}
+    expected = set(CALIB_IDS) | {10, 11, 12, 30, HAND_ID} | {13, 14, 15, 16, 17}  # 13-17: I2's spare cards
     assert ids == expected
+    assert {m["id"] for m in manifest["markers"] if m["spare"]} == {13, 14, 15, 16, 17}
     for entry in manifest["markers"]:
         file = out / entry["file"]
         assert file.exists() and entry["side_cm"] == marker_side(entry["id"]) * 100
