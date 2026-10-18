@@ -65,7 +65,7 @@ Assembled kits normally ship with motor IDs set. Run `lerobot-setup-motors` only
 
 **Needs:** A3. **By:** Sat 12:30 AM. **Files:** `config/objects.yaml`.
 
-1. Measure the jaw opening at gripper 100, in mm.
+1. Measure the jaw opening at gripper 1.0 (the joint map's `open_pct`, 51 on this arm), in mm.
 2. Record the empty-closed reading: command gripper 0 and read it after 0.5 s.
 3. Choose three objects and one obstacle. Rules: width across the grasp at most the jaw opening minus 2 cm; height 6 to 11 cm; a flat top that fits a 3 cm marker; under 100 g; nothing sharp, hot or fragile. Proposed: an empty pill bottle, an empty juice box, a narrow tea tin, and a cereal box about 20 cm tall as the obstacle.
 4. Teleoperate 5 grasps per object and record the closed readings. Set `held_min` to half the gap between the smallest closed reading and the empty-closed reading (0 to 100 scale).

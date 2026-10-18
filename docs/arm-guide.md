@@ -326,7 +326,10 @@ camera's number in `.env` as `OVERHEAD_CAM`.
 
 Print the sheets at 100 % scale (never "fit to page") and check one marker's side with the ruler. Then:
 
-- glue marker 10 on the pill bottle, 11 on the juice box, 12 on the tea tin and 30 on the cereal box;
+- glue marker 10 on the pill bottle, 11 on the power bank, 12 on the box and 30 on the tape measure (the
+  obstacle, standing on its edge; mount its 4 cm marker flat on a small card). The code keeps its slot
+  names: the power bank is `juice_box`, the box `tea_tin`, the tape measure `cereal_box`, so say "juice
+  box" for the power bank. Starting spots are in [demo.md](demo.md); the "tray" is a taped drop area;
 - tape markers 0 to 7 flat around the edge of the workspace;
 - put marker 40 on the wristband for the hand-over;
 - keep the spare cards 13 to 17 loose for the arm-meets-camera test in Part E.

@@ -771,8 +771,11 @@ def test_routine_spec_substitutes_args_everywhere(seeded: Library):
     assert already_true(spec, SCENE, {}) is False
     after = json.loads(json.dumps(SCENE))
     after["objects"]["pill_bottle"]["seen"] = False
-    after["objects"]["juice_box"].update({"x": 0.30, "y": 0.22})
-    after["objects"]["tea_tin"].update({"x": 0.28, "y": 0.20})
+    # two of the scene's own tray slots, so the check follows the tray when the table is re-taped
+    # (the literal (0.30, 0.22) and (0.28, 0.20) were inside the kit tray only)
+    (jx, jy), (tx, ty) = SCENE["zones"]["tray"]["slots"][:2]
+    after["objects"]["juice_box"].update({"x": jx, "y": jy})
+    after["objects"]["tea_tin"].update({"x": tx, "y": ty})
     assert evaluate(spec, SCENE, after, {}, ["handoff_done"]) is True
     assert evaluate(spec, SCENE, after, {}, []) is False
 

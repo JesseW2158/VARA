@@ -17,7 +17,7 @@ def run(robot, args):
     tray = scene["zones"]["tray"]
     if TARGET not in objs or not objs[TARGET]["seen"]:
         return False
-    tallest = max([o["h"] for o in scene["obstacles"].values()] + [0.0])
+    tallest = max([o["h"] for o in [*scene["obstacles"].values(), *scene["objects"].values()]] + [0.0])
     transit = tallest + 0.08
     if not robot.pick(TARGET, transit_z=transit):
         return False

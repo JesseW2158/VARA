@@ -8,6 +8,7 @@ import json
 import cv2
 import numpy as np
 import pytest
+from vision_kit import install_kit_layout
 
 from scripts import capture_table
 from vision import calibrate, cameras, markers
@@ -68,6 +69,14 @@ def no_hardware(monkeypatch, tmp_path):
     monkeypatch.setattr(capture_table, "DEFAULT_CHECK_POINTS", tmp_path / "default" / "check-points.json")
     # Never undistort through this laptop's config/lens.npz: physical captures here run on raw frames.
     monkeypatch.setattr("vision.lens.LENS_PATH", tmp_path / "no-lens" / "lens.npz")
+
+
+@pytest.fixture
+def kit_layout(monkeypatch, tmp_path):
+    """`--fake` captures render the frozen kit layout (tests/vision_kit.py), not the live config: which
+    calibration marker a raised item hides and where a check spot lands depend on the table layout, and
+    config/scene.yaml, objects.yaml and fake_scene.json now describe the measured table and real props."""
+    return install_kit_layout(monkeypatch, tmp_path / "kit")
 
 
 @pytest.fixture
@@ -144,11 +153,12 @@ def test_unexpected_fake_camera_is_closed_and_refused(camera, tmp_path):
     assert camera.released and list(tmp_path.iterdir()) == []
 
 
-def test_explicit_fake_capture_is_labeled_even_without_fake_environment(tmp_path):
+def test_explicit_fake_capture_is_labeled_even_without_fake_environment(kit_layout, tmp_path):
     report = capture_table.capture(tmp_path / "offline", fake=True)
     assert report["mode"] == "synthetic"
     assert report["original_image"].startswith("synthetic-")
     assert report["annotated_image"].startswith("synthetic-")
+    # the kit's 20 cm cereal box covers calibration marker 6 in the synthetic image
     assert report["markers"] and report["synthetic_hidden_calibration_ids"] == [6]
 
 
@@ -228,7 +238,7 @@ def test_duplicate_ids_are_reported(camera, tmp_path, capsys):
     assert "seen more than once" in capsys.readouterr().out
 
 
-def test_fake_capture_combines_frames_expect_all_and_printed_sides(monkeypatch, tmp_path, capsys):
+def test_fake_capture_combines_frames_expect_all_and_printed_sides(kit_layout, monkeypatch, tmp_path, capsys):
     single = capture_table.capture(tmp_path / "single", fake=True)
     reads = []
 
@@ -268,7 +278,7 @@ def test_expected_ids_come_from_the_marker_table():
     assert capture_table.expected_ids(include_hand=True) == [0, 1, 2, 3, 4, 5, 6, 7, 10, 11, 12, 30, 40]
 
 
-def test_expect_all_reports_the_hidden_calibration_marker_and_fails(tmp_path, capsys):
+def test_expect_all_reports_the_hidden_calibration_marker_and_fails(kit_layout, tmp_path, capsys):
     report = capture_table.capture(tmp_path / "vis", fake=True, expect=capture_table.expected_ids())
     assert report["expected"] == [0, 1, 2, 3, 4, 5, 6, 7, 10, 11, 12, 30]
     assert report["missing"] == [6] and report["unexpected"] == []
@@ -280,8 +290,9 @@ def test_expect_all_reports_the_hidden_calibration_marker_and_fails(tmp_path, ca
     assert "calibration marker(s) [6] lie under raised items" in output
 
 
-def test_expect_all_passes_when_every_marker_is_visible(monkeypatch, tmp_path, capsys):
+def test_expect_all_passes_when_every_marker_is_visible(kit_layout, monkeypatch, tmp_path, capsys):
     scene = copy.deepcopy(cameras.load_fake_scene())
+    assert cameras.FakeCamera(scene).hidden_calibration_ids() == {6}  # the kit box covers 6 where it stands
     scene["obstacles"]["cereal_box"].update({"x": 0.12, "y": 0.10})  # off calibration marker 6
     assert cameras.FakeCamera(scene).hidden_calibration_ids() == set()
     use_fake_scene(monkeypatch, scene)
@@ -552,7 +563,10 @@ def test_check_point_refusals_after_the_capture_keep_the_images(camera, tmp_path
     assert len(capture_table.load_check_point_list(path)) == 1
 
 
-def test_five_fake_spots_pass_the_offline_check(monkeypatch, tmp_path, capsys):
+def test_five_fake_spots_pass_the_offline_check(kit_layout, monkeypatch, tmp_path, capsys):
+    # Checked against the synthetic homography of the camera that rendered the spots (the kit's), never
+    # config/homography.npy: that file becomes the measured calibration of the physical camera (D6).
+    homography = kit_layout.homography_path
     path = tmp_path / "synthetic-check-points.json"
     for index, (x, y) in enumerate(SPOTS, start=1):
         use_fake_scene(monkeypatch, spot_scene(x, y))
@@ -580,11 +594,11 @@ def test_five_fake_spots_pass_the_offline_check(monkeypatch, tmp_path, capsys):
         3,
         4,
     ]
-    assert calibrate.main(["--check", "--check-points", str(path)]) == 0
+    assert calibrate.main(["--check", "--check-points", str(path), "--out", str(homography)]) == 0
     assert "PASS" in capsys.readouterr().out
     # The synthetic camera and the synthetic homography agree to sub-pixel detection noise (1 px is
     # about 1.4 mm on the table), far inside the 1.5 cm limit.
-    assert calibrate.check_points_metrics(calibrate.load_homography(), points)["max_cm"] < 0.25
+    assert calibrate.check_points_metrics(calibrate.load_homography(homography), points)["max_cm"] < 0.25
 
 
 def test_fake_camera_check_point_refusals_leave_the_list_unchanged(monkeypatch, tmp_path, capsys):

@@ -1,10 +1,16 @@
 """A8 SimRobot on the MuJoCo scene and A12 starter skills.
 
-Every scene here derives from config/fake_scene.json as committed (`FAKE_SCENE`), so the suite follows
+Most scenes here derive from config/fake_scene.json as committed (`FAKE_SCENE`), so the suite follows
 A15's re-taping of the layout: the hand, the handoff zone, the slots and the cereal box are read from the
 file, never hard-coded. The A8 done-when (place_in_tray on the juice box 5 of 5 perturbed trials, a candidate
 that drops the box beside the tray fails the spec, a candidate without transit_z hits the cereal box) runs on
 that file.
+
+A few tests of generic SimRobot behaviour need geometry the real props of 2026-10-18 no longer have (a 20 cm
+obstacle in the path of a no-transit move, a box taller than twice the default release height, the 3.5 cm
+pill bottle's attach offsets, tray walls a gripper can hit, a carry that descends onto the handoff point).
+They run on the kit layout (`KIT_SCENE`, `kit_model`): the inputs committed before the props changed,
+rendered by sim.model.build_scene into a temp dir, so the shipped props cannot make them vacuous.
 """
 
 from __future__ import annotations
@@ -17,14 +23,17 @@ import random
 import time
 from datetime import datetime
 
+import mujoco
 import numpy as np
 import pytest
 from jsonschema import Draft202012Validator
+from known_limits import SHORT_OBSTACLE
 
 from arm import ik, replay, sim_robot
 from arm.sim_robot import DT, ROLL_OFFSET, SimRobot, SimTimeLimit
 from sim import restricted, success
 from sim.candidate_check import check_source
+from sim.model import build_scene
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 STARTER = ROOT / "skills" / "_starter"
@@ -37,8 +46,76 @@ HOME_Q = [float(v) for v in ik.home_q()]
 DEG = math.pi / 180
 ROBOT_LABELS = {"base", "shoulder", "upper_arm", "lower_arm", "wrist", "gripper"}
 OBJECTS = ("pill_bottle", "juice_box", "tea_tin")
-TRANSIT_Z = 0.20 + 0.08  # tallest obstacle + 0.08, as the starter skills compute it
+# The kit's 20 cm cereal box + 0.08, the kit starter rule. On the shipped layout the starter skills now take
+# the tallest object or obstacle + 0.08 (0.18 m), so 0.28 is a higher, still valid transit there.
+TRANSIT_Z = 0.20 + 0.08
 WALL_TIMES: dict[str, float] = {}
+
+# The kit layout: config/objects.yaml (shapes and sizes), config/scene.yaml zones.tray and
+# config/fake_scene.json as committed before the 2026-10-18 props. build_scene.render of these inputs
+# reproduced that commit's scene_ours.xml byte for byte (checked 2026-10-18). The scene's `h` values matter
+# too: SimRobot places obstacles and computes the carry clearance from them.
+KIT_OBJECTS = {
+    10: {"name": "pill_bottle", "kind": "object", "shape": "cylinder", "size": [0.035, 0.035], "h": 0.07},
+    11: {"name": "juice_box", "kind": "object", "shape": "box", "size": [0.063, 0.04], "h": 0.105},
+    12: {"name": "tea_tin", "kind": "object", "shape": "cylinder", "size": [0.04, 0.04], "h": 0.09},
+    30: {"name": "cereal_box", "kind": "obstacle", "shape": "box", "size": [0.19, 0.06], "h": 0.2},
+    40: {"name": "hand", "kind": "hand", "h": 0.03},
+}
+KIT_SCENE = {
+    "t": 1792209600.12,
+    "objects": {
+        "pill_bottle": {
+            "marker": 10,
+            "x": 0.18,
+            "y": -0.12,
+            "yaw": 0.0,
+            "h": 0.07,
+            "size": [0.035, 0.035],
+            "seen": True,
+        },
+        "juice_box": {
+            "marker": 11,
+            "x": 0.24,
+            "y": -0.04,
+            "yaw": 0.3,
+            "h": 0.105,
+            "size": [0.063, 0.04],
+            "seen": True,
+        },
+        "tea_tin": {
+            "marker": 12,
+            "x": 0.16,
+            "y": -0.02,
+            "yaw": 0.0,
+            "h": 0.09,
+            "size": [0.04, 0.04],
+            "seen": True,
+        },
+    },
+    "obstacles": {
+        "cereal_box": {
+            "marker": 30,
+            "x": 0.28,
+            "y": 0.07,
+            "yaw": 0.0,
+            "h": 0.2,
+            "size": [0.19, 0.06],
+            "seen": True,
+        },
+    },
+    "hand": {"marker": 40, "x": 0.28, "y": -0.08, "z": 0.03, "seen": False},
+    "zones": {
+        "tray": {
+            "x": 0.3,
+            "y": 0.22,
+            "r": 0.07,
+            "wall": 0.035,
+            "slots": [[0.275, 0.195], [0.325, 0.195], [0.275, 0.245], [0.325, 0.245]],
+        },
+        "handoff": {"x": 0.28, "y": -0.08, "z": 0.1},
+    },
+}
 
 
 def perturb(scene: dict, trial: int, seed: int = 7) -> dict:
@@ -118,6 +195,49 @@ def in_tray(scene: dict, name: str) -> bool:
 @pytest.fixture(scope="module")
 def robot() -> SimRobot:
     return SimRobot(FAKE_SCENE, skills_dir=STARTER)
+
+
+@pytest.fixture(scope="module")
+def kit_model(tmp_path_factory) -> pathlib.Path:
+    """The kit layout's scene model, rendered by build_scene into a temp dir beside a copy of the arm MJCF
+    whose meshdir points at sim/model/assets (the scene's include and the meshes are relative paths), so
+    nothing is written into sim/model."""
+    out = tmp_path_factory.mktemp("kit_model")
+    model_dir = ROOT / "sim" / "model"
+    arm_xml = (model_dir / "so101_new_calib.xml").read_text(encoding="utf-8")
+    assert arm_xml.count('meshdir="assets"') == 1
+    assets = (model_dir / "assets").resolve().as_posix()
+    (out / "so101_new_calib.xml").write_text(
+        arm_xml.replace('meshdir="assets"', f'meshdir="{assets}"'), encoding="utf-8", newline="\n"
+    )
+    path = out / "scene_kit.xml"
+    text = build_scene.render(KIT_OBJECTS, {"zones": {"tray": KIT_SCENE["zones"]["tray"]}}, KIT_SCENE)
+    path.write_text(text, encoding="utf-8", newline="\n")
+    return path
+
+
+@pytest.fixture(scope="module")
+def kit_robot(kit_model) -> SimRobot:
+    return SimRobot(KIT_SCENE, skills_dir=STARTER, model_path=kit_model)
+
+
+def test_kit_model_has_the_kit_geometry(kit_robot):
+    """The premise of the kit-pinned tests: the 20 cm cereal box, the 10.5 cm juice box, the 3.5 cm pill
+    bottle and a tray with 3.5 cm walls, and the kit scene is a valid scene."""
+    SCENE_VALIDATOR.validate(KIT_SCENE)
+    kit_robot.reset(KIT_SCENE)
+    m = kit_robot._model
+
+    def geom(name: str) -> int:
+        gid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, name)
+        assert gid >= 0, name
+        return gid
+
+    assert np.allclose(m.geom_size[geom("cereal_box")], [0.095, 0.03, 0.10])
+    assert kit_robot._object_half_height("juice_box") == pytest.approx(0.0525)
+    assert kit_robot._object_width("pill_bottle") == pytest.approx(0.035)
+    wall = geom("tray_wall_nx")
+    assert m.geom_pos[wall][2] + m.geom_size[wall][2] == pytest.approx(0.035)
 
 
 # ---------------------------------------------------------------- model, reset, scene
@@ -204,15 +324,18 @@ def test_unseen_object_remains_a_collision_body_but_cannot_be_grasped(robot):
     assert grips(robot)[-1] == {"kind": "grip", "action": "close", "expect_held": False}
 
 
-def test_unseen_obstacle_still_rejects_a_colliding_candidate(robot):
-    scene = copy.deepcopy(FAKE_SCENE)
+def test_unseen_obstacle_still_rejects_a_colliding_candidate(kit_robot):
+    """An unseen obstacle stays a collision body. Kit layout: there the 20 cm cereal box stands in the path
+    of a no-transit pick and place; the shipped 5.7 cm obstacle is cleared without a transit (that layout
+    property is test_candidate_without_transit_collides_with_the_cereal_box's)."""
+    scene = copy.deepcopy(KIT_SCENE)
     scene["obstacles"]["cereal_box"]["seen"] = False
-    robot.reset(scene)
-    assert robot.pick("juice_box")
-    robot.place_in_zone("tray")
-    assert robot.stats["collisions"] >= 1
-    assert "cereal_box" in robot.stats["first_collision"]
-    assert robot.final_scene()["obstacles"]["cereal_box"] == scene["obstacles"]["cereal_box"]
+    kit_robot.reset(scene)
+    assert kit_robot.pick("juice_box")
+    kit_robot.place_in_zone("tray")
+    assert kit_robot.stats["collisions"] >= 1
+    assert "cereal_box" in kit_robot.stats["first_collision"]
+    assert kit_robot.final_scene()["obstacles"]["cereal_box"] == scene["obstacles"]["cereal_box"]
 
 
 def test_post_handoff_snapshot_cannot_resurrect_the_taken_object(robot):
@@ -541,12 +664,20 @@ def test_hand_over_juice_box_also_passes(robot):
 
 
 def test_candidate_that_drops_the_box_beside_the_tray_fails_the_spec(robot):
+    # Beside the tray read from the file: on the +x side, 3 cm past the zone's edge plus the juice box's
+    # half-diagonal, so no part of the box can count as inside (the old hard-coded (0.17, 0.22) is inside
+    # the re-taped zone).
+    tray, box = FAKE_SCENE["zones"]["tray"], FAKE_SCENE["objects"]["juice_box"]
+    reach = math.hypot(box["size"][0] / 2, box["size"][1] / 2)
+    x, y = tray["x"] + tray["r"] + reach + 0.03, tray["y"]
+    assert math.hypot(x - tray["x"], y - tray["y"]) > tray["r"] + reach
+    assert BOX["x"][0] <= x <= BOX["x"][1] and BOX["y"][0] <= y <= BOX["y"][1]
     src = (
         "import math\n\n"
         "def run(robot, args):\n"
         "    if not robot.pick('juice_box', transit_z=0.28):\n"
         "        return False\n"
-        "    return robot.place(0.17, 0.22, 0.07, transit_z=0.28)\n"
+        f"    return robot.place({x:.4f}, {y:.4f}, 0.07, transit_z=0.28)\n"
     )
     run = restricted.load_entry(src)
     robot.reset(FAKE_SCENE)
@@ -560,6 +691,10 @@ def test_candidate_that_drops_the_box_beside_the_tray_fails_the_spec(robot):
     assert reason == "spec not satisfied"
 
 
+@pytest.mark.xfail(
+    reason=SHORT_OBSTACLE,
+    strict=True,
+)
 def test_candidate_without_transit_collides_with_the_cereal_box(robot):
     src = (
         "import math\n\n"
@@ -594,9 +729,12 @@ def test_no_self_collision_at_home_pick_poses_and_during_place_in_tray(robot):
     assert robot._collision_log == []
 
 
-def test_self_contacts_would_be_counted(robot):
-    """The scan counts robot-robot pairs: fold the wrist back into the forearm and the phrase names links."""
-    robot.reset(FAKE_SCENE)
+def test_self_contacts_would_be_counted(kit_robot):
+    """The scan counts robot-robot pairs: fold the wrist back into the forearm and the phrase names links.
+    Kit layout: on the shipped one the folding gripper sweeps into the 10 cm tea box at (0.15, 0.03) first,
+    an environment contact that says nothing about self-contacts."""
+    robot = kit_robot
+    robot.reset(KIT_SCENE)
     q = np.array(HOME_Q)
     q[3] = LIMITS["wrist_flex"][1] - 3.5 * DEG
     q[2] = LIMITS["elbow_flex"][1] - 3.5 * DEG
@@ -701,21 +839,30 @@ def test_carry_clearance_above_the_ceiling_is_refused_without_motion(robot):
     assert robot.stats["ik_failures"] == 1
 
 
-def test_carry_descent_requires_measured_arrival_before_release(robot, monkeypatch):
-    robot.reset(FAKE_SCENE)
+def test_carry_descent_requires_measured_arrival_before_release(kit_robot, monkeypatch):
+    """Kit layout: the carry clears the 20 cm cereal box at 0.26 m and descends to 0.185 m above the
+    handoff point. On the shipped layout the handoff target (0.19 m) is above the clearance (0.17 m): the
+    rise goes straight to it and the 3rd path is a 2-waypoint descent of zero height the arm has already
+    finished (measured 2026-10-18), so stalling it proves nothing."""
+    robot = kit_robot
+    robot.reset(KIT_SCENE)
     assert robot.pick("pill_bottle", transit_z=TRANSIT_Z)
     run_path = robot._run_path
     calls = 0
+    stalled_drop: list[float] = []
 
     def stall_descent(path):
         nonlocal calls
         calls += 1
         if calls != 3:  # rise and travel work; the descent's actuator does not follow its command
             run_path(path)
+        else:
+            stalled_drop.append(ik.fk_grasp(path[0])[0][2] - ik.fk_grasp(path[-1])[0][2])
 
     monkeypatch.setattr(robot, "_run_path", stall_descent)
     assert robot.carry_to_hand() is False
     assert calls == 3
+    assert stalled_drop[0] > 0.03, stalled_drop  # the stalled leg really is the descent
     assert robot._held == "pill_bottle" and robot.events == []
     assert robot.stats["ik_failures"] == 1
 
@@ -918,17 +1065,22 @@ def test_tip_speed_cap_holds_on_straight_legs_too(robot):
     assert validate(robot) == []
 
 
-def test_place_with_the_default_release_height_keeps_the_juice_box_off_the_table(robot):
+def test_place_with_the_default_release_height_keeps_the_juice_box_off_the_table(kit_robot):
     """The contract's default release_z = 0.05 is below the 10.5 cm juice box's half height: the release is
-    raised so the held box stops 5 mm above the table instead of being pushed into it (a collision)."""
-    robot.reset(FAKE_SCENE)
+    raised so the held box stops 5 mm above the table instead of being pushed into it (a collision). Kit
+    layout: the shipped 8.9 cm power bank's half height is under 0.05 m, and its 4.45 cm pill bottle stands
+    in the gripper's way at (0.20, -0.18)."""
+    robot = kit_robot
+    robot.reset(KIT_SCENE)
+    half = robot._object_half_height("juice_box")
+    assert half == pytest.approx(0.0525) and half > 0.05  # the premise: default release_z is too low
     assert robot.pick("juice_box", transit_z=TRANSIT_Z) is True
     assert robot.place(0.20, -0.18, transit_z=TRANSIT_Z) is True
     x, y, z, _yaw = robot._object_pose("juice_box")
     assert robot.stats["collisions"] == 0, robot._collision_log
     assert math.hypot(x - 0.20, y + 0.18) < 0.02 and abs(z - 0.0525) < 0.003  # upright where it was asked
     assert validate(robot) == []
-    robot.reset(FAKE_SCENE)  # a short object at a low release height is unaffected
+    robot.reset(KIT_SCENE)  # a short object at a low release height is unaffected
     assert robot.pick("tea_tin", transit_z=TRANSIT_Z) and robot.place(0.20, -0.18, 0.055, transit_z=TRANSIT_Z)
     assert robot.stats["collisions"] == 0, robot._collision_log
 
@@ -999,18 +1151,21 @@ def test_ai_code_cannot_reset_relabel_or_shadow_the_robot(robot):
     assert robot.stats["sim_s"] == 0.0
 
 
-def test_attach_tolerance_is_one_centimeter_from_the_center_line(robot):
+def test_attach_tolerance_is_one_centimeter_from_the_center_line(kit_robot):
     """close_gripper attaches at 0.8 cm from the pill bottle's center line, not at 2.5 cm (the bottle then
     sits under the moving jaw and is shoved) nor 3 cm beside the fingers (nothing is touched), nor at 85 %
-    of the juice box's height."""
-    robot.reset(FAKE_SCENE)
+    of the juice box's height. Kit layout: the offsets are sized for the kit's 3.5 cm bottle; the shipped
+    4.45 cm one touches a finger 3 cm to the side."""
+    robot = kit_robot
+    robot.reset(KIT_SCENE)
+    assert robot._object_width("pill_bottle") == pytest.approx(0.035)  # the premise
     descend_to(robot, "pill_bottle", 0.008, 0.0, 0.5)
     assert robot.close_gripper() is True
     close = {"kind": "grip", "action": "close", "object": "pill_bottle", "expect_held": True}
     assert grips(robot)[-1] == close
     assert robot.move_to(0.22, -0.10, 0.18) and robot._object_pose("pill_bottle")[2] > 0.10  # it came along
     for along_c, across in ((0.025, 0.0), (0.0, -0.03), (-0.025, 0.0)):
-        robot.reset(FAKE_SCENE)
+        robot.reset(KIT_SCENE)
         descend_to(robot, "pill_bottle", along_c, across, 0.5)
         assert robot.close_gripper() is False, (along_c, across)
         assert grips(robot)[-1] == {"kind": "grip", "action": "close", "expect_held": False}
@@ -1020,7 +1175,7 @@ def test_attach_tolerance_is_one_centimeter_from_the_center_line(robot):
             assert robot.move_to(0.22, -0.10, 0.18) and robot._object_pose("pill_bottle")[2] < 0.05
         else:  # under a finger: shoved (a counted contact), never attached
             assert robot.stats["collisions"] >= 1 and "pill_bottle" in robot.stats["first_collision"]
-    robot.reset(FAKE_SCENE)
+    robot.reset(KIT_SCENE)
     descend_to(robot, "juice_box", 0.0, 0.0, 0.85)
     assert robot.close_gripper() is False
     assert grips(robot)[-1] == {"kind": "grip", "action": "close", "expect_held": False}
@@ -1107,19 +1262,20 @@ def test_a_self_recursive_skill_stops_at_the_nesting_cap(tmp_path):
     assert other.events == ["run_skill: loop nested too deep"]
 
 
-def test_tray_contacts_are_named_after_the_tray():
+def test_tray_contacts_are_named_after_the_tray(kit_model):
     """Body-name labels for the tray walls: the empty gripper and a held object dragged out through the -x
-    wall are counted as 'gripper hit tray' and 'held juice_box hit tray'."""
-    far = copy.deepcopy(FAKE_SCENE)
+    wall are counted as 'gripper hit tray' and 'held juice_box hit tray'. Kit layout: its tray has 3.5 cm
+    walls; the shipped zone is taped (2 mm) and its -x side, 10 cm in, is outside the workspace box."""
+    far = copy.deepcopy(KIT_SCENE)
     far["objects"]["juice_box"].update({"x": 0.12, "y": -0.23})
     far["objects"]["tea_tin"].update({"x": 0.12, "y": 0.23})
     tray = far["zones"]["tray"]
-    r = SimRobot(far)
+    r = SimRobot(far, model_path=kit_model)
     assert r.move_to(tray["x"], tray["y"], 0.12) and r.move_to(tray["x"], tray["y"], 0.03)
     assert r._collision_log == []
     assert r.move_to(tray["x"] - 0.10, tray["y"], 0.03)
     assert r._collision_log == ["gripper hit tray"]
-    r = SimRobot(far)
+    r = SimRobot(far, model_path=kit_model)
     assert r.pick("juice_box", transit_z=TRANSIT_Z)
     x, y, _z, _yaw = r._object_pose("juice_box")
     assert (

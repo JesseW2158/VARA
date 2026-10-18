@@ -360,6 +360,19 @@ def _fk_tip() -> Any:
     return fk_tip
 
 
+FAILED_EVENTS_KEPT = 20  # replay events saved with a failed leg (the reason alone does not say what failed)
+
+
+def _last_events(result: dict[str, Any]) -> list[str]:
+    """The last replay events of a failed leg, as text, for results.json and the console."""
+    return [str(e) for e in list(result.get("events") or [])[-FAILED_EVENTS_KEPT:]]
+
+
+def _print_events(events: Sequence[str]) -> None:
+    for line in events[-8:]:
+        print(f"  replay: {line}")
+
+
 def stream_fake(driver: Any, traj: dict[str, Any]) -> bool:
     """Send every waypoint through `driver.command` (FakeDriver only; a stand-in for replay())."""
     if not getattr(driver, "is_fake", False):
@@ -728,9 +741,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             go = run_trajectory(driver, p["traj_go"], fake=args.fake, scene=hand_source)
             entry["replay_go"] = {k: go.get(k) for k in ("ok", "reason", "note")}
             if not go.get("ok"):
+                entry["replay_go"]["events"] = _last_events(go)
                 entry.update(ok=False, gap_cm=None)
                 results.append(entry)
                 print(f"{p['name']}: replay failed ({go.get('reason')}); stopping here")
+                _print_events(entry["replay_go"]["events"])
                 aborted = True
                 break
             q_now, _ = driver.read()
@@ -747,7 +762,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             entry["replay_back"] = {k: back.get(k) for k in ("ok", "reason", "note")}
             results.append(entry)
             if not back.get("ok"):
+                entry["replay_back"]["events"] = _last_events(back)
                 print(f"{p['name']}: return leg failed ({back.get('reason')}); stopping here")
+                _print_events(entry["replay_back"]["events"])
                 aborted = True
                 break
     finally:

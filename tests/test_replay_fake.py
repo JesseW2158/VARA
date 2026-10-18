@@ -529,9 +529,19 @@ def test_torque_off_at_entry_is_an_error_without_a_freeze(poses):
     assert d.commands == [] and not d.stopped and not d.torque
 
 
-def test_hold_value_not_the_reading_is_commanded_after_a_close(poses):
-    # the hold is the contact reading minus 3 (0-100 scale): 0.27 for a reading of 0.30; the rise, a live
-    # home and the next path must keep commanding 0.27, never the present reading
+def test_hold_value_not_the_reading_is_commanded_after_a_close(poses, monkeypatch, tmp_path):
+    # the hold is the contact reading minus 3 (0-100 scale): 0.27 for a reading of 0.30 on the kit's 0-100
+    # gripper map (pinned here, whatever this arm's config/joint_map.yaml says); the rise, a live home and the
+    # next path must keep commanding 0.27, never the present reading
+    jm = tmp_path / "kit_joint_map.yaml"
+    jm.write_text("gripper: {closed_pct: 0, open_pct: 100}\n", encoding="utf-8")
+    ob = tmp_path / "kit_objects.yaml"
+    ob.write_text(
+        "11: {name: juice_box, kind: object, shape: box, h: 0.105, held_min: 8}\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(driver_mod, "JOINT_MAP_PATH", jm)
+    monkeypatch.setattr(driver_mod, "OBJECTS_PATH", ob)
+    monkeypatch.setattr(replay, "OBJECTS_PATH", ob)
     close = {"kind": "grip", "action": "close", "object": "juice_box", "expect_held": True}
     d = FakeDriver(q0=poses["pick"], gripper0=1.0)
     d.gripper_reading_override = 0.30

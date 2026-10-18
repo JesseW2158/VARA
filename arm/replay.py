@@ -550,6 +550,28 @@ def shrunk_box(box: Box, inset: float) -> dict[str, list[float]]:
     return {axis: [float(box[axis][0]) + inset, float(box[axis][1]) - inset] for axis in "xyz"}
 
 
+SAG_RECOVERY_M = 0.05  # a bridge may start at most this far behind the box's near edge (sag at home)
+SAG_SLACK_M = 0.005  # the recovery box's near edge sits this far behind the start (joint-sweep wobble)
+
+
+def sag_recovery_box(box: Box, tip: Sequence[float]) -> dict[str, list[float]] | None:
+    """The box a bridge may use when its measured start lies just behind the workspace box's near edge:
+    the workspace box with its near edge moved back to the start (less SAG_SLACK_M). None when the start
+    is inside the box, more than SAG_RECOVERY_M behind the near edge, or outside any other face (beyond the
+    far edge, to a side, below the floor, above the ceiling): those starts need the home move."""
+    x, y, z = (float(v) for v in tip)
+    behind = float(box["x"][0]) - x
+    if not 0.0 < behind <= SAG_RECOVERY_M:
+        return None
+    if not (float(box["y"][0]) <= y <= float(box["y"][1]) and float(box["z"][0]) <= z <= float(box["z"][1])):
+        return None
+    return {
+        "x": [x - SAG_SLACK_M, float(box["x"][1])],
+        "y": [float(box["y"][0]), float(box["y"][1])],
+        "z": [float(box["z"][0]), float(box["z"][1])],
+    }
+
+
 def inside_box(point: Sequence[float], box: Box, tol: float = 0.0) -> bool:
     """True when `point` is inside `box`, allowing `tol` meters beyond each face."""
     return all(
@@ -937,14 +959,41 @@ class Session:
         return None, problems, ""
 
     def bridge_to(self, q_target: Sequence[float], *, where: str = "bridge") -> None:
-        """Move to `q_target` at <= BRIDGE_STEP_RAD per tick along `plan_path` (sweep, else straight line)."""
-        path, problems, how = self.plan_path(q_target)
+        """Move to `q_target` at <= BRIDGE_STEP_RAD per tick along `plan_path` (sweep, else straight line).
+
+        A start just behind the box's near edge (the real arm sags back at home under its own weight, about
+        3 cm on 2026-10-18) bridges back into the box under `sag_recovery_box`, for this bridge only; any
+        other start outside the box is refused ("run home first"). The gate box is restored afterwards, so
+        the trajectory's own waypoints are checked against the workspace box as before."""
+        box = self.box
+        if not inside_box(self.tip, self.box, BOX_GATE_M):
+            x, y, z = self.tip
+            recovery = sag_recovery_box(self.box, self.tip)
+            if recovery is None:
+                self.emit(
+                    f"{where} refused: the arm starts outside the workspace box at "
+                    f"({x:.3f}, {y:.3f}, {z:.3f}); run home first"
+                )
+                raise Abort("error")
+            box = recovery
+            behind = float(self.box["x"][0]) - x
+            self.emit(
+                f"{where}: the arm starts {behind * 100:.1f} cm behind the box's near edge (sag at home); "
+                "bridging back into the box"
+            )
+        path, problems, how = self.plan_path(q_target, box=box)
         if path is None:
             for problem in problems[:5]:
                 self.emit(f"{where} refused: {problem}")
             raise Abort("error")
         self.emit(f"{where}: {len(path)} steps" + ("" if how == "direct" else f" ({how})"))
-        self.stream(path, where=where)
+        previous = self.gate_box
+        if box is not self.box:
+            self.gate_box = box
+        try:
+            self.stream(path, where=where)
+        finally:
+            self.gate_box = previous
 
     def rise(self, dz: float, *, where: str = "rise") -> bool:
         """Lift the tip by `dz` (pitch kept, IK on the current tip, validated); False when skipped."""

@@ -246,7 +246,8 @@ def test_out_cli_writes_a_live_scene_file_the_arm_clis_can_read(tmp_path):
         set(scene["objects"]) == {"pill_bottle", "juice_box", "tea_tin"}
         and "cereal_box" in scene["obstacles"]
     )
-    assert scene_file_reader(str(out))()["zones"]["tray"]["r"] == pytest.approx(0.07)
+    # config/scene.yaml's zones (tray drop area, hand-off point) reach the arm CLIs' reader unchanged
+    assert scene_file_reader(str(out))()["zones"] == load_scene_cfg()["zones"]
     assert set(_seen_flags(scene).values()) == {False}  # the writer stopped: nothing is left marked seen
     time.sleep(0.02)
     assert scene_mod.main(["--fake", "--out", str(out), "--seconds", "0.4"]) == 0

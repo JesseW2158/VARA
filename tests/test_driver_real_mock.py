@@ -923,3 +923,34 @@ def test_driver_gripper_scale_methods_match_the_module():
     assert d.gripper_to_pct(0.4) == driver.gripper_to_pct(0.4) == pytest.approx(40.0)
     assert d.held_threshold("juice_box") == driver.held_threshold("juice_box")
     assert d.empty_closed_reading() == driver.empty_closed_reading() == 0.0
+
+
+def test_a_gripper_open_past_open_pct_is_warned_once_before_the_first_command(monkeypatch, tmp_path, caplog):
+    # open_pct 51 (2026-10-18): jaws left at ~98 % by an older map read as 1.0, so the first command
+    # closes them to 51 % with no gripper move asked for; the driver says so once.
+    jm = tmp_path / "joint_map.yaml"
+    jm.write_text("gripper: {closed_pct: 0, open_pct: 51}\n", encoding="utf-8")
+    monkeypatch.setattr(driver, "JOINT_MAP_PATH", jm)
+    d, _log, robots = build()
+    d.connect()
+    lo, hi = RANGES[GRIPPER]
+    robots[0].bus.present[GRIPPER] = int(lo + 0.98 * (hi - lo))
+    with caplog.at_level("WARNING", logger=driver.log.name):
+        q, g = d.read()
+        d.read()
+    assert g == 1.0
+    warnings = [r for r in caplog.records if "past open_pct" in r.getMessage()]
+    assert len(warnings) == 1 and "98.0 %" in warnings[0].getMessage()
+
+
+def test_a_gripper_inside_the_map_is_not_warned(monkeypatch, tmp_path, caplog):
+    jm = tmp_path / "joint_map.yaml"
+    jm.write_text("gripper: {closed_pct: 0, open_pct: 51}\n", encoding="utf-8")
+    monkeypatch.setattr(driver, "JOINT_MAP_PATH", jm)
+    d, _log, robots = build()
+    d.connect()
+    lo, hi = RANGES[GRIPPER]
+    robots[0].bus.present[GRIPPER] = int(lo + 0.40 * (hi - lo))
+    with caplog.at_level("WARNING", logger=driver.log.name):
+        d.read()
+    assert not [r for r in caplog.records if "past open_pct" in r.getMessage()]

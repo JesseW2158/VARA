@@ -58,7 +58,7 @@ The prompt holds the Robot API and its notes from Contracts verbatim, the candid
 
 1. Nearest object first, default parameters.
 2. Farthest object first.
-3. Set `transit_z` to the tallest obstacle plus 0.08 m on every pick and place.
+3. Set `transit_z` to the tallest object or obstacle plus 0.08 m on every pick and place.
 4. Route around obstacles: rise, move out to x = 0.32 m, then sideways.
 5. Slow down to 0.08 m/s and use pitch -π/4 for targets beyond 0.30 m from the base.
 6. Fill tray slots far side first, and retry a failed grasp once.

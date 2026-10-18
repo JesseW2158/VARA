@@ -27,4 +27,8 @@ shoulder_lift: {sign: 1, offset_deg: -1.582}
 elbow_flex: {sign: 1, offset_deg: -8.044}
 wrist_flex: {sign: 1, offset_deg: -1.055}
 wrist_roll: {sign: 1, offset_deg: 3.473}
-gripper: {closed_pct: 0, open_pct: 100, empty_closed_pct: 1.9}
+# open_pct 51 makes our gripper 1.0 the model's full opening (1.17 rad of jaw swing from closed, about 10 cm
+# between the tips, arm/sim_robot.py). The calibrated range reaches about 134 degrees (15 cm measured
+# 2026-10-18), so 100 would open the real jaws about 5 cm wider than the plans allow for. Closed is raw 2047
+# (2.2 %); 763 ticks (1.17 rad) further is raw 2810 = 51 % of the 2012-3577 range.
+gripper: {closed_pct: 0, open_pct: 51, empty_closed_pct: 1.9}

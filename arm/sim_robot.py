@@ -1150,12 +1150,23 @@ class SimRobot:
         return True
 
     def _rise(self, transit_z: Any) -> bool:
-        """Rise vertically at the current xy to transit_z on the grasp center (straight line)."""
+        """Rise vertically at the current xy to transit_z on the grasp center (straight line).
+
+        A transit_z below the grasp makes this leg a descent. Where no straight descent exists (folded at
+        home near the base, the jaws cannot point down below about 0.19 m), the leg is skipped without an
+        IK failure: the travel that follows reaches transit_z on its own. A short obstacle (transit_z =
+        tallest + 0.08 m, 0.137 m for the 2026-10-18 tape measure) otherwise failed every pick from home.
+        """
         tz = _finite(transit_z)
         if tz is None:
             self._stats["ik_failures"] += 1
             return False
-        (gx, gy, _gz), _ = ik.fk_grasp(self._q_cmd)
+        (gx, gy, gz), _ = ik.fk_grasp(self._q_cmd)
+        if tz < gz:
+            path = self._plan(GRASP_SITE, (gx, gy, tz), -math.pi / 2, LEG_SPEED, self._q_cmd, straight=True)
+            if path is not None:
+                self._run_path(path)
+            return True
         return self._move(GRASP_SITE, (gx, gy, tz), -math.pi / 2, LEG_SPEED, straight=True)
 
     def _travel(self, xy: tuple[float, float], transit_z: Any, roll: float | None = None) -> bool:

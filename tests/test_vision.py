@@ -18,7 +18,9 @@ import cv2
 import numpy as np
 import pytest
 from jsonschema import Draft202012Validator
+from vision_kit import write_kit_layout
 
+from vision import calibrate as calibrate_mod
 from vision import cameras as cameras_mod
 from vision import scene as scene_mod
 from vision.calibrate import (
@@ -69,6 +71,13 @@ def fake_scene():
 @pytest.fixture(scope="module")
 def homography(cfg):
     return synthetic_homography(cfg)
+
+
+@pytest.fixture(scope="module")
+def kit(tmp_path_factory):
+    """The frozen kit layout (tests/vision_kit.py) for tests whose expectations depend on where items land
+    in the synthetic image; the live config describes the measured table and the real props."""
+    return write_kit_layout(tmp_path_factory.mktemp("vision-kit"))
 
 
 @pytest.fixture
@@ -213,8 +222,13 @@ def test_fit_homography_needs_four_points():
         fit_homography([(0, 0), (1, 0), (0, 1), (1, 1)], [(0, 0), (1, 0), (0, 1)])
 
 
-def test_committed_homography_matches_synthetic(homography):
-    assert np.allclose(load_homography(), homography, atol=1e-9)
+def test_fake_calibration_writes_the_synthetic_homography(homography, tmp_path):
+    # `python -m vision.calibrate --fake` writes exactly the synthetic camera's homography of
+    # config/scene.yaml and load_homography reads it back. Checked on a file in tmp_path, not the committed
+    # config/homography.npy, which becomes the measured calibration of the physical camera (D6).
+    out = tmp_path / "homography.npy"
+    assert calibrate_mod.main(["--fake", "--out", str(out)]) == 0
+    assert np.allclose(load_homography(out), homography, atol=1e-9)
 
 
 # -- FakeCamera -----------------------------------------------------------------------------------------
@@ -683,16 +697,16 @@ def test_running_snapshot_fails_fast_when_every_grab_raises(fake_scene, cfg, tab
         tr.close()
 
 
-def test_fake_camera_item_markers_cover_the_calibration_markers_under_them(
-    fake_scene, cfg, table, homography
-):
-    moved = copy.deepcopy(fake_scene)
+def test_fake_camera_item_markers_cover_the_calibration_markers_under_them(kit):
+    cfg, table = kit.cfg(), kit.table()  # the kit layout: the positions below land on those table markers
+    moved = copy.deepcopy(kit.fake_scene())
     moved["objects"]["tea_tin"].update(x=0.40, y=0.25)  # its raised marker lands on calib 4 in the image
     moved["objects"]["juice_box"].update(x=0.10, y=-0.25)  # on calib 1
     moved["objects"]["pill_bottle"].update(x=0.10, y=0.25)  # on calib 0
     moved["obstacles"]["cereal_box"].update(x=0.36, y=-0.17)  # on calib 7
     cam = FakeCamera(moved, scene_cfg=cfg, objects=table)
-    tr = SceneTracker(cam, homography, table, cfg)
+    assert cam.hidden_calibration_ids() == {0, 1, 4, 7}
+    tr = SceneTracker(cam, synthetic_homography(cfg), table, cfg)
     for _ in range(3):
         tr.step()
     scene = tr.latest()
@@ -891,8 +905,9 @@ def test_load_objects_rejects_a_missing_size_and_a_nonpositive_height(tmp_path):
     assert names == {"pill_bottle", "juice_box", "tea_tin", "cereal_box", "hand"}  # the real config loads
 
 
-def test_fake_camera_paints_table_markers_under_the_raised_ones(fake_scene, cfg, table):
-    moved = copy.deepcopy(fake_scene)
+def test_fake_camera_paints_table_markers_under_the_raised_ones(kit):
+    cfg, table = kit.cfg(), kit.table()  # the kit layout: the positions below land on those table markers
+    moved = copy.deepcopy(kit.fake_scene())
     moved["objects"]["tea_tin"].update(x=0.40, y=0.25)
     moved["objects"]["juice_box"].update(x=0.10, y=-0.25)
     moved["objects"]["pill_bottle"].update(x=0.10, y=0.25)

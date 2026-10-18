@@ -16,7 +16,7 @@ def run(robot, args):
     scene = robot.scene()
     objs = scene["objects"]
     tray = scene["zones"]["tray"]
-    tallest = max([o["h"] for o in scene["obstacles"].values()] + [0.0])
+    tallest = max([o["h"] for o in [*scene["obstacles"].values(), *scene["objects"].values()]] + [0.0])
     transit = tallest + 0.08
     todo = [name for name in objs if objs[name]["seen"]]
     release = tray["wall"] + max([objs[name]["h"] for name in todo] + [0.0]) + 0.01

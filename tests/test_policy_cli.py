@@ -517,7 +517,8 @@ def test_trace_flags_an_interval_over_its_cap():
 
 def test_marker_target_rules():
     scene = json.loads(json.dumps(FAKE_SCENE))
-    assert pr.marker_target(scene, 12) == ("tea_tin", (0.16, -0.02, 0.09))
+    tea = scene["objects"]["tea_tin"]  # the marker lies on the top face: the target is (x, y, h)
+    assert pr.marker_target(scene, 12) == ("tea_tin", (tea["x"], tea["y"], tea["h"]))
     assert pr.marker_target(scene, 30)[0] == "cereal_box"
     scene["objects"]["tea_tin"]["seen"] = False
     scene["obstacles"]["cereal_box"]["seen"] = False

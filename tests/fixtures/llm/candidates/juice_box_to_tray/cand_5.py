@@ -25,7 +25,7 @@ def run(robot, args):
     if TARGET not in objs or not objs[TARGET]["seen"]:
         return False
     box = objs[TARGET]
-    cruise = max([o["h"] for o in scene["obstacles"].values()] + [0.0]) + 0.08
+    cruise = max([o["h"] for o in [*scene["obstacles"].values(), *scene["objects"].values()]] + [0.0]) + 0.08
     if not robot.pick(TARGET):
         return False
     slot = far_row_slot(tray)

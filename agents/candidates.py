@@ -106,7 +106,7 @@ SKILL_LISTS: tuple[str, ...] = ("all", "starter", "none")  # the `--skills` choi
 HINTS: tuple[str, ...] = (
     "Nearest object first, default parameters.",
     "Farthest object first.",
-    "Set `transit_z` to the tallest obstacle plus 0.08 m on every pick and place.",
+    "Set `transit_z` to the tallest object or obstacle plus 0.08 m on every pick and place.",
     "Route around obstacles: rise, move out to x = 0.32 m, then sideways.",
     "Slow down to 0.08 m/s and use pitch -π/4 for targets beyond 0.30 m from the base.",
     "Fill tray slots far side first, and retry a failed grasp once.",
@@ -132,7 +132,8 @@ STARTER_EXAMPLES: dict[str, dict[str, Any]] = {
             "    scene = robot.scene()\n"
             '    if name not in scene["objects"] or not scene["objects"][name]["seen"]:\n'
             "        return False\n"
-            '    tallest = max([o["h"] for o in scene["obstacles"].values()] + [0.0])\n'
+            '    tallest = max([o["h"] for o in [*scene["obstacles"].values(), '
+            '*scene["objects"].values()]] + [0.0])\n'
             "    if not robot.pick(name, transit_z=tallest + 0.08):\n"
             "        return False\n"
             "    return robot.carry_to_hand()\n"
@@ -147,7 +148,7 @@ STARTER_EXAMPLES: dict[str, dict[str, Any]] = {
             "english": "The object ends inside the tray.",
         },
         "code": (
-            '"""place_in_tray: put the named object into the tray, rising above every obstacle."""\n'
+            '"""place_in_tray: put the named object into the tray, rising above everything on the table."""\n'
             "import math\n"
             "\n"
             "\n"
@@ -156,7 +157,8 @@ STARTER_EXAMPLES: dict[str, dict[str, Any]] = {
             "    scene = robot.scene()\n"
             '    if name not in scene["objects"] or not scene["objects"][name]["seen"]:\n'
             "        return False\n"
-            '    transit = max([o["h"] for o in scene["obstacles"].values()] + [0.0]) + 0.08\n'
+            '    transit = max([o["h"] for o in [*scene["obstacles"].values(), '
+            '*scene["objects"].values()]] + [0.0]) + 0.08\n'
             "    if not robot.pick(name, transit_z=transit):\n"
             "        return False\n"
             '    if not robot.place_in_zone("tray", transit_z=transit):\n'

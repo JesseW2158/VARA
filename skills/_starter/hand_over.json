@@ -22,7 +22,7 @@
     },
     "english": "The object leaves its spot and the user takes it from the gripper."
   },
-  "code": "import math\n\ndef run(robot, args):\n    scene = robot.scene()\n    tallest = max([o[\"h\"] for o in scene[\"obstacles\"].values()] + [0.0])\n    if not robot.pick(args[\"object\"], transit_z=tallest + 0.08):\n        return False\n    return robot.carry_to_hand()\n",
+  "code": "import math\n\ndef run(robot, args):\n    scene = robot.scene()\n    tallest = max([o[\"h\"] for o in [*scene[\"obstacles\"].values(), *scene[\"objects\"].values()]] + [0.0])\n    if not robot.pick(args[\"object\"], transit_z=tallest + 0.08):\n        return False\n    return robot.carry_to_hand()\n",
   "sim": {
     "successes": 5,
     "trials": 5

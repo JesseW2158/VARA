@@ -1115,6 +1115,7 @@ class Driver(_DriverBase):
         self._id = follower_id
         self._robot_factory = robot_factory or _lerobot_robot_factory
         self._robot: Any = None
+        self._warned_over_open = False  # read(): the over-open gripper warning, once per Driver
 
     @property
     def robot(self) -> Any:
@@ -1235,7 +1236,19 @@ class Driver(_DriverBase):
             obs = self._robot.get_observation()
             jm = joint_map()
             q = [_lerobot_to_rad(j, float(obs[f"{j}.pos"]), jm) for j in JOINTS]
-            return q, _pct_to_gripper(float(obs[f"{GRIPPER}.pos"]), jm)
+            pct = float(obs[f"{GRIPPER}.pos"])
+            g = jm["gripper"]
+            beyond = pct - g["open_pct"] if g["open_pct"] >= g["closed_pct"] else g["open_pct"] - pct
+            if beyond > GRIP_STILL_PCT and self.last_command is None and not self._warned_over_open:
+                # Opened past open_pct (teleop, by hand, or a map with a wider open_pct): the reading clamps
+                # to 1.0, so the first command re-sends 1.0 and closes the jaws to open_pct unannounced.
+                self._warned_over_open = True
+                log.warning(
+                    "gripper reads %.1f %%, past open_pct %.1f %%: the next command closes the jaws to it",
+                    pct,
+                    g["open_pct"],
+                )
+            return q, _pct_to_gripper(pct, jm)
 
     def _send(self, q: list[float], gripper: float) -> None:
         jm = joint_map()

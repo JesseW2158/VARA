@@ -9,7 +9,7 @@ seconds, and "limit hit" means a joint came within 1 degree of its range.
 {{FAILURES}}
 
 Study why each one failed, then write a new program that avoids every failure above. Typical fixes: set
-`transit_z` to the tallest obstacle plus 0.08 m on every pick and place so the arm rises above obstacles;
+`transit_z` to the tallest object or obstacle plus 0.08 m on every pick and place so the arm, and anything it carries, rises above everything on the table;
 use `place_in_zone("tray", ...)` instead of a hand-picked drop point; check every return value; use the
 scene's own positions instead of constants.
 

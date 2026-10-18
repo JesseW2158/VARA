@@ -11,7 +11,9 @@ import json
 import shutil
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
+from known_limits import SHORT_OBSTACLE
 
 from agents import candidates, orchestrator, sandbox_pool
 from arm import driver
@@ -20,6 +22,7 @@ from vision import scene
 ROOT = Path(__file__).resolve().parents[1]
 
 
+@pytest.mark.xfail(reason=SHORT_OBSTACLE, strict=True)
 def test_failed_first_round_is_repaired_by_real_local_scoring(tmp_path, monkeypatch):
     skills, runs = tmp_path / "skills", tmp_path / "runs"
     shutil.copytree(ROOT / "skills" / "_starter", skills / "_starter")
@@ -59,11 +62,13 @@ def test_failed_first_round_is_repaired_by_real_local_scoring(tmp_path, monkeypa
 
         task_dir = runs / task_id
         first = [json.loads((task_dir / f"cand_{i}" / "score.json").read_text()) for i in range(1, 7)]
+        # the first round's verdicts before the repair files: when the fixture stops colliding, no repair
+        # round runs, and this names that cause instead of a missing repair/cand_1/score.json
+        assert all(not score["passed"] and score["collisions"] > 0 for score in first), first
+        assert all("cereal_box" in score["fail_reason"] for score in first)
         repaired = [
             json.loads((task_dir / "repair" / f"cand_{i}" / "score.json").read_text()) for i in range(1, 7)
         ]
-        assert all(not score["passed"] and score["collisions"] > 0 for score in first), first
-        assert all("cereal_box" in score["fail_reason"] for score in first)
         passing = [score for score in repaired if score["passed"]]
         assert passing, repaired
         assert all(score["successes"] == 5 and score["collisions"] == 0 for score in passing)

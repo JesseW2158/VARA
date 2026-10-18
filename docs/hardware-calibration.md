@@ -96,10 +96,12 @@ or outside the 6 to 11 cm height rule, a blank jaw answer, an object the jaws di
 
 The command then prints the exact lines to paste:
 
-- `gripper: {closed_pct: 0, open_pct: 100, empty_closed_pct: Z, jaw_open_mm: J}` replaces the
+- `gripper: {closed_pct: 0, open_pct: P, empty_closed_pct: Z, jaw_open_mm: J}` replaces the
   `gripper:` line of `config/joint_map.yaml`. `closed_pct` and `open_pct` are the command endpoints
-  of the current map (0 and 100 after `lerobot-calibrate`), `empty_closed_pct` the measured close
-  on nothing; `jaw_open_mm` is a note the loader ignores.
+  of the current map, copied from it: this arm uses 0 and 51, so our gripper 1.0 opens the jaws about
+  9.7 cm, the opening the simulation plans with (100 would open them about 15 cm). `empty_closed_pct`
+  is the measured close on nothing; `jaw_open_mm` is a note the loader ignores. A gripper left open
+  past `open_pct` (by teleop or an older map) reads as 1.0 and closes to `open_pct` on the next command.
 - `held_min: V` goes on each object's entry in `config/objects.yaml`.
 
 Then run `pytest -q tests/test_config.py`. `--fake --measure-grip --grasps 2 --fake-contact 25` is

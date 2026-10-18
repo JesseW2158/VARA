@@ -1,18 +1,20 @@
-# Measured once per table setup. Units: meters and radians. Placeholders until B4, B5 and A10 measure them.
+# Measured once per table setup. Units: meters and radians. camera and calib_markers were tape-measured on
+# 2026-10-18; workspace, zones and home_q are the sim layout until A15 re-tapes the table and A10 agrees
+# the home pose.
 workspace: {x: [0.10, 0.40], y: [-0.25, 0.25], z: [0.02, 0.30]}
 zones:
-  tray: {x: 0.30, y: 0.22, r: 0.07, wall: 0.035, slots: [[0.275, 0.195], [0.325, 0.195], [0.275, 0.245], [0.325, 0.245]]}
+  tray: {x: 0.19, y: 0.17, r: 0.09, wall: 0.002, slots: [[0.13,0.15], [0.22,0.12], [0.2,0.22]]}
   handoff: {x: 0.28, y: -0.08, z: 0.10}  # moved off the cereal box's -y face (sim layout; A15 re-tapes it)
 camera:
-  Hc: 0.65            # lens height above the table (B4)
-  c: [0.20, -0.05]    # table point directly under the lens (B4)
-calib_markers:        # tape-measured centers of calibration markers 0-7 (B5)
+  Hc: 0.635           # lens height above the table (B4), tape 2026-10-18
+  c: [0.23, 0.0]      # table point directly under the lens (B4), plumb line 2026-10-18
+calib_markers:        # tape-measured centers of calibration markers 0-7 (B5), 2026-10-18
   0: [0.08, 0.34]
   1: [0.08, -0.34]
-  2: [0.27, 0.34]
-  3: [0.27, -0.34]
+  2: [0.28, 0.34]     # re-measured (first reading 0.19 was a slip; the camera fit on 0, 1, 4-7 said 0.28)
+  3: [0.28, -0.34]    # re-measured, as marker 2
   4: [0.46, 0.34]
   5: [0.46, -0.34]
-  6: [0.46, 0.17]
-  7: [0.46, -0.17]
+  6: [0.46, 0.19]
+  7: [0.46, -0.19]
 home_q: [0.0, -1.35, 0.02, 1.45, 0.0]  # folded up against the base: tip (0.11, 0, 0.27), jaws level. Placeholder until A10/B4 agree a pose (the kit value put the gripper inside the tea tin)

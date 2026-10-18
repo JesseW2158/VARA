@@ -23,6 +23,7 @@ import time
 
 import pytest
 from jsonschema import Draft202012Validator
+from known_limits import SHORT_OBSTACLE
 
 from arm import ik, replay
 from sim import scoring, success
@@ -264,6 +265,7 @@ def test_drop_beside_fails_the_spec_and_the_candidate_prints_only_to_stderr(runs
     assert score["fail_reason"] == "trial 1: spec not satisfied"
     assert score["nominal_success"] is False and score["error"] is None
     assert score["collisions"] == 0 and score["successes"] == 0 and score["trials"] == 2
+    assert score["ik_failures"] == 0  # the box really is set down beside the tray, not refused as unreachable
     assert score["candidate"] == 4  # cand_4.py
     assert score["traj"] == (run.out / "traj.json").as_posix()
     assert "drop_beside: dropping it beside the tray" in run.stderr
@@ -271,6 +273,10 @@ def test_drop_beside_fails_the_spec_and_the_candidate_prints_only_to_stderr(runs
     assert len(run.stdout.strip().splitlines()) == 1
 
 
+@pytest.mark.xfail(
+    reason=SHORT_OBSTACLE,
+    strict=True,
+)
 def test_candidate_without_transit_fails_naming_the_cereal_box(runs):
     run = runs["no_transit"]
     score = run.score

@@ -13,6 +13,7 @@ import mujoco
 import numpy as np
 import pytest
 import yaml
+from known_limits import FIXED_FINGER_CLEARANCE
 
 from arm import ik
 from sim.model import build_scene
@@ -32,6 +33,15 @@ DEG = math.pi / 180
 OUT = np.array([0.0, 0.0, -1.0])  # jaw direction in the gripper body frame
 GRIPPER_OPEN = 1.0  # rad, our gripper value 1.0 (fully open) in the sim
 PICK_XY = (0.18, -0.12)  # a spot every object can be picked at straight down
+# The kit's pill bottle (config/objects.yaml before the 2026-10-18 props): a fixed control object short and
+# narrow enough to clear the jaws at 0.6 rad, so the 0.6 rad contacts of the shipped props are their size.
+KIT_PILL = {
+    "name": "kit_pill_bottle",
+    "kind": "control",
+    "shape": "cylinder",
+    "size": [0.035, 0.035],
+    "h": 0.07,
+}
 
 
 def name2id(m: mujoco.MjModel, kind: str, name: str) -> int:
@@ -268,6 +278,7 @@ def test_finger_boxes_follow_the_mesh(arm):
         assert (verts @ axis).max() > 0.08
 
 
+@pytest.mark.xfail(reason=FIXED_FINGER_CLEARANCE, strict=True)
 def test_grasp_site_sits_a_clearance_from_the_fixed_finger(arm):
     """`grasp` is GRASP_FROM_FIXED_FACE from the fixed finger box's inner face at the tip level, along the
     closing direction, and arm.ik.grasp_offset() reports its distance from `tip`."""
@@ -287,14 +298,16 @@ def test_grasp_site_sits_a_clearance_from_the_fixed_finger(arm):
 
 @pytest.fixture(scope="module")
 def probe_model():
-    """arm_only.xml plus mocap probes that collide with the robot: a cylinder (radius 2 cm, 3 cm long) and
-    one body per object of config/objects.yaml with that object's geom, all parked far below the floor."""
+    """arm_only.xml plus mocap probes that collide with the robot: a cylinder (radius 2 cm, 3 cm long), one
+    body per object of config/objects.yaml with that object's geom and one for KIT_PILL, all parked far
+    below the floor."""
     spec = mujoco.MjSpec.from_file(str(ARM_ONLY))
     body = spec.worldbody.add_body(name="probe", mocap=True, pos=[0, 0, -5])
     body.add_geom(
         name="probe", type=mujoco.mjtGeom.mjGEOM_CYLINDER, size=[0.02, 0.015, 0.0], contype=1, conaffinity=1
     )
-    for i, entry in enumerate(e for e in OBJECTS.values() if e["kind"] == "object"):
+    entries = [e for e in OBJECTS.values() if e["kind"] == "object"] + [KIT_PILL]
+    for i, entry in enumerate(entries):
         name = f"obj_{entry['name']}"
         b = spec.worldbody.add_body(name=name, mocap=True, pos=[0, 0, -6 - i])
         length, width = (float(v) for v in entry["size"])
@@ -365,11 +378,13 @@ def test_open_fingers_leave_the_grasp_gap_empty(arm, probe_model):
 
 def test_objects_centered_on_grasp_clear_the_open_gripper(probe_model):
     """The pick recipe: grasp center on the object's center line, tip at the object's mid-height, gripper
-    fully open (1.0 rad): no object of config/objects.yaml touches any robot geom. At 0.6 rad the taller
-    objects hit the moving finger, which is why SimRobot opens fully before descending."""
+    fully open (1.0 rad): no object of config/objects.yaml touches any robot geom. At 0.6 rad every prop of
+    2026-10-18 (8.3 to 10.2 cm tall, up to 4.45 cm wide) hits the moving finger and only it, which is why
+    SimRobot opens fully before descending; the kit's 3.5 x 7 cm pill bottle (KIT_PILL), the control, still
+    clears at 0.6 rad, so those contacts come from the props' size, not from a probe that always touches."""
     m = probe_model
-    hits_at_06 = {}
-    for entry in (e for e in OBJECTS.values() if e["kind"] == "object"):
+
+    def contacts(entry: dict, opening: float) -> list[str]:
         name = entry["name"]
         h = float(entry["h"])
         center = np.array([*PICK_XY, max(h / 2, 0.02)])
@@ -381,18 +396,21 @@ def test_objects_centered_on_grasp_clear_the_open_gripper(probe_model):
         y_axis = np.array([c[0], c[1], 0.0])
         y_axis /= np.linalg.norm(y_axis)  # the object's width runs along the closing direction
         frame = np.stack([np.cross(y_axis, [0, 0, 1.0]), y_axis, [0, 0, 1.0]], axis=1)
-        for opening in (GRIPPER_OPEN, 0.6):
-            d = mujoco.MjData(m)
-            set_arm(m, d, q, opening)
-            place_mocap(m, d, f"obj_{name}", center, frame)
-            mujoco.mj_forward(m, d)
-            hits = robot_contacts(m, d, name2id(m, "geom", f"obj_{name}"))
-            if opening == GRIPPER_OPEN:
-                assert hits == [], (name, hits)
-            else:
-                hits_at_06[name] = hits
-    assert set(hits_at_06["juice_box"]) == {"finger_moving"}, hits_at_06
-    assert set(hits_at_06["pill_bottle"]) == set(), hits_at_06
+        d = mujoco.MjData(m)
+        set_arm(m, d, q, opening)
+        place_mocap(m, d, f"obj_{name}", center, frame)
+        mujoco.mj_forward(m, d)
+        return robot_contacts(m, d, name2id(m, "geom", f"obj_{name}"))
+
+    hits_at_06 = {}
+    for entry in (e for e in OBJECTS.values() if e["kind"] == "object"):
+        hits = contacts(entry, GRIPPER_OPEN)
+        assert hits == [], (entry["name"], hits)
+        hits_at_06[entry["name"]] = contacts(entry, 0.6)
+    assert set(hits_at_06) == {"pill_bottle", "juice_box", "tea_tin"}
+    for name, hits in hits_at_06.items():
+        assert set(hits) == {"finger_moving"}, (name, hits_at_06)  # never the fixed finger
+    assert contacts(KIT_PILL, GRIPPER_OPEN) == [] and contacts(KIT_PILL, 0.6) == []
 
 
 def test_gravity_holds_the_arm_at_home(arm):

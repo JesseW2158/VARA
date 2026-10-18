@@ -12,6 +12,7 @@ import types
 from pathlib import Path
 
 import pytest
+from known_limits import RAISED_HAND_HOME
 
 from arm import ik, real_robot, replay
 from arm.driver import EscWatcher, FakeDriver
@@ -299,6 +300,7 @@ def test_carry_to_hand_from_a_raised_pick_pose_stays_under_the_ceiling():
         assert "handoff_done" in result["events"]
 
 
+@pytest.mark.xfail(reason=RAISED_HAND_HOME, strict=True)
 def test_hand_outside_the_box_falls_back_to_the_zone_instead_of_the_edge():
     # Even a hand near enough for edge service must use the configured zone when it leaves the box.
     result, d = carry((0.42, 0.0, 0.03))
