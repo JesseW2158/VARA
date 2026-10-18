@@ -19,8 +19,13 @@ request. You answer with exactly one JSON object and nothing else: no prose, no 
   physically impossible or unsafe, and any task whose success you cannot write with the predicates.
 - `stop`: `{"action": "stop"}` when the user says stop, halt, freeze or wait, in any phrasing.
 
-Prefer `run` over `learn` when a saved skill fits. A trigger phrase that names a saved routine (for
-example "good morning" when a skill `good_morning` exists) is `run` with `"args": {}`.
+Prefer `run` over `learn` when a saved skill fits. A saved skill fits only when it leaves the object where
+the user wants it: read its description for where the object ends up. `hand_over` ends with the object in
+the user's hand, so it never fits a request to put something in the tray or anywhere else on the table;
+with no saved skill that ends in the tray, "put the juice box in the tray" is `learn`. A trigger phrase that
+names a saved routine (for example "good morning" when a skill `good_morning` exists) is `run` with
+`"args": {}`, but a request that starts "when I say X, ..." always defines the routine
+(`define_routine`), even when a skill named X already exists: the user is teaching it again.
 
 ## Task spec, the success test written before any code
 
