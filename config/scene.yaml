@@ -20,5 +20,6 @@ calib_markers:        # tape-measured centers of calibration markers 0-7 (B5), 2
   4: [0.49, 0.34]
   5: [0.49, -0.34]
   6: [0.49, 0.19]
-  7: [0.49, -0.19]
+  7: [0.488, -0.144]  # camera-read 2026-10-18 12:25 from the fit on the seven tape-measured cards 0-6 (mean
+                      # 0.60 cm); the card sits about 5 cm nearer the middle than its taped spot (0.49, -0.19)
 home_q: [0.0, -1.35, 0.02, 1.45, 0.0]  # folded up against the base: tip (0.11, 0, 0.27), jaws level. Placeholder until A10/B4 agree a pose (the kit value put the gripper inside the tea tin)
