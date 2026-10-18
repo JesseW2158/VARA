@@ -118,3 +118,30 @@ def test_a_start_behind_the_near_edge_and_above_the_ceiling_is_refused():
     assert not result["ok"] and result["reason"] == "error"
     assert any("run home first" in e for e in result["events"]), result["events"]
     assert d.commands == []
+
+
+def test_the_same_driver_continues_from_its_last_command_and_never_walks_the_goal_out():
+    # the real trigger (review 2026-10-18): one driver across replays, the last leg ended at home, and the
+    # arm reads sagged behind the near edge while its goal is still home
+    d = FakeDriver(q0=HOME, gripper0=1.0)
+    d.command(HOME, 1.0)
+    d.set_present(SAGGED)
+    sent_before = len(d.commands)
+    result = replay.replay(_hover_traj(), driver=d, realtime=False)
+    assert result["ok"], result["events"]
+    assert not any("behind the box's near edge" in e for e in result["events"])  # no recovery needed
+    box = replay.load_box()
+    sent = [q for q, _g in d.commands[sent_before:]]
+    assert sent
+    outside = [ik.fk_tip(q) for q in sent if not replay.inside_box(ik.fk_tip(q), box, replay.BOX_GATE_M)]
+    assert outside == []
+
+
+@pytest.mark.parametrize(
+    ("label", "tip"),
+    [("low, beside the base", (0.06, 0.10, 0.07)), ("at table height", (0.061, 0.0, 0.038))],
+)
+def test_a_start_behind_the_edge_far_from_home_is_not_recovered(label, tip):
+    box = replay.load_box()
+    assert replay.sag_recovery_box(box, tip) is None, label
+    assert replay.sag_recovery_box(box, ik.fk_tip(SAGGED)) is not None  # the home sag still is

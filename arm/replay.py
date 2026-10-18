@@ -30,7 +30,11 @@ as a problem rather than raised, and a waypoint value too large for a float is "
    the hand and the box: outside `carry_to_hand`, a wristband seen within HAND_FREEZE_M of the tip freezes
    the arm (`hand_too_close`); within HAND_SLOW_M the tip moves at most TIP_SPEED_NEAR_HAND, elsewhere at
    most TIP_SPEED_MAX, by splitting a waypoint over several ticks; a tick whose tip would be more than
-   BOX_GATE_M outside the workspace box is never sent (the arm freezes, `error`), whatever planned it. A
+   BOX_GATE_M outside the workspace box is never sent (the arm freezes, `error`), whatever planned it. The
+   one exception is the bridge out of a fresh connect whose measured start sags just behind the box's near
+   edge next to home (`sag_recovery_box`): that bridge is gated against the box with its near edge moved
+   back to the start, and only while it moves back in. A run continues from the driver's last command
+   when there is one, never from a sagged reading. A
    gripper close within HAND_FREEZE_M of a seen wristband is refused and aborts like a missed grasp with
    reason `hand_too_close` (the abort's own moves still run the hand check, so with the hand still there
    the arm simply freezes).
@@ -551,19 +555,33 @@ def shrunk_box(box: Box, inset: float) -> dict[str, list[float]]:
 
 
 SAG_RECOVERY_M = 0.05  # a bridge may start at most this far behind the box's near edge (sag at home)
+SAG_NEAR_HOME_M = 0.06  # ... and only this close to the home tip: the sag is a home-pose effect
 SAG_SLACK_M = 0.005  # the recovery box's near edge sits this far behind the start (joint-sweep wobble)
 
 
-def sag_recovery_box(box: Box, tip: Sequence[float]) -> dict[str, list[float]] | None:
-    """The box a bridge may use when its measured start lies just behind the workspace box's near edge:
-    the workspace box with its near edge moved back to the start (less SAG_SLACK_M). None when the start
-    is inside the box, more than SAG_RECOVERY_M behind the near edge, or outside any other face (beyond the
-    far edge, to a side, below the floor, above the ceiling): those starts need the home move."""
+def home_tip(path: Path | str | None = None) -> Vec3:
+    """The tip of config/scene.yaml's `home_q`."""
+    file = Path(path) if path is not None else SCENE_PATH
+    raw = yaml.safe_load(file.read_text(encoding="utf-8"))
+    x, y, z = _ik().fk_tip([float(v) for v in raw["home_q"]])
+    return (float(x), float(y), float(z))
+
+
+def sag_recovery_box(
+    box: Box, tip: Sequence[float], home: Sequence[float] | None = None
+) -> dict[str, list[float]] | None:
+    """The box a bridge may use when its measured start (a fresh connect, so the goal is that reading) lies
+    just behind the workspace box's near edge next to home, where the folded arm sags under its own weight:
+    the workspace box with its near edge moved back to the start (less SAG_SLACK_M). None when the start is
+    inside the box, more than SAG_RECOVERY_M behind the near edge, more than SAG_NEAR_HOME_M from the home
+    tip (`home`, default `home_tip()`), or outside any other face: those starts need the home move."""
     x, y, z = (float(v) for v in tip)
     behind = float(box["x"][0]) - x
     if not 0.0 < behind <= SAG_RECOVERY_M:
         return None
     if not (float(box["y"][0]) <= y <= float(box["y"][1]) and float(box["z"][0]) <= z <= float(box["z"][1])):
+        return None
+    if math.dist((x, y, z), home if home is not None else home_tip()) > SAG_NEAR_HOME_M:
         return None
     return {
         "x": [x - SAG_SLACK_M, float(box["x"][1])],
@@ -964,7 +982,16 @@ class Session:
         A start just behind the box's near edge (the real arm sags back at home under its own weight, about
         3 cm on 2026-10-18) bridges back into the box under `sag_recovery_box`, for this bridge only; any
         other start outside the box is refused ("run home first"). The gate box is restored afterwards, so
-        the trajectory's own waypoints are checked against the workspace box as before."""
+        the trajectory's own waypoints are checked against the workspace box as before.
+
+        The bridge starts from the driver's last command when there is one, not from the reading: the driver
+        clips every tick to 2 degrees from that command, so planning from a sagged reading would first walk
+        the goal back toward the sag, out of the box and unchecked (review, 2026-10-18). Only a fresh
+        connect (no last command; the goal is the reading) can start outside the box."""
+        last = self.driver.last_command
+        if last is not None:
+            self.q = [float(v) for v in last[0]]
+            self.tip = self._tip_of(self.q)
         box = self.box
         if not inside_box(self.tip, self.box, BOX_GATE_M):
             x, y, z = self.tip
