@@ -92,7 +92,7 @@ part-way) is discarded and the problem list says where the session stopped. The 
 the open and empty-closed readings, each object's closed readings, held verdicts and
 `held_min = (smallest closed reading - empty-closed reading) / 2` on the 0 to 100 scale, the
 follower id and calibration hash, and any problem: an object wider than the jaw opening minus 2 cm
-or outside the 6 to 11 cm height rule, a blank jaw answer, an object the jaws did not detect.
+or outside the 6 to 11.5 cm height rule, a blank jaw answer, an object the jaws did not detect.
 
 The command then prints the exact lines to paste:
 

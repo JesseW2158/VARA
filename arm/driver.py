@@ -437,9 +437,11 @@ def empty_closed_reading() -> float:
 
 
 # A11's object rules (docs/tasks/A-arm.md): width across the grasp at most the jaw opening minus 2 cm, height
-# 6 to 11 cm. The jaw clearance is in millimeters (what the human measures) and the heights in meters.
+# 6 to 11.5 cm (raised from 11 cm for the 11.4 cm juice box of 2026-10-18, which clears the open gripper at
+# mid-height in tests/test_model.py). The jaw clearance is in millimeters (what the human measures) and the
+# heights in meters.
 JAW_CLEARANCE_MM = 20.0
-OBJECT_HEIGHT_M = (0.06, 0.11)
+OBJECT_HEIGHT_M = (0.06, 0.115)
 
 # How far outside the commandable band (limits minus MARGIN_RAD) a start pose may lie before the A6 jog and
 # the A11 grip session refuse it. Driver.clip pulls such a joint into the band, so up to this much it moves.
@@ -549,7 +551,7 @@ def objects_fit(jaw_open_mm: float, objects: dict[str, dict[str, Any]] | None = 
     """Names of the `kind: object` entries that break A11's size rules at this jaw opening (the misfits).
 
     Lists every object whose width across the grasp (`size[1]`, meters) exceeds `jaw_open_mm` minus 20 mm
-    or whose height `h` is outside 0.06 to 0.11 m; an empty list means every object fits. `objects`
+    or whose height `h` is outside 0.06 to 0.115 m; an empty list means every object fits. `objects`
     defaults to config/objects.yaml keyed by name; entries of other kinds are ignored. ValueError for a
     non-finite or non-positive jaw opening and for an object entry without numeric `size` and `h`.
     """

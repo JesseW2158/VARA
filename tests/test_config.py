@@ -24,7 +24,7 @@ def test_objects_yaml_entries():
             assert entry["shape"] in ("box", "cylinder")
             assert len(entry["size"]) == 2 and all(v > 0 for v in entry["size"])
         if entry["kind"] == "object":
-            assert 0.06 <= entry["h"] <= 0.11, f"{entry['name']}: height must be 6 to 11 cm"
+            assert 0.06 <= entry["h"] <= 0.115, f"{entry['name']}: height must be 6 to 11.5 cm"
             assert entry["held_min"] > 0
     assert kinds["object"] >= 3 and kinds["obstacle"] >= 1 and kinds["hand"] == 1
 

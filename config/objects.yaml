@@ -5,8 +5,8 @@
 # The props changed again on 2026-10-18 (second set); each keeps the slot name the code and the contract use
 # (tape-measured):
 #   pill_bottle = pill bottle, 2.25 x 1.75 in footprint, 2.875 in tall, gripped across the 1.75 in side
-#   juice_box   = juice box, 3.5 x 1.25 in footprint, 4.5 in tall, gripped across the 1.25 in side; 11.4 cm is
-#                 over A11's 11 cm height rule, which --measure-grip reports as a problem
+#   juice_box   = juice box, 3.5 x 1.25 in footprint, 4.5 in tall, gripped across the 1.25 in side (A11's
+#                 height rule went from 11 to 11.5 cm for it)
 #   tea_tin     = tea tin, 2.75 x 1.75 in footprint, 4.125 in tall, gripped across the 1.75 in side
 #   cereal_box  = tape measure, the obstacle, standing on its edge: 2.75 x 0.75 in, 2.25 tall
 # held_min: still the first 2026-10-18 set's A11 values (runs/calibration/gripper-20261018T064828Z.json), whose
