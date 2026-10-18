@@ -9,14 +9,14 @@
 #                 height rule went from 11 to 11.5 cm for it)
 #   tea_tin     = tea tin, 2.75 x 1.75 in footprint, 4.125 in tall, gripped across the 1.75 in side
 #   cereal_box  = tape measure, the obstacle, standing on its edge: 2.75 x 0.75 in, 2.25 tall
-# held_min: still the first 2026-10-18 set's A11 values (runs/calibration/gripper-20261018T064828Z.json), whose
-# widths across the grasp were the same (1.75, 1.25 and 1.75 in). Re-measure with --measure-grip on these props
-# before any real pick.
-10: {name: pill_bottle, kind: object, shape: box, size: [0.0572, 0.0445], h: 0.0730, held_min: 9.6,
+# held_min: A11 on these props, 2026-10-18 11:14 (runs/calibration/gripper-20261018T151451Z.json, 5 grasps each,
+# all held, empty close 1.3): pill bottle closes at 24.4-25.2, juice box at 6.5-7.0, tea tin at 14.8-16.4. The
+# juice box squeezes: the rigid 1.25 in power bank closed at about 16.4, so the jaws crush it to about half width.
+10: {name: pill_bottle, kind: object, shape: box, size: [0.0572, 0.0445], h: 0.0730, held_min: 11.5,
     called: [pill bottle, pills, medicine, bottle]}
-11: {name: juice_box, kind: object, shape: box, size: [0.0889, 0.0318], h: 0.1143, held_min: 7.2,
+11: {name: juice_box, kind: object, shape: box, size: [0.0889, 0.0318], h: 0.1143, held_min: 2.6,
     called: [juice box, juice, drink]}
-12: {name: tea_tin, kind: object, shape: box, size: [0.0699, 0.0445], h: 0.1048, held_min: 7.4,
+12: {name: tea_tin, kind: object, shape: box, size: [0.0699, 0.0445], h: 0.1048, held_min: 6.7,
     called: [tea tin, tin, tea]}
 30: {name: cereal_box, kind: obstacle, shape: box, size: [0.0699, 0.0191], h: 0.0572,
     called: [tape measure, measuring tape]}
