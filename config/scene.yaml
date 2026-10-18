@@ -7,14 +7,16 @@ zones:
   handoff: {x: 0.28, y: -0.08, z: 0.10}  # moved off the cereal box's -y face (sim layout; A15 re-tapes it)
 camera:
   Hc: 0.635           # lens height above the table (B4), tape 2026-10-18
-  c: [0.23, 0.0]      # table point directly under the lens (B4), plumb line 2026-10-18
-calib_markers:        # tape-measured centers of calibration markers 0-7 (B5), 2026-10-18
-  0: [0.08, 0.34]
-  1: [0.08, -0.34]
-  2: [0.28, 0.34]     # re-measured (first reading 0.19 was a slip; the camera fit on 0, 1, 4-7 said 0.28)
-  3: [0.28, -0.34]    # re-measured, as marker 2
-  4: [0.46, 0.34]
-  5: [0.46, -0.34]
-  6: [0.46, 0.19]
-  7: [0.46, -0.19]
+  c: [0.26, 0.0]      # table point directly under the lens (B4), plumb line 2026-10-18 (+0.03, see below)
+calib_markers:        # tape-measured centers of calibration markers 0-7 (B5), 2026-10-18. The first tape
+                      # readings started 3 cm in front of the turning axis (marker 0 re-measured from the
+                      # axis: 0.11, not 0.08), so every x here is the reading + 0.03; I2 had the arm 3 cm short.
+  0: [0.11, 0.34]
+  1: [0.11, -0.34]
+  2: [0.31, 0.34]     # re-measured (first reading 0.19 was a slip; the camera fit on 0, 1, 4-7 said 0.28)
+  3: [0.31, -0.34]    # re-measured, as marker 2
+  4: [0.49, 0.34]
+  5: [0.49, -0.34]
+  6: [0.49, 0.19]
+  7: [0.49, -0.19]
 home_q: [0.0, -1.35, 0.02, 1.45, 0.0]  # folded up against the base: tip (0.11, 0, 0.27), jaws level. Placeholder until A10/B4 agree a pose (the kit value put the gripper inside the tea tin)
