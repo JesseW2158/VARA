@@ -965,6 +965,7 @@ def test_touch_markers_real_aborts_when_esc_lands_inside_connect(monkeypatch, tm
 
     for flag in ("FAKE", "FAKE_CAMERA", "FAKE_ROBOT"):
         monkeypatch.delenv(flag, raising=False)
+    monkeypatch.setenv("VARA_RUNS_DIR", str(tmp_path / "runs"))  # the A13 Esc record lands here
     monkeypatch.setattr(dotenv, "load_dotenv", lambda *args, **kwargs: False)
 
     class EscInsideConnect(driver_mod.FakeDriver):

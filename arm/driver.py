@@ -1720,6 +1720,11 @@ def esc_latency_ms(watcher: EscWatcher | None, driver: _DriverBase | None) -> fl
 ESC_PHASES = ("session", "connect")
 
 
+def esc_latency_path() -> Path:
+    """The A13 record file: `<runs>/calibration/esc-latency.jsonl` (runs/, or VARA_RUNS_DIR), resolved now."""
+    return _runs_dir() / "calibration" / "esc-latency.jsonl"
+
+
 def esc_phase(watcher: Any, connected_at: float | None) -> str:
     """Which phase an Esc press belongs to: "connect" or "session".
 
@@ -1756,7 +1761,7 @@ def record_esc_latency(
         raise ValueError(f"latency_ms must be finite or None, got {latency_ms!r}")
     if phase not in ESC_PHASES:
         raise ValueError(f"phase must be one of {ESC_PHASES}, got {phase!r}")
-    target = Path(path) if path is not None else _runs_dir() / "calibration" / "esc-latency.jsonl"
+    target = Path(path) if path is not None else esc_latency_path()
     target.parent.mkdir(parents=True, exist_ok=True)
     record = {
         "t": datetime.now().astimezone().isoformat(timespec="milliseconds"),
@@ -1784,7 +1789,7 @@ def esc_latency_report(path: str | Path | None = None, *, bar_ms: float = ESC_BA
     record is within the bar, 1 when any is not, 2 when the file is missing, empty or malformed or holds no
     session record. Touches no hardware.
     """
-    target = Path(path) if path is not None else _runs_dir() / "calibration" / "esc-latency.jsonl"
+    target = Path(path) if path is not None else esc_latency_path()
     if not target.is_file():
         print(f"no Esc records: {target} does not exist", file=sys.stderr)
         return 2

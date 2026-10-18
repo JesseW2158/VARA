@@ -1752,10 +1752,12 @@ def _record_dashboard_stop(driver: Any, reply: dict[str, Any]) -> None:
         or not getattr(driver, "connected", False)
     ):
         return
+    path = driver_mod.esc_latency_path()  # resolved now, with this request's VARA_RUNS_DIR, not in the thread
 
     def write() -> None:
         try:
             driver_mod.record_esc_latency(
+                path,
                 source=f"dashboard-{reply.get('source')}",
                 latency_ms=reply.get("press_to_freeze_ms"),
                 extra={"server_latency_ms": reply.get("latency_ms"), "task_id": reply.get("task_id")},
