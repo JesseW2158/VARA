@@ -1192,8 +1192,10 @@ class Driver(_DriverBase):
                 if not bus.is_calibrated:
                     raise RuntimeError(
                         f"calibration in the motors does not match the file for id '{follower_id}' (or the "
-                        "file is missing). Refusing to connect rather than prompting; recalibrate with "
-                        "lerobot-calibrate and redo A6."
+                        "file is missing). Refusing to connect rather than prompting. Usually another "
+                        "program (SenseCraft) wrote its own calibration: don't recalibrate, write the file "
+                        r"back with C:\Users\jesse\lerobot-tools\restore_calibration.py (--check, then "
+                        "--write; see CLAUDE.md). Only if the file is gone: lerobot-calibrate, then redo A6."
                     )
                 # Before any torque enable, including the one inside configure(): goal := present.
                 # Enabling torque drives each servo to its stored Goal_Position; stale goals measured
