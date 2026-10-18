@@ -41,9 +41,38 @@ Safety layer implemented here (docs/safety.md, CLAUDE.md "Arm hazards"):
   explicitly after the human confirmed the arm is clear. Until then every `command()`/`read()` raises
   RuntimeError rather than silently doing nothing.
 
-`python -m arm.driver --real --jog` moves each joint +10 degrees and back at 30 Hz after a 3 s countdown,
-with Esc freezing the arm in place (an Esc during `connect()` leaves it frozen and nothing moves). Without
-`--real` it refuses to touch hardware (`--fake` uses the in-memory arm).
+CLI, `python -m arm.driver`, one action per run. `--real` adds the typed confirmation, the 3 s countdown
+and the Esc watcher (an Esc during `connect()` leaves the arm frozen and nothing moves); `--fake` runs the
+in-memory arm; anything else refuses to touch hardware. As in arm.replay and arm.real_robot, FAKE_ROBOT
+only picks the fake arm when `--real` is absent; `--fake-contact` is refused with `--real` at parse time.
+
+* `--jog [--deg D]`: every joint +D degrees (default 10) and back at 30 Hz, one after the other (A4).
+* `--jog-joint NAME [--deg D] [--hold S]`: A6's increment test on one joint (`jog_joint`): out by D (A6
+  uses 20), hold S seconds (default 10), back. It prints the LeRobot degrees the servo reports, our mapped
+  radians, the expected model increment and the `arm.ik.fk_tip` positions to compare with the MuJoCo
+  viewer, and reads again at the end of the hold. A comparison aid: it writes no configuration and refuses
+  an increment that would leave the calibrated range minus 3 degrees.
+* `--measure-grip [--objects ...] [--grasps N] [--out PATH]`: A11's session (`measure_grip`): jaw opening,
+  empty-closed reading, N `close_gripper_hold` grasps per object. It writes a timestamped report under
+  runs/calibration/ (never overwriting) and prints the lines to paste into config/joint_map.yaml and
+  config/objects.yaml; nothing in config/ is written. Esc freezes the arm, ends the session and still
+  writes the partial report, without paste lines; a reading taken after the Esc is discarded.
+
+`--jog-joint` and `--measure-grip` re-send the start pose with every command, and `Driver.clip` pulls any
+joint outside the band (limits minus 3 degrees) into it, so both refuse with exit 2, before anything moves,
+when a joint of the start pose lies more than BAND_TOLERANCE_DEG outside the band (`band_violations`).
+Then only the named joint, or only the jaws, move.
+
+Every Esc during a `--real` run after the confirmation is measured with `esc_latency_ms` and appended to
+runs/calibration/esc-latency.jsonl by `record_esc_latency` with its `esc_phase`: "session" when it came
+after `connect()` returned (A13's Esc-to-freeze number, judged against 200 ms) or "connect" when it came
+while connecting (nothing moved; the freeze lands when connect returns, so it is a diagnostic kept out of
+the 200 ms bar). `report_esc_latency` is that end-of-session step, shared by arm.replay, arm.real_robot,
+scripts/touch_markers.py and the orchestrator's console watcher; the orchestrator also records a dashboard
+STOP on the real arm. `--esc-latency-report [--file PATH]` reads the records and prints A13's verdict (exit
+0 every session record within 200 ms, 1 not, 2 no usable records); it touches no hardware.
+`held_min_from_readings` and `objects_fit` are A11's pure rules. Default evidence paths honour
+`VARA_RUNS_DIR`.
 """
 
 from __future__ import annotations
@@ -51,6 +80,7 @@ from __future__ import annotations
 import argparse
 import copy
 import hashlib
+import json
 import logging
 import math
 import os
@@ -122,6 +152,8 @@ __all__ = [
     "gripper_to_pct",
     "held_threshold",
     "empty_closed_reading",
+    "held_min_from_readings",
+    "objects_fit",
     "Driver",
     "FakeDriver",
     "get_driver",
@@ -129,6 +161,11 @@ __all__ = [
     "inspect_hardware",
     "map_inspection_joints",
     "EscWatcher",
+    "jog",
+    "jog_joint",
+    "measure_grip",
+    "esc_latency_ms",
+    "record_esc_latency",
     "main",
 ]
 
@@ -347,6 +384,126 @@ def empty_closed_reading() -> float:
     jm = joint_map()
     raw = jm["gripper"].get("empty_closed_pct")
     return 0.0 if raw is None else _pct_to_gripper(float(raw), jm)
+
+
+# A11's object rules (docs/tasks/A-arm.md): width across the grasp at most the jaw opening minus 2 cm, height
+# 6 to 11 cm. The jaw clearance is in millimeters (what the human measures) and the heights in meters.
+JAW_CLEARANCE_MM = 20.0
+OBJECT_HEIGHT_M = (0.06, 0.11)
+
+# How far outside the commandable band (limits minus MARGIN_RAD) a start pose may lie before the A6 jog and
+# the A11 grip session refuse it. Driver.clip pulls such a joint into the band, so up to this much it moves.
+BAND_TOLERANCE_DEG = 0.5
+
+
+def band_violations(q: Sequence[float], *, tolerance_deg: float = BAND_TOLERANCE_DEG) -> dict[str, float]:
+    """Joints of `q` outside the commandable band, each with how many degrees outside it lies.
+
+    The band is config/limits.yaml minus the 3 degree margin, the range `Driver.clip` enforces. Clip pulls a
+    joint outside it back in at up to 2 degrees per command whatever the caller asks, so a tool that re-sends
+    a pose it read (the A6 single-joint jog, the A11 grip session) would also move every such joint. Those
+    tools refuse to start when this is not empty. A joint at most `tolerance_deg` outside is accepted.
+    """
+    lim = limits()
+    out: dict[str, float] = {}
+    for name, value in zip(JOINTS, q, strict=True):
+        lo, hi = lim[name]
+        excess = math.degrees(max(lo + MARGIN_RAD - float(value), float(value) - (hi - MARGIN_RAD)))
+        if excess > tolerance_deg:
+            out[name] = excess
+    return out
+
+
+def _require_in_band(q: Sequence[float], tool: str) -> None:
+    """ValueError naming every out-of-band joint of the start pose `q`, before `tool` moves anything."""
+    outside = band_violations(q)
+    if outside:
+        joints = ", ".join(f"{name} {excess:.1f} deg" for name, excess in outside.items())
+        raise ValueError(
+            f"{tool}: the start pose lies outside the commandable band (limits minus 3 degrees) on {joints}; "
+            "the driver would pull those joints into the band, so they would move too. Move the arm to a "
+            "pose inside the band first (teleoperate it, or move it by hand with torque off and run "
+            "sync_goals.py again), or finish A6's limits; nothing moved"
+        )
+
+
+def _runs_dir() -> Path:
+    """`VARA_RUNS_DIR` when set (the orchestrator's and scripts/e2e_fake.py's convention), else runs/."""
+    return Path(os.environ.get("VARA_RUNS_DIR") or ROOT / "runs")
+
+
+def held_min_from_readings(
+    closed_pct: Sequence[float], empty_closed_pct: float, *, open_pct: float = 100.0
+) -> float:
+    """A11's `held_min` (0-100 scale): half the gap between the smallest closed reading and the empty close.
+
+    `closed_pct` are the settled readings of closes on the object (what `close_gripper_hold` returned,
+    converted with `gripper_to_pct`) and `empty_closed_pct` the reading of a close on nothing, both on
+    LeRobot's 0-100 scale. "Smallest" means nearest to the empty close along the open direction, which
+    `open_pct` gives (the joint map's `open_pct`; the default 100 is the usual direction, where the
+    formula is `(min(closed) - empty) / 2`). ValueError when no reading is given, a value is not finite,
+    or the nearest closed reading is not on the open side of the empty close: the object was not detected
+    between the jaws, so no threshold can be proposed.
+    """
+    readings = [float(v) for v in closed_pct]
+    empty = float(empty_closed_pct)
+    if not readings:
+        raise ValueError("held_min needs at least one closed reading")
+    if not all(math.isfinite(v) for v in readings) or not math.isfinite(empty) or not math.isfinite(open_pct):
+        raise ValueError(f"readings must be finite, got closed {readings}, empty {empty}, open {open_pct}")
+    toward_open = 1.0 if float(open_pct) >= empty else -1.0
+    gap = min(toward_open * v for v in readings) - toward_open * empty
+    if gap <= 0:
+        nearest = min(readings, key=lambda v: toward_open * v)
+        raise ValueError(
+            f"smallest closed reading {nearest:.1f} is not on the open side of the empty close {empty:.1f}: "
+            "the object was not detected between the jaws"
+        )
+    return gap / 2
+
+
+def _fit_problems(jaw_open_mm: float, objects: dict[str, dict[str, Any]] | None) -> dict[str, list[str]]:
+    """Per `kind: object` entry, the A11 size rules it breaks at this jaw opening ({} when all fit)."""
+    jaw = float(jaw_open_mm)
+    if not math.isfinite(jaw) or jaw <= 0:
+        raise ValueError(f"the jaw opening must be a finite number of mm > 0, got {jaw_open_mm!r}")
+    entries = _objects() if objects is None else objects
+    lo_h, hi_h = OBJECT_HEIGHT_M
+    out: dict[str, list[str]] = {}
+    for name, entry in entries.items():
+        if not isinstance(entry, dict) or entry.get("kind") != "object":
+            continue
+        try:
+            width_mm = round(float(entry["size"][1]) * 1000.0, 6)  # 0.035 m is 35 mm, not 35.000000000000004
+            height = float(entry["h"])
+        except (KeyError, IndexError, TypeError, ValueError):
+            raise ValueError(f"{name}: an object entry needs size [length, width] and h in meters") from None
+        if not (math.isfinite(width_mm) and math.isfinite(height)):
+            raise ValueError(f"{name}: size and h must be finite numbers")
+        problems: list[str] = []
+        if width_mm > jaw - JAW_CLEARANCE_MM:
+            problems.append(
+                f"{name}: width {width_mm:.0f} mm across the grasp exceeds the jaw opening {jaw:.0f} mm "
+                f"minus {JAW_CLEARANCE_MM:.0f} mm"
+            )
+        if not (lo_h <= height <= hi_h):
+            problems.append(
+                f"{name}: height {height * 100:.1f} cm is outside {lo_h * 100:.0f} to {hi_h * 100:.0f} cm"
+            )
+        if problems:
+            out[str(name)] = problems
+    return out
+
+
+def objects_fit(jaw_open_mm: float, objects: dict[str, dict[str, Any]] | None = None) -> list[str]:
+    """Names of the `kind: object` entries that break A11's size rules at this jaw opening (the misfits).
+
+    Lists every object whose width across the grasp (`size[1]`, meters) exceeds `jaw_open_mm` minus 20 mm
+    or whose height `h` is outside 0.06 to 0.11 m; an empty list means every object fits. `objects`
+    defaults to config/objects.yaml keyed by name; entries of other kinds are ignored. ValueError for a
+    non-finite or non-positive jaw opening and for an object entry without numeric `size` and `h`.
+    """
+    return sorted(_fit_problems(jaw_open_mm, objects))
 
 
 # ------------------------------------------------------------------------------------------------------------
@@ -875,6 +1032,11 @@ class Driver(_DriverBase):
     def robot(self) -> Any:
         return self._robot
 
+    @property
+    def follower_id(self) -> str:
+        """The LeRobot id `connect()` uses: the constructor's, else FOLLOWER_ID, else the joint map's."""
+        return self._id or os.environ.get("FOLLOWER_ID") or joint_map()["lerobot_id"]
+
     def connect(self) -> None:
         """Open the bus, require a matching calibration, and sync before every torque enable.
 
@@ -899,7 +1061,7 @@ class Driver(_DriverBase):
                     "FOLLOWER_PORT is not set. Run lerobot-find-port (or lerobot-tools/arm_check.py) and put "
                     "the follower's port in .env"
                 )
-            follower_id = self._id or os.environ.get("FOLLOWER_ID") or joint_map()["lerobot_id"]
+            follower_id = self.follower_id
             robot = self._robot_factory(port=port, id=follower_id, **ROBOT_CONFIG)
             bus = robot.bus
             try:
@@ -1017,6 +1179,9 @@ class FakeDriver(_DriverBase):
         self._q = list(q0) if q0 is not None else _home_q()
         self._g = float(gripper0)
         self.gripper_reading_override: float | None = None  # tests fake a held object (contact reading)
+        # An object between the jaws: a close stops at this reading (our 0-1 units) while an open still
+        # reads what was commanded. `measure_grip` sets it from --fake-contact around each object close.
+        self.contact_gripper: float | None = None
         self.commands: list[tuple[list[float], float]] = []  # everything _send received, oldest first
         self.connected = True
         self.torque = True
@@ -1041,6 +1206,8 @@ class FakeDriver(_DriverBase):
     def read(self) -> tuple[list[float], float]:
         with self.lock:
             g = self._g if self.gripper_reading_override is None else self.gripper_reading_override
+            if self.contact_gripper is not None:
+                g = max(float(g), float(self.contact_gripper))
             return list(self._q), float(g)
 
     def set_present(self, q: list[float] | None = None, gripper: float | None = None) -> None:
@@ -1222,6 +1389,592 @@ def jog(
     return True
 
 
+HOLD_SLICE_S = 0.1  # jog_joint waits out its hold in slices this long so an Esc is noticed promptly
+
+
+def jog_joint(
+    driver: Driver | FakeDriver,
+    joint: str,
+    *,
+    deg: float = 10.0,
+    hold_s: float = 10.0,
+    step_deg: float = 1.0,
+    realtime: bool = True,
+    fk: Callable[[Sequence[float]], Sequence[float]] | None = None,
+) -> dict[str, Any]:
+    """A6's increment test on one joint: out by `deg`, hold `hold_s` seconds, back; prints what to compare.
+
+    Only `joint` moves, `step_deg` per 30 Hz tick (at most 2 degrees, the driver's own clip); the other
+    joints and the gripper are re-sent unchanged. Before the move, at the increment and after the return it
+    prints the LeRobot reading in degrees as the servo reports it (the number LeRobot's own tools show, so
+    degrees stay inside this module), our mapped value in radians through config/joint_map.yaml, the
+    expected model increment (`radians(deg)`, 0.349 for 20 degrees) and, when `fk` (`arm.ik.fk_tip`) is
+    given, the tip position of the before, expected and measured joint vectors for the MuJoCo viewer
+    comparison; at the end of the hold it reads again (`lerobot_deg_settled`, `delta_settled_rad`), since a
+    real servo can trail its target right after the ramp. ValueError before anything moves when the
+    increment would leave the calibrated range minus the 3 degree margin, or when any joint of the start pose
+    lies outside that band (`band_violations`): the driver's clip would pull it in, so it would move too.
+    Returns the readings; `ok` is False when the driver stopped accepting commands (Esc froze it, or torque
+    is off). A comparison aid: it writes no configuration.
+    """
+    if joint not in JOINTS:
+        raise ValueError(f"joint must be one of {JOINTS}, got {joint!r}")
+    deg = float(deg)
+    if not math.isfinite(deg) or deg == 0:
+        raise ValueError(f"deg must be a finite, non-zero number of degrees, got {deg}")
+    if not (0 < step_deg <= math.degrees(MAX_STEP_RAD)):
+        raise ValueError(f"step_deg must be in (0, {math.degrees(MAX_STEP_RAD):g}] degrees, got {step_deg}")
+    if not (math.isfinite(hold_s) and hold_s >= 0):
+        raise ValueError(f"hold_s must be a finite number of seconds >= 0, got {hold_s}")
+    i = JOINTS.index(joint)
+    jm = joint_map()
+    q0, g0 = driver.read()
+    _require_in_band(q0, f"jog-joint {joint}")
+    delta = math.radians(deg)
+    q_expected = list(q0)
+    q_expected[i] = q0[i] + delta
+    lo, hi = limits()[joint]
+    if not (lo + MARGIN_RAD - 1e-9 <= q_expected[i] <= hi - MARGIN_RAD + 1e-9):
+        raise ValueError(
+            f"{joint}: {math.degrees(q0[i]):+.1f} {deg:+.1f} = {math.degrees(q_expected[i]):+.1f} deg "
+            f"leaves the calibrated range minus 3 degrees [{math.degrees(lo + MARGIN_RAD):+.1f}, "
+            f"{math.degrees(hi - MARGIN_RAD):+.1f}] deg; nothing moved"
+        )
+
+    def tip(q: Sequence[float]) -> tuple[float, float, float] | None:
+        if fk is None:
+            return None
+        x, y, z = fk(list(q))
+        return (float(x), float(y), float(z))
+
+    def show(label: str, q: Sequence[float]) -> None:
+        parts = [f"LeRobot {_rad_to_lerobot(joint, q[i], jm):+.2f} deg", f"mapped {q[i]:+.4f} rad"]
+        t = tip(q)
+        if t is not None:
+            parts.append("tip (%.3f, %.3f, %.3f) m" % t)
+        print(f"  {label}: " + " | ".join(parts))
+
+    result: dict[str, Any] = {
+        "joint": joint,
+        "deg": deg,
+        "expected_delta_rad": delta,
+        "hold_s": hold_s,
+        "ok": False,
+        "lerobot_deg_before": _rad_to_lerobot(joint, q0[i], jm),
+        "q_before": list(q0),
+        "q_expected": q_expected,
+        "tip_before": tip(q0),
+        "tip_expected": tip(q_expected),
+    }
+    print(
+        f"jog-joint {joint}: {deg:+.1f} deg from the present pose (expected model increment "
+        f"{delta:+.3f} rad), hold {hold_s:g} s, then back. Only {joint} moves."
+    )
+    show("before", q0)
+    show(f"expected at {deg:+.1f} deg (compare with the viewer)", q_expected)
+    if fk is None:
+        print("  (no fk given: tip positions not printed)")
+
+    n = math.ceil(abs(deg) / step_deg - 1e-9)
+    up = [min(step_deg * k, abs(deg)) for k in range(1, n + 1)]
+    down = [*up[-2::-1], 0.0]
+    next_tick = time.perf_counter()
+
+    def run(offsets: Sequence[float]) -> bool:
+        nonlocal next_tick
+        for offset in offsets:
+            target = list(q0)
+            target[i] = q0[i] + math.copysign(math.radians(offset), deg)
+            if not driver.command(target, g0):
+                print("command refused (stopped or torque off); jog-joint ends")
+                return False
+            if realtime:
+                next_tick += TICK
+                delay = next_tick - time.perf_counter()
+                if delay > 0:
+                    time.sleep(delay)
+        return True
+
+    if not run(up):
+        return result
+    q_at, _ = driver.read()
+    result.update(
+        lerobot_deg_at=_rad_to_lerobot(joint, q_at[i], jm),
+        q_at=list(q_at),
+        delta_at_rad=q_at[i] - q0[i],
+        tip_at=tip(q_at),
+    )
+    show(f"at increment (measured delta {q_at[i] - q0[i]:+.4f} rad)", q_at)
+    if hold_s > 0:
+        print(f"  holding {hold_s:g} s for the viewer comparison (Esc freezes)...", flush=True)
+    for _ in range(int(round(hold_s / HOLD_SLICE_S))):
+        driver._sleep(HOLD_SLICE_S)  # a no-op on the FakeDriver
+        if driver.stopped:
+            print("stopped during the hold; jog-joint ends")
+            return result
+    q_settled, _ = driver.read()
+    result.update(
+        lerobot_deg_settled=_rad_to_lerobot(joint, q_settled[i], jm),
+        delta_settled_rad=q_settled[i] - q0[i],
+    )
+    show(f"settled at the end of the hold (delta {q_settled[i] - q0[i]:+.4f} rad)", q_settled)
+    next_tick = time.perf_counter()
+    if not run(down):
+        return result
+    q_after, _ = driver.read()
+    result.update(
+        lerobot_deg_after=_rad_to_lerobot(joint, q_after[i], jm),
+        q_after=list(q_after),
+        delta_after_rad=q_after[i] - q0[i],
+        tip_after=tip(q_after),
+        ok=True,
+    )
+    show(f"after return (delta from start {q_after[i] - q0[i]:+.4f} rad)", q_after)
+    return result
+
+
+def _ask(prompt: str) -> str:
+    """`input()` that reads EOF or an unreadable stdin (redirected, captured) as a blank answer."""
+    try:
+        return input(prompt)
+    except (EOFError, OSError):
+        print()  # no answer came back: end the prompt line so a redirected-stdin transcript stays readable
+        return ""
+
+
+def _yes_no(answer: str) -> bool | None:
+    """'y'/'yes' -> True, 'n'/'no' -> False, anything else (a blank, EOF) -> None: unanswered."""
+    text = answer.strip().lower()
+    if text in ("y", "yes"):
+        return True
+    if text in ("n", "no"):
+        return False
+    return None
+
+
+def _parse_mm(answer: str) -> float | None:
+    """A positive finite number of millimeters, or None for a blank or unusable answer."""
+    try:
+        value = float(answer.strip())
+    except ValueError:
+        return None
+    return value if math.isfinite(value) and value > 0 else None
+
+
+def measure_grip(
+    driver: Driver | FakeDriver,
+    *,
+    objects: Sequence[str],
+    grasps: int = 5,
+    ask: Callable[[str], str] | None = None,
+    fake_contact_pct: float | None = None,
+    lerobot_id: str | None = None,
+    calibration_sha256: str | None = None,
+) -> dict[str, Any]:
+    """A11's gripper session on a connected driver; returns the report, partial when the driver stopped.
+
+    The five joints are read once and that same q goes with every gripper command. Sequence: open to 1.0,
+    wait 1 s, read, ask for the jaw opening in mm; close on nothing (0.0), read after 0.5 s, re-open at
+    once (an empty close is never left stalled); then per object `grasps` times: open, wait for Enter with
+    the object between the jaws, `close_gripper_hold()` (settled reading, held at the contact minus 3),
+    ask whether it held, re-open. Readings are recorded on LeRobot's 0-100 scale (`gripper_to_pct`) and
+    each object's `held_min` comes from `held_min_from_readings`; the jaw opening is checked against every
+    object on file with `objects_fit`. `ask(prompt) -> str` replaces `input()` (EOF reads as blank, so a
+    redirected stdin never blocks). On the FakeDriver `fake_contact_pct` (0-100) stands in for each
+    object's contact reading through `FakeDriver.contact_gripper`; it is refused on a real driver. When
+    the driver stops accepting commands (Esc froze it, torque off) the report gets `stopped: True`, a
+    problem entry saying where, and everything measured before it; a reading taken after the stop (the
+    jaws frozen part-way) is discarded, never recorded as a measurement. ValueError before anything moves
+    when an arm joint of the start pose lies outside the commandable band (`band_violations`), because
+    every command re-sends that pose and the driver's clip would move such a joint. A name listed twice is
+    measured once.
+    """
+    names = list(dict.fromkeys(str(n) for n in objects))
+    if not names:
+        raise ValueError("measure_grip needs at least one object name")
+    if grasps < 1:
+        raise ValueError(f"grasps must be at least 1, got {grasps}")
+    if fake_contact_pct is not None and not getattr(driver, "is_fake", False):
+        raise ValueError(
+            "fake_contact_pct is for the FakeDriver only; the real jaws report their own contact"
+        )
+    prompt = ask or _ask
+    jm = joint_map()
+    report: dict[str, Any] = {
+        "captured_at": datetime.now(timezone.utc).isoformat(),
+        "mode": "fake" if getattr(driver, "is_fake", False) else "real",
+        "lerobot_id": lerobot_id or jm["lerobot_id"],
+        "calibration_sha256": calibration_sha256,
+        "grasps": int(grasps),
+        "jaw_open_mm": None,
+        "open_reading_pct": None,
+        "empty_closed_pct": None,
+        "objects": {},
+        "problems": [],
+        "stopped": False,
+    }
+    problems: list[str] = report["problems"]
+    q, _ = driver.read()
+    _require_in_band(q, "measure-grip")
+    report["q"] = list(q)
+
+    def send(gripper: float, where: str) -> bool:
+        """One gripper target with the fixed q; False (and a problem entry) when the driver refused it."""
+        if driver.command(q, gripper) and not driver.stopped:
+            return True
+        return interrupted(where)
+
+    def interrupted(where: str) -> bool:
+        """Always False (session over); records why. Called when a command was refused or Esc landed."""
+        report["stopped"] = True
+        why = "Esc/STOP" if driver.stopped else "torque off"
+        problems.append(f"{why} {where}: session ended, the report is partial")
+        return False
+
+    def session() -> None:
+        if not send(1.0, "while opening the jaws"):
+            return
+        driver._sleep(1.0)
+        if driver.stopped or not driver.torque:
+            interrupted("while the jaws were opening (open reading discarded)")
+            return
+        report["open_reading_pct"] = _gripper_to_pct(driver.read()[1], jm)
+        answer = prompt("jaw opening at gripper 1.0 in mm: ")
+        if driver.stopped:
+            interrupted("at the jaw opening prompt")
+            return
+        jaw = _parse_mm(answer)
+        if jaw is None:
+            problems.append(
+                "jaw opening not recorded (blank or not a number): run again and answer the prompt"
+            )
+        else:
+            report["jaw_open_mm"] = jaw
+            for rule_problems in _fit_problems(jaw, None).values():
+                problems.extend(rule_problems)
+        if not send(0.0, "while closing on nothing"):
+            return
+        driver._sleep(0.5)
+        if driver.stopped or not driver.torque:
+            interrupted("during the empty close (the jaws stopped part-way; reading discarded)")
+            return
+        report["empty_closed_pct"] = _gripper_to_pct(driver.read()[1], jm)
+        if not send(1.0, "while re-opening after the empty close"):
+            return
+        for name in names:
+            entry: dict[str, Any] = {"closed_pct": [], "held": [], "held_min": None}
+            report["objects"][name] = entry
+            for k in range(1, grasps + 1):
+                where = f"grasp {k} of {grasps} on {name}"
+                if not send(1.0, f"before {where}"):
+                    return
+                prompt(f"place {name} between the jaws, Enter: ")
+                if driver.stopped:
+                    interrupted(f"at the placement prompt of {where}")
+                    return
+                if fake_contact_pct is not None:
+                    driver.contact_gripper = _pct_to_gripper(float(fake_contact_pct), jm)
+                reading = driver.close_gripper_hold()
+                if driver.stopped or not driver.torque:
+                    interrupted(f"during the close of {where}")
+                    return
+                entry["closed_pct"].append(_gripper_to_pct(reading, jm))
+                entry["held"].append(_yes_no(prompt("held? y/n: ")))
+                if driver.stopped:
+                    interrupted(f"at the held prompt of {where}")
+                    return
+                if not send(1.0, f"while re-opening after {where}"):
+                    return
+                if fake_contact_pct is not None:
+                    driver.contact_gripper = None
+
+    try:
+        session()
+    finally:
+        if fake_contact_pct is not None:
+            driver.contact_gripper = None
+    for name, entry in report["objects"].items():
+        if entry["closed_pct"] and report["empty_closed_pct"] is not None:
+            try:
+                entry["held_min"] = held_min_from_readings(
+                    entry["closed_pct"], report["empty_closed_pct"], open_pct=jm["gripper"]["open_pct"]
+                )
+            except ValueError as exc:
+                problems.append(f"{name}: {exc}")
+        elif not entry["closed_pct"]:
+            problems.append(f"{name}: no closed reading recorded")
+    return report
+
+
+def esc_latency_ms(watcher: EscWatcher | None, driver: _DriverBase | None) -> float | None:
+    """Milliseconds from the Esc press (`watcher.pressed_at`) to the freeze (`driver.frozen_at`), A13's
+    number. None when either timestamp is missing (no press, or the freeze never landed) or when the
+    freeze on record predates the press (an older freeze; the new one has not landed)."""
+    pressed = getattr(watcher, "pressed_at", None)
+    frozen = getattr(driver, "frozen_at", None)
+    if pressed is None or frozen is None or frozen < pressed:
+        return None
+    return (float(frozen) - float(pressed)) * 1000.0
+
+
+ESC_PHASES = ("session", "connect")
+
+
+def esc_phase(watcher: Any, connected_at: float | None) -> str:
+    """Which phase an Esc press belongs to: "connect" or "session".
+
+    "connect" when the press came before `driver.connect()` returned (`connected_at`, a `time.monotonic()`
+    stamp taken right after it returned, is None or not earlier than `watcher.pressed_at`; equal stamps
+    count as connect, since Windows' monotonic clock ticks every ~15.6 ms and nothing moves before the
+    callers' post-connect check): nothing was moving and the freeze could only land when connect
+    finished, so the number is a diagnostic, not A13's Esc-to-freeze latency. "session" otherwise: the
+    arm could move, so the number counts against the 200 ms bar.
+    """
+    pressed = getattr(watcher, "pressed_at", None)
+    if connected_at is None or (pressed is not None and float(pressed) <= float(connected_at)):
+        return "connect"
+    return "session"
+
+
+def record_esc_latency(
+    path: str | Path | None = None,
+    *,
+    source: str,
+    latency_ms: float | None,
+    extra: dict[str, Any] | None = None,
+    phase: str = "session",
+) -> Path:
+    """Append one JSON line `{"t", "source", "phase", "latency_ms", "extra"}` to the Esc-latency log (A13).
+
+    `t` is the local time in ISO 8601 with its UTC offset. `path` defaults to
+    `<runs>/calibration/esc-latency.jsonl` (runs/, or VARA_RUNS_DIR); its parent is created. `latency_ms`
+    may be None for a press whose freeze never landed. `phase` comes from `esc_phase`: "session" records
+    count against A13's 200 ms bar, "connect" records (Esc pressed before connect() returned) are kept as
+    diagnostics and stay out of it. Returns the path written.
+    """
+    if latency_ms is not None and not math.isfinite(float(latency_ms)):
+        raise ValueError(f"latency_ms must be finite or None, got {latency_ms!r}")
+    if phase not in ESC_PHASES:
+        raise ValueError(f"phase must be one of {ESC_PHASES}, got {phase!r}")
+    target = Path(path) if path is not None else _runs_dir() / "calibration" / "esc-latency.jsonl"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    record = {
+        "t": datetime.now().astimezone().isoformat(timespec="milliseconds"),
+        "source": str(source),
+        "phase": phase,
+        "latency_ms": None if latency_ms is None else float(latency_ms),
+        "extra": extra,
+    }
+    with target.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(record) + "\n")
+    return target
+
+
+ESC_BAR_MS = 200.0  # A13: Esc freezes motion within 0.2 s
+
+
+def esc_latency_report(path: str | Path | None = None, *, bar_ms: float = ESC_BAR_MS) -> int:
+    """`python -m arm.driver --esc-latency-report`: print the Esc records and A13's verdict; the exit code.
+
+    Reads `path` (default `<runs>/calibration/esc-latency.jsonl`) and prints one row per record (local time,
+    source, phase, latency in ms), then the count and maximum of the "session" records and whether every one
+    is at most `bar_ms`. "connect" records (Esc pressed before the connect returned, nothing moving) are
+    listed separately and never judged. A record without `phase` predates the field and counts as
+    "session"; a session record whose freeze never landed (latency null) fails. Exit 0 when every session
+    record is within the bar, 1 when any is not, 2 when the file is missing, empty or malformed or holds no
+    session record. Touches no hardware.
+    """
+    target = Path(path) if path is not None else _runs_dir() / "calibration" / "esc-latency.jsonl"
+    if not target.is_file():
+        print(f"no Esc records: {target} does not exist", file=sys.stderr)
+        return 2
+    records: list[dict[str, Any]] = []
+    for n, line in enumerate(target.read_text(encoding="utf-8").splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+            phase = record.get("phase", "session")
+            latency = record.get("latency_ms")
+            if phase not in ESC_PHASES or not isinstance(record.get("source"), str):
+                raise ValueError("bad phase or source")
+            if latency is not None and not (
+                isinstance(latency, int | float) and not isinstance(latency, bool) and math.isfinite(latency)
+            ):
+                raise ValueError("latency_ms must be a finite number or null")
+        except (ValueError, AttributeError) as exc:
+            print(f"{target}:{n}: malformed Esc record ({exc}): {line[:120]}", file=sys.stderr)
+            return 2
+        records.append({**record, "phase": phase})
+    if not records:
+        print(f"no Esc records: {target} is empty", file=sys.stderr)
+        return 2
+
+    def row(record: dict[str, Any]) -> str:
+        latency = record.get("latency_ms")
+        shown = "no freeze" if latency is None else f"{latency:.0f} ms"
+        return f"  {record.get('t', '?'):29s}  {record['source']:32s}  {record['phase']:7s}  {shown}"
+
+    session = [r for r in records if r["phase"] == "session"]
+    connect = [r for r in records if r["phase"] == "connect"]
+    print(f"Esc records in {target}:")
+    for record in session:
+        print(row(record))
+    if connect:
+        print(f"connect-phase records (Esc while connecting, nothing moving; not judged): {len(connect)}")
+        for record in connect:
+            print(row(record))
+    if not session:
+        print("no session-phase record: run the A13 drill (Esc while the arm moves)", file=sys.stderr)
+        return 2
+    failed = [r for r in session if r.get("latency_ms") is None or r["latency_ms"] > bar_ms]
+    worst = max((r["latency_ms"] for r in session if r.get("latency_ms") is not None), default=None)
+    print(
+        f"{len(session)} session record(s), max "
+        + ("n/a" if worst is None else f"{worst:.0f} ms")
+        + f"; A13 bar {bar_ms:.0f} ms: "
+        + ("PASS" if not failed else f"FAIL ({len(failed)} over the bar or never frozen)")
+    )
+    return 0 if not failed else 1
+
+
+def report_esc_latency(
+    watcher: Any,
+    driver: Any,
+    *,
+    source: str,
+    connected_at: float | None,
+    extra: dict[str, Any] | None = None,
+    path: str | Path | None = None,
+) -> Path | None:
+    """The shared end-of-session A13 step of every `--real` CLI: when `watcher` fired, print the Esc line
+    and append one record (`record_esc_latency`) with its `esc_phase`; None when no Esc was pressed.
+
+    A "session" press prints `Esc -> freeze command: N ms`; a "connect" press (before `connect()` returned,
+    `connected_at` None or later than the press) prints a diagnostic line instead, since nothing moved. Call
+    it only once the human confirmed and the connect was attempted: an Esc during the countdown aborts before
+    connecting and leaves no record. Never raises: a failed write is printed, the arm is already frozen.
+    """
+    if not getattr(watcher, "pressed", False):
+        return None
+    ms = esc_latency_ms(watcher, driver)
+    phase = esc_phase(watcher, connected_at)
+    if ms is not None and phase == "session":
+        print(f"Esc -> freeze command: {ms:.0f} ms")
+    elif ms is not None:
+        print(
+            f"Esc during connect -> arm held when connect returned: {ms:.0f} ms "
+            "(connect phase: a diagnostic, not an A13 latency)"
+        )
+    try:
+        written = record_esc_latency(path, source=source, latency_ms=ms, extra=extra, phase=phase)
+    except (OSError, ValueError) as exc:
+        print(f"Esc latency not recorded: {exc}", file=sys.stderr)
+        return None
+    print(f"Esc latency recorded in {written} (phase {phase})")
+    return written
+
+
+def _calibration_sha256(driver: Any) -> str | None:
+    """SHA-256 of the connected robot's calibration file (as inspect_hardware hashes it); None for a fake."""
+    fpath = getattr(getattr(driver, "robot", None), "calibration_fpath", None)
+    if not fpath:
+        return None
+    path = Path(fpath)
+    return hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
+
+
+def _report_path(out: str | None, prefix: str) -> Path:
+    """A new file for a report: `out` (refused when it exists) or `<runs>/calibration/<prefix>-<UTC>.json`.
+
+    Parent directories are created here so the refusal happens before anything moves.
+    """
+    if out:
+        path = Path(out)
+        if path.exists():
+            raise FileExistsError(f"{path} exists; evidence is never overwritten, choose a new --out")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path
+    folder = _runs_dir() / "calibration"
+    folder.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    for n in range(1, 100):
+        path = folder / (f"{prefix}-{stamp}.json" if n == 1 else f"{prefix}-{stamp}-{n}.json")
+        if not path.exists():
+            return path
+    raise FileExistsError(f"could not find a free name for {prefix}-{stamp}*.json in {folder}")
+
+
+def _write_report(report: dict[str, Any], path: Path) -> Path:
+    """Write the report JSON to `path`, which must not exist yet (exclusive create)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("x", encoding="utf-8") as fh:
+        json.dump(report, fh, indent=2)
+        fh.write("\n")
+    return path
+
+
+def _print_grip_summary(report: dict[str, Any], path: Path) -> None:
+    """The per-object readings, the problems and the exact lines to paste into the two config files."""
+    g = joint_map()["gripper"]
+    print(f"gripper report written to {path}")
+    jaw = report["jaw_open_mm"]
+    opened = report["open_reading_pct"]
+    empty = report["empty_closed_pct"]
+    print(
+        "  jaw opening "
+        + ("not recorded" if jaw is None else f"{jaw:g} mm")
+        + ", open reading "
+        + ("n/a" if opened is None else f"{opened:.1f}")
+        + ", empty-closed reading "
+        + ("n/a" if empty is None else f"{empty:.1f}")
+        + " (0-100)"
+    )
+    for name, entry in report["objects"].items():
+        readings = ", ".join(f"{v:.1f}" for v in entry["closed_pct"])
+        held = sum(1 for h in entry["held"] if h is True)
+        unanswered = sum(1 for h in entry["held"] if h is None)
+        held_min = "n/a" if entry["held_min"] is None else f"{entry['held_min']:.1f}"
+        print(
+            f"  {name}: closed readings [{readings}], held {held} of {len(entry['held'])}"
+            + (f" ({unanswered} unanswered)" if unanswered else "")
+            + f", held_min {held_min}"
+        )
+    for problem in report["problems"]:
+        print(f"  problem: {problem}")
+    if report.get("stopped"):
+        print(
+            "Session ended early (Esc/STOP or torque off): no lines to paste. The readings above are "
+            "partial; run --measure-grip again to completion."
+        )
+        print("Nothing under config/ was written.")
+        return
+    print("Paste into config/joint_map.yaml (replaces its gripper line; the loader ignores jaw_open_mm):")
+    fields = [f"closed_pct: {g['closed_pct']:g}", f"open_pct: {g['open_pct']:g}"]
+    if empty is not None:
+        fields.append(f"empty_closed_pct: {empty:.1f}")
+    if jaw is not None:
+        fields.append(f"jaw_open_mm: {jaw:g}")
+    print("gripper: {" + ", ".join(fields) + "}")
+    print("Paste into config/objects.yaml (held_min on each object's entry):")
+    for name, entry in report["objects"].items():
+        if entry["held_min"] is None:
+            print(f"  {name}: held_min not measured")
+        else:
+            print(f"  {name}: held_min: {entry['held_min']:.1f}")
+    print("Nothing under config/ was written; paste by hand after checking the readings.")
+
+
+def _fk_tip_or_none() -> Callable[[Sequence[float]], Sequence[float]] | None:
+    """`arm.ik.fk_tip`, imported lazily (it loads MuJoCo); None with a note when it is unavailable."""
+    try:
+        from arm.ik import fk_tip
+    except Exception as exc:  # ImportError, or a model that fails to load
+        print(f"arm.ik unavailable ({exc}); tip positions are not printed", file=sys.stderr)
+        return None
+    return fk_tip
+
+
 def _countdown(seconds: int, watcher: EscWatcher) -> bool:
     try:
         answer = input("Type yes when the arm and table are clear: ")
@@ -1243,12 +1996,69 @@ def _countdown(seconds: int, watcher: EscWatcher) -> bool:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m arm.driver",
-        description="SO-101 driver check. Nothing touches hardware without --real.",
+        description=(
+            "SO-101 driver checks: --jog (A4), --jog-joint (A6 increment test) and --measure-grip (A11). "
+            "Nothing touches hardware without --real; --fake runs the in-memory arm. Under --real: typed "
+            "confirmation, 3 s countdown, Esc freezes the arm with torque on."
+        ),
     )
-    parser.add_argument("--real", action="store_true", help="use the real arm: 3 s countdown, Esc freezes it")
-    parser.add_argument("--fake", action="store_true", help="use the in-memory FakeDriver (no hardware)")
-    parser.add_argument("--jog", action="store_true", help="move each joint +DEG and back at 30 Hz")
-    parser.add_argument("--deg", type=float, default=10.0, help="jog amplitude in degrees (default 10)")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--real", action="store_true", help="use the real arm: 3 s countdown, Esc freezes it")
+    mode.add_argument("--fake", action="store_true", help="use the in-memory FakeDriver (no hardware)")
+    action = parser.add_mutually_exclusive_group()
+    action.add_argument("--jog", action="store_true", help="move each joint +DEG and back at 30 Hz")
+    action.add_argument(
+        "--jog-joint",
+        choices=JOINTS,
+        metavar="NAME",
+        help=(
+            "A6: move one joint (%(choices)s) +DEG, hold --hold seconds, return; prints the LeRobot "
+            "degrees, mapped radians and fk tip to compare with the MuJoCo viewer. Writes no config."
+        ),
+    )
+    action.add_argument(
+        "--measure-grip",
+        action="store_true",
+        help=(
+            "A11: jaw opening, empty-closed reading and --grasps closes per object; writes a report under "
+            "runs/calibration/ and prints the lines to paste into config/joint_map.yaml and objects.yaml"
+        ),
+    )
+    action.add_argument(
+        "--esc-latency-report",
+        action="store_true",
+        help=(
+            "A13: print the Esc records (runs/calibration/esc-latency.jsonl, or --file) and whether every "
+            "session-phase record is within 200 ms; exit 0 pass, 1 fail, 2 no usable records. No hardware"
+        ),
+    )
+    parser.add_argument("--file", metavar="PATH", help="--esc-latency-report: the records file to read")
+    parser.add_argument(
+        "--deg", type=float, help="--jog/--jog-joint amplitude in degrees (default 10; A6 uses 20)"
+    )
+    parser.add_argument(
+        "--hold", type=float, metavar="SECONDS", help="--jog-joint: hold at the increment (default 10)"
+    )
+    parser.add_argument(
+        "--objects",
+        nargs="+",
+        metavar="NAME",
+        help="--measure-grip: objects to grasp (default: every kind: object in config/objects.yaml)",
+    )
+    parser.add_argument(
+        "--grasps", type=int, metavar="N", help="--measure-grip: closes per object (default 5)"
+    )
+    parser.add_argument(
+        "--fake-contact",
+        type=float,
+        metavar="PCT",
+        help="--measure-grip --fake: the 0-100 reading the fake jaws stop at on an object (default 25)",
+    )
+    parser.add_argument(
+        "--out",
+        metavar="PATH",
+        help="--measure-grip: report path, must not exist (default runs/calibration/gripper-<UTC>.json)",
+    )
     parser.add_argument("--port", help="serial port; default FOLLOWER_PORT from .env")
     parser.add_argument(
         "--id", dest="follower_id", help=f"LeRobot id; default FOLLOWER_ID or {DEFAULT_FOLLOWER_ID}"
@@ -1256,14 +2066,105 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, stream=sys.stderr, format="%(asctime)s %(levelname)s %(message)s")
-    if not args.jog:
+    if args.file is not None and not args.esc_latency_report:
+        parser.error("--file applies to --esc-latency-report only")
+    if args.esc_latency_report:
+        if args.real or args.fake:
+            parser.error("--esc-latency-report reads a file; it takes neither --real nor --fake")
+        return esc_latency_report(args.file)
+    if not (args.jog or args.jog_joint or args.measure_grip):
         parser.print_help()
         return 2
+    if args.hold is not None and not args.jog_joint:
+        parser.error("--hold applies to --jog-joint only")
+    if args.deg is not None and args.measure_grip:
+        parser.error("--deg applies to --jog and --jog-joint only")
+    if args.deg is None:
+        args.deg = 10.0
+    for flag, value in (
+        ("--objects", args.objects),
+        ("--grasps", args.grasps),
+        ("--fake-contact", args.fake_contact),
+        ("--out", args.out),
+    ):
+        if value is not None and not args.measure_grip:
+            parser.error(f"{flag} applies to --measure-grip only")
+    if args.fake_contact is not None and args.real:
+        parser.error("--fake-contact is for --fake only; the real jaws report their own contact reading")
+    if not math.isfinite(args.deg):
+        parser.error("--deg must be a finite number of degrees")
+    if args.jog_joint and args.deg == 0:
+        parser.error("--jog-joint needs a non-zero --deg")
+    hold = 10.0 if args.hold is None else args.hold
+    if not (math.isfinite(hold) and hold >= 0):
+        parser.error("--hold must be a finite number of seconds >= 0")
+    grasps = 5 if args.grasps is None else args.grasps
+    if grasps < 1:
+        parser.error("--grasps must be at least 1")
+    fake_contact = 25.0 if args.fake_contact is None else args.fake_contact
+    if not (0.0 <= fake_contact <= 100.0):
+        parser.error("--fake-contact is on the 0-100 scale")
+
+    names: list[str] = []
+    out_path: Path | None = None
+    if args.measure_grip:
+        on_file = _objects()
+        names = (
+            list(args.objects)
+            if args.objects
+            else [n for n, e in on_file.items() if e.get("kind") == "object"]
+        )
+        if not names:
+            print(
+                "no objects: pass --objects or list kind: object entries in config/objects.yaml",
+                file=sys.stderr,
+            )
+            return 2
+        for name in names:
+            if name not in on_file:
+                print(
+                    f"note: {name} is not in config/objects.yaml; measuring it anyway (add its entry before "
+                    "pasting held_min)",
+                    file=sys.stderr,
+                )
+        try:
+            out_path = _report_path(args.out, "gripper")
+        except FileExistsError as exc:
+            print(exc, file=sys.stderr)
+            return 2
+    action_name = (
+        "--jog" if args.jog else f"--jog-joint {args.jog_joint}" if args.jog_joint else "--measure-grip"
+    )
+
     if args.fake or (not args.real and _fake("FAKE_ROBOT")):
         driver = FakeDriver()
-        ok = jog(driver, deg=args.deg, realtime=False)
-        print("fake jog", "ok" if ok else "stopped", f"({len(driver.commands)} commands)")
-        return 0 if ok else 1
+        if args.jog:
+            ok = jog(driver, deg=args.deg, realtime=False)
+            print("fake jog", "ok" if ok else "stopped", f"({len(driver.commands)} commands)")
+            return 0 if ok else 1
+        if args.jog_joint:
+            try:
+                result = jog_joint(
+                    driver, args.jog_joint, deg=args.deg, hold_s=hold, realtime=False, fk=_fk_tip_or_none()
+                )
+            except ValueError as exc:
+                print(f"refused: {exc}", file=sys.stderr)
+                return 2
+            print("fake jog-joint", "ok" if result["ok"] else "stopped", f"({len(driver.commands)} commands)")
+            return 0 if result["ok"] else 1
+        assert out_path is not None
+        try:
+            report = measure_grip(driver, objects=names, grasps=grasps, fake_contact_pct=fake_contact)
+        except ValueError as exc:
+            print(f"refused: {exc}", file=sys.stderr)
+            return 2
+        _print_grip_summary(report, _write_report(report, out_path))
+        print(
+            "fake measure-grip",
+            "stopped" if report["stopped"] else "ok",
+            f"({len(driver.commands)} commands)",
+        )
+        return 1 if report["stopped"] else 0
     if not args.real:
         print("Refusing to touch the arm without --real (use --fake for the in-memory arm).", file=sys.stderr)
         return 2
@@ -1281,15 +2182,53 @@ def main(argv: list[str] | None = None) -> int:
             print("Stopped before connecting; nothing moved.")
             return 1
         driver.connect()
+        connected_at = time.monotonic()  # Esc presses before this are connect-phase (see esc_phase)
+        rc = 1
         try:
             if watcher.pressed or driver.stopped:
-                driver.freeze()
-                print("Esc pressed while connecting: arm frozen with torque on, nothing moved.")
-                ok = False
+                if not driver.stopped:  # connect() applies a pending freeze itself; never re-stamp it
+                    driver.freeze()
+                print(
+                    f"Esc pressed while connecting: arm frozen with torque on, nothing moved ({action_name})."
+                )
+            elif args.jog:
+                rc = 0 if jog(driver, deg=args.deg) else 1
+            elif args.jog_joint:
+                try:
+                    result = jog_joint(
+                        driver, args.jog_joint, deg=args.deg, hold_s=hold, fk=_fk_tip_or_none()
+                    )
+                    rc = 0 if result["ok"] else 1
+                except ValueError as exc:
+                    print(f"refused: {exc}", file=sys.stderr)
+                    rc = 2
             else:
-                ok = jog(driver, deg=args.deg)
-            if watcher.pressed and watcher.pressed_at is not None and driver.frozen_at is not None:
-                print(f"Esc -> freeze command: {(driver.frozen_at - watcher.pressed_at) * 1000:.0f} ms")
+                assert out_path is not None
+                try:
+                    report = measure_grip(
+                        driver,
+                        objects=names,
+                        grasps=grasps,
+                        lerobot_id=getattr(driver, "follower_id", None),
+                        calibration_sha256=_calibration_sha256(driver),
+                    )
+                except ValueError as exc:
+                    print(f"refused: {exc}", file=sys.stderr)
+                    rc = 2
+                else:
+                    _print_grip_summary(report, _write_report(report, out_path))
+                    rc = 1 if report["stopped"] else 0
+            if watcher.pressed:
+                extra: dict[str, Any] = {"mode": "real", "frozen": driver.stopped}
+                if not args.measure_grip:
+                    extra["deg"] = args.deg
+                report_esc_latency(
+                    watcher,
+                    driver,
+                    source=f"arm.driver {action_name}",
+                    connected_at=connected_at,
+                    extra=extra,
+                )
             if driver.stopped:
                 print("Arm is FROZEN with torque on. Press Enter to release the port (torque stays on).")
                 try:
@@ -1298,7 +2237,7 @@ def main(argv: list[str] | None = None) -> int:
                     pass
         finally:
             driver.disconnect()  # torque stays on; the arm keeps holding its pose
-        return 0 if ok else 1
+        return rc
     finally:
         watcher.stop()
 
