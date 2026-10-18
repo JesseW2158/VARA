@@ -187,7 +187,8 @@ currently release props from 15 cm into the tray; that maneuver has simulation e
 **What is still physical:** the arm mapping (A6), grip (A11), Esc drill (A13), camera mount and table
 calibration (B3 to B6), the camera soak (B1), the first real learn (I3) and every keyed service gate.
 [docs/runbook.md](docs/runbook.md) is the one ordered procedure from tonight's state to the judging table;
-`tests/test_docs_runbook.py` keeps its commands valid. Every tool below writes timestamped evidence under
+[docs/arm-guide.md](docs/arm-guide.md) walks through calibrating and running the arm in plain language;
+`tests/test_docs_runbook.py` keeps the commands in both valid. Every tool below writes timestamped evidence under
 `runs/` (`VARA_RUNS_DIR` moves it) and never overwrites it. Commands that move the arm take `--real`, ask
 you to type that the arm is clear, count down 3 s and freeze the arm on Esc.
 

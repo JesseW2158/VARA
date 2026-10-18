@@ -9,7 +9,9 @@ Run everything from the repository root in PowerShell. Steps marked **MOVES THE 
 with a hand on Esc, one holding the follower's 12 V plug, and the table clear. Every such command asks you
 to type that the arm is clear, counts down 3 s and freezes the arm with torque on when Esc is pressed.
 [tests/test_docs_runbook.py](../tests/test_docs_runbook.py) checks that every command below still exists
-with the flags shown. Gate status lives in [gates.md](gates.md).
+with the flags shown. Gate status lives in [gates.md](gates.md). For the arm and camera steps explained in
+plain language (what each step is for, what you should see, what to do when it fails), read
+[arm-guide.md](arm-guide.md).
 
 ## Part 1: offline demo and backup clip
 
