@@ -708,8 +708,14 @@ class Session:
         events: list[str] | None = None,
         hand_freeze: bool = True,
         cancelled: Callable[[], bool] | None = None,
+        remember_hand: bool = False,
     ) -> None:
         self.driver = driver
+        # carry_to_hand only: a wristband the arm itself hides from the overhead camera stays at its last
+        # seen position (aim, speed cap and release), instead of vanishing and sending the carry away
+        self.remember_hand = remember_hand
+        self.last_hand: Vec3 | None = None
+        self.hand_remembered = False
         self.scene_fn = scene
         self.pacer = pacer if pacer is not None else Pacer(not getattr(driver, "is_fake", False))
         self.on_event = on_event
@@ -745,12 +751,18 @@ class Session:
         return scene
 
     def hand(self) -> Vec3 | None:
-        """The seen wristband's (x, y, z), or None when there is no hand data or it is not seen."""
+        """The seen wristband's (x, y, z), or None when there is no hand data or it is not seen. With
+        `remember_hand`, an unseen wristband that was seen earlier in this session reads as its last seen
+        position (`hand_remembered` is then True): the arm covering the marker must not make it vanish."""
+        self.hand_remembered = False
         scene = self.scene_dict()
         if scene is None:
             return None
         hand = scene.get("hand")
         if not isinstance(hand, dict) or not hand.get("seen"):
+            if self.remember_hand and self.last_hand is not None:
+                self.hand_remembered = True
+                return self.last_hand
             return None
         try:
             xyz = (float(hand["x"]), float(hand["y"]), float(hand["z"]))
@@ -758,6 +770,7 @@ class Session:
             raise ValueError(f"malformed hand entry in the scene: {_short(hand, 80)}") from exc
         if not all(math.isfinite(v) for v in xyz):
             raise ValueError(f"non-finite hand position in the scene: {xyz}")
+        self.last_hand = xyz
         return xyz
 
     # -- state -----------------------------------------------------------------------------------------------

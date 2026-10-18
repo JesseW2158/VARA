@@ -18,8 +18,10 @@ ceiling).
 - `freeze(driver)`: the driver's freeze (hold in place, torque on) plus the module-level cancel flag that
   any running primitive checks every tick; a cancelled primitive returns reason `stopped`.
 - `carry_to_hand(obj, *, driver, scene, on_event, timeout, ...)`: with the object held, take the grasp
-  center (`arm.ik.fk_grasp`) to the target, the seen wristband + 0.05 m (the handoff zone when the hand is
-  unseen). A target outside the workspace box latches a fallback to the configured handoff zone; a
+  center (`arm.ik.fk_grasp`) to the target, the seen wristband + 0.05 m (the handoff zone when no hand has
+  been seen; a wristband that disappears, typically under the arm itself, keeps its last seen position for
+  the aim, the speed cap and the release, `Session(remember_hand=True)`). A target outside the workspace
+  box latches a fallback to the configured handoff zone; a
   valid target near the tape is inset TARGET_INSET_M to leave room for the tip. The handoff zone must
   itself have that inset. The carry has three legs, like `arm.sim_robot.SimRobot.carry_to_hand`:
   1. Rise: straight up at the present xy to the carry height, the sim's clearance rule
@@ -350,9 +352,11 @@ def home(
     sleep: Callable[[float], None] | None = None,
     realtime: bool | None = None,
     hand_freeze: bool = True,
+    last_hand: Vec3 | None = None,
 ) -> dict[str, Any]:
     """Move to `home_q` at <= `max_step_rad` (default HOME_STEP_RAD, 1 degree) per joint per tick along a
-    validated plan (see the module docstring).
+    validated plan (see the module docstring). `last_hand` (carry_to_hand's final leg) is the wristband's
+    last seen position: while the arm still covers it, the speed cap near the hand keeps using it.
 
     `scene` gives the hand check its data; `hand_freeze=False` (carry_to_hand's final leg, which starts
     right above the hand) keeps only the speed cap. Returns `{"ok", "reason", "events"}`.
@@ -370,7 +374,9 @@ def home(
             events=events,
             hand_freeze=hand_freeze,
             cancelled=cancelled,
+            remember_hand=last_hand is not None,
         )
+        session.last_hand = last_hand
         q_home = _home_target()
     except Exception as exc:  # a bad argument, config or arm.ik unavailable: nothing moved, nothing frozen
         return setup_failure(events, on_event, exc)
@@ -482,6 +488,7 @@ def carry_to_hand(
             events=events,
             hand_freeze=False,
             cancelled=cancelled,
+            remember_hand=True,
         )
         _home_target()
     except Exception as exc:  # a bad argument, config or arm.ik unavailable: nothing moved, nothing frozen
@@ -515,6 +522,7 @@ def carry_to_hand(
             sleep=pacer.sleep,
             realtime=pacer.realtime,
             hand_freeze=False,
+            last_hand=session.last_hand,
         )
         events.extend(result["events"])  # home() already passed each through on_event
         if not result["ok"]:
@@ -844,9 +852,15 @@ class _HandLog:
         self.seen = False
 
     def __call__(self, hand: Vec3 | None, grasp: Sequence[float], t: float) -> None:
-        if hand is None:
+        if hand is None or getattr(self.session, "hand_remembered", False):
             if self.seen:
-                self.session.emit(f"{self.where} t={t:.1f} s: hand unseen")
+                if hand is None:
+                    self.session.emit(f"{self.where} t={t:.1f} s: hand unseen")
+                else:  # the arm covers the wristband: keep aiming at where it was last seen
+                    self.session.emit(
+                        f"{self.where} t={t:.1f} s: hand unseen; using its last position "
+                        f"({hand[0]:.3f}, {hand[1]:.3f})"
+                    )
             self.seen = False
             return
         self.seen = True

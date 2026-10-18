@@ -28,8 +28,8 @@
     "trials": 5
   },
   "real": {
-    "runs": 0,
-    "successes": 0
+    "runs": 7,
+    "successes": 6
   },
   "created": "2026-10-17T08:29:40-04:00"
 }

@@ -346,15 +346,17 @@ def repair(
     n: int = 6,
     on_rejected: Callable[[Candidate], None] | None = None,
     task_id: str | None = None,
+    out_name: str = "repair",
 ) -> list[Candidate]:
-    """The repair round: six new candidates written against the three best failures (C7, normal mode)."""
+    """The repair round: six new candidates written against the three best failures (C7, normal mode).
+    `out_name` is the folder under `task_dir` (later rounds of VARA_REPAIR_ROUNDS use repair-2, ...)."""
     task_dir = Path(task_dir)
     best = list(failures)[:3]
     jobs = []
     for i in range(1, int(n) + 1):
         hint = HINTS[(i - 1) % len(HINTS)]
         jobs.append(_Job(i, hint, repair_messages(spec, scene, skills, hint, best), "repair"))
-    out_dir = task_dir / "repair"
+    out_dir = task_dir / out_name
     return _run_jobs(jobs, str(spec["name"]), task_dir, out_dir, timeout, False, on_rejected, task_id)
 
 

@@ -226,6 +226,30 @@ BUDGETS: dict[str, dict[str, Any]] = {
 }
 
 
+CONNECT_ATTEMPTS = 3  # --real startup: a motor bus glitch during setup gets this many tries
+CONNECT_RETRY_S = 2.0
+REPAIR_ROUNDS_DEFAULT = 1  # the contract's budget table: one repair round in normal mode
+REPAIR_ROUNDS_MAX = 5
+
+
+def repair_rounds() -> int:
+    """How many repair rounds a learn gets in normal mode when no candidate passes: VARA_REPAIR_ROUNDS
+    (0 to REPAIR_ROUNDS_MAX), else REPAIR_ROUNDS_DEFAULT. Values beyond the range are clamped and a bad
+    value is ignored, both with a warning. DEMO_MODE has no repair round at all (BUDGETS)."""
+    raw = os.environ.get("VARA_REPAIR_ROUNDS", "").strip()
+    if not raw:
+        return REPAIR_ROUNDS_DEFAULT
+    try:
+        value = int(raw)
+    except ValueError:
+        log.warning("VARA_REPAIR_ROUNDS=%r is not a whole number; using %d", raw, REPAIR_ROUNDS_DEFAULT)
+        return REPAIR_ROUNDS_DEFAULT
+    clamped = min(max(value, 0), REPAIR_ROUNDS_MAX)
+    if clamped != value:
+        log.warning("VARA_REPAIR_ROUNDS=%d is outside 0-%d; using %d", value, REPAIR_ROUNDS_MAX, clamped)
+    return clamped
+
+
 def _fake(flag: str) -> bool:
     return os.environ.get("FAKE") == "1" or os.environ.get(flag) == "1"
 
@@ -1199,10 +1223,23 @@ class Orchestrator:
         results = self._simulate(task, spec, cands, task.dir)
         winner, ranked = self._select(task, results)
         if winner is None and BUDGETS[task.mode]["repair"]:
-            failures = [self._failure_of(entry) for entry in ranked[:3]]
-            cands = self._write_code(task, spec, before, failures=failures)
-            results = self._simulate(task, spec, cands, task.dir / "repair")
-            winner, ranked = self._select(task, results)
+            rounds = repair_rounds()
+            for round_no in range(1, rounds + 1):
+                # each round writes against the best failures so far (the latest round's ranking)
+                failures = [self._failure_of(entry) for entry in ranked[:3]]
+                out_name = "repair" if round_no == 1 else f"repair-{round_no}"
+                try:
+                    cands = self._write_code(task, spec, before, failures=failures, out_name=out_name)
+                except Queued:
+                    if round_no == rounds:
+                        raise
+                    continue  # nothing valid this round (a model timeout, say): the next round tries again
+                results = self._simulate(task, spec, cands, task.dir / out_name)
+                winner, round_ranked = self._select(task, results)
+                if round_ranked:
+                    ranked = round_ranked
+                if winner is not None:
+                    break
         if winner is None:
             raise Queued(task.text, NO_CANDIDATE)
         self._run_and_save(task, spec, winner, ranked, before)
@@ -1257,6 +1294,7 @@ class Orchestrator:
         spec: dict[str, Any],
         scene: dict[str, Any],
         failures: list[dict[str, Any]] | None = None,
+        out_name: str = "repair",
     ) -> list[candidates.Candidate]:
         budget = self._budget(task, "writing_code") or 45.0
         hints = candidates.HINTS
@@ -1300,6 +1338,7 @@ class Orchestrator:
                     timeout=budget,
                     n=N_CANDIDATES,
                     on_rejected=on_rejected,
+                    out_name=out_name,
                 )
 
         cands = list(self._call(task, "writing_code", write, budget=budget + STAGE_GRACE_S))
@@ -2136,7 +2175,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print("startup stopped; nothing connected")
                 return 1
             console["connecting"] = True
-            driver.connect()
+            for attempt in range(1, CONNECT_ATTEMPTS + 1):
+                try:
+                    driver.connect()
+                    break
+                except ConnectionError as exc:
+                    # one dropped status packet during LeRobot's motor setup aborts the whole connect (its
+                    # writes do not retry); a failed connect already put the arm back to holding
+                    if attempt == CONNECT_ATTEMPTS or watcher.pressed or driver.stopped:
+                        raise
+                    print(f"connect failed ({exc}); retrying in {CONNECT_RETRY_S:.0f} s")
+                    time.sleep(CONNECT_RETRY_S)
             console["connected_at"] = time.monotonic()
             if watcher.pressed or driver.stopped or real_robot.cancelled() or orch.stop_event.is_set():
                 orch.stop("stopped while connecting")

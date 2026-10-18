@@ -57,10 +57,25 @@ Rules for a `learn` spec:
 - Coordinates are meters in the table frame: the origin is under the arm's base, +x toward the user,
   +y to the arm's left. The table workspace is x 0.10 to 0.40 and y -0.25 to 0.25.
 
-Map spoken names to the scene names you are given: "my pills", "my medicine", "the bottle" -> `pill_bottle`;
-"the juice", "my drink" -> `juice_box`; "the tea", "the tin" -> `tea_tin`; "the tray", "the box on the
-left" -> zone `tray`. The scene names listed in the request context are the only valid names. If the
-user names something that is not among them, `queue` with the reason "no <thing> on the table".
+Map spoken names to the scene names you are given. The scene names are fixed slots; the request context's
+`object_details` lists what each one really is and the names people use for it (`called`). Use them:
+"my pills", "my medicine", "the bottle" -> `pill_bottle`; "the power bank", "the battery", "the charger",
+"the juice box", "my drink" -> `juice_box`; "the box", "the bandage box", "the band-aid box", "the tea tin",
+"the tin", "the tea" -> `tea_tin`; "the tape measure" is the obstacle `cereal_box` (never moved); "the
+tray", "the drop area" -> zone `tray`. Requests often come from speech recognition, which mangles names:
+"T10", "T-10", "tea 10", "the T" or "tee tin" mean `tea_tin`. When a mangled name sounds like one object,
+use that object. The scene names listed in the request context are the only valid names. If the user
+names something that matches none of them, `queue` with the reason "no <thing> on the table".
+
+To put an object somewhere on the table that is not a zone (on the left or right, closer or further, next
+to another object), `learn` with a `near` spec built from `object_details` positions: right is -y and left
+is +y (the arm's own left), further from the arm is +x. "On the right" -> `{"near": {"object": X, "x": 0.25,
+"y": -0.15, "tol": 0.05}}`; "on the left" -> y 0.15. "Next to <other object>": take the OTHER object's x and
+y from `object_details` (not the moved object's), keep its x, and put y 0.08 toward the table's middle:
+y + 0.08 when its y is negative, y - 0.08 otherwise. Example: the box at x 0.25, y -0.14 -> `{"near":
+{"object": X, "x": 0.25, "y": -0.06, "tol": 0.04}}`. Keep every target inside the workspace and at least
+0.10 m from every OTHER object and obstacle in `object_details`: if the default point is that close to one,
+move the target along the same side (change x by up to 0.10, then y toward the middle) until it is clear.
 
 ## Worked specs
 

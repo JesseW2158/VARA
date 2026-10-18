@@ -46,6 +46,8 @@ class FakeBus:
         self.torque = dict.fromkeys(MOTORS, 0)
         self.lose_writes: set[str] = set()  # motors whose Goal_Position writes silently vanish
         self.gripper_block_raw: int | None = None  # an object stops the jaws at this raw position
+        self.gains: dict[str, tuple[int, int]] = {}  # motor -> (P_Coefficient written, torque at the time)
+        self.fail_gain_writes = False
         self.max_jump = 0  # largest present-position change caused by a goal write or torque enable
         self.port_handler = SimpleNamespace(closePort=self.close_port)
 
@@ -103,6 +105,11 @@ class FakeBus:
 
     def write(self, data_name, motor, value, *, normalize=True, num_retry=0):
         self.log.append(("write", data_name, motor, value, normalize))
+        if data_name == "P_Coefficient":  # a settings write: the servos accept it only with torque off
+            if self.fail_gain_writes:
+                raise ConnectionError("no status packet")
+            self.gains[motor] = (int(value), self.torque[motor])
+            return
         assert data_name == "Goal_Position", data_name
         if motor in self.lose_writes:
             return
@@ -252,6 +259,8 @@ def test_connect_call_order_and_no_jump():
         *[("write", "Goal_Position", m, False) for m in MOTORS],
         ("configure",),
         ("disable_torque",),
+        # the arm joints' gain, in configure's torque-off window (the gripper keeps LeRobot's)
+        *[("write", "P_Coefficient", m, True) for m in driver.JOINTS],
         *[("write", "Goal_Position", m, False) for m in MOTORS],
         ("enable_torque",),
     ]
@@ -954,3 +963,45 @@ def test_a_gripper_inside_the_map_is_not_warned(monkeypatch, tmp_path, caplog):
     with caplog.at_level("WARNING", logger=driver.log.name):
         d.read()
     assert not [r for r in caplog.records if "past open_pct" in r.getMessage()]
+
+
+def test_connect_raises_the_arm_joints_gain_with_torque_off_and_leaves_the_gripper(monkeypatch):
+    monkeypatch.delenv("VARA_ARM_P", raising=False)
+    d, log, robots = build()
+    d.connect()
+    bus = robots[0].bus
+    assert set(bus.gains) == set(driver.JOINTS) and driver.GRIPPER not in bus.gains
+    assert all(p == driver.ARM_P_DEFAULT and torque == 0 for p, torque in bus.gains.values())
+    gain_at = max(i for i, e in enumerate(log) if e[:2] == ("write", "P_Coefficient"))
+    enabled_at = max(i for i, e in enumerate(log) if e == ("enable_torque",))
+    assert gain_at < enabled_at  # written before the arm was powered again
+    assert all(bus.torque[m] == 1 for m in driver.MOTORS)
+
+
+def test_the_arm_gain_follows_vara_arm_p_and_refuses_bad_values_before_the_port_opens(monkeypatch):
+    monkeypatch.setenv("VARA_ARM_P", "32")
+    d, _log, robots = build()
+    d.connect()
+    assert {p for p, _t in robots[0].bus.gains.values()} == {32}
+    for bad in ("7", "41", "stiff"):
+        monkeypatch.setenv("VARA_ARM_P", bad)
+        d, log, robots = build()
+        with pytest.raises(ValueError):
+            d.connect()
+        assert robots == [] and log == []  # nothing built, nothing opened
+
+
+def test_a_failed_gain_write_still_powers_the_arm(monkeypatch):
+    monkeypatch.delenv("VARA_ARM_P", raising=False)
+    built: list = []
+
+    def factory(**config):
+        robot = FakeRobot(built, **config)
+        robot.bus.fail_gain_writes = True
+        return robot
+
+    d = Driver(robot_factory=factory)
+    d.connect()
+    assert d.connected and d.torque
+    bus = d.robot.bus
+    assert bus.gains == {} and all(bus.torque[m] == 1 for m in driver.MOTORS)

@@ -48,6 +48,7 @@ from pathlib import Path
 from typing import Any
 
 import jsonschema
+import yaml
 
 from agents import llm
 from agents.llm import chat, normalize, router_model
@@ -74,6 +75,7 @@ __all__ = [
 
 ROOT = Path(__file__).resolve().parents[1]
 PROMPT_PATH = ROOT / "agents" / "prompts" / "router.md"
+OBJECTS_CONFIG = ROOT / "config" / "objects.yaml"  # only for the `called` names in the router context
 SCHEMA_PATH = ROOT / "schemas" / "router.json"
 PHRASES_PATH = ROOT / "tests" / "fixtures" / "router_phrases.json"
 FAKE_SCENE_PATH = ROOT / "config" / "fake_scene.json"
@@ -111,6 +113,14 @@ OBJECT_WORDS: dict[str, str] = {
     "tea tin": "tea_tin",
     "tea": "tea_tin",
     "tin": "tea_tin",
+    # the 2026-10-18 props keep the slot names: the power bank is juice_box, the box is tea_tin
+    "power bank": "juice_box",
+    "battery": "juice_box",
+    "charger": "juice_box",
+    "bandage box": "tea_tin",
+    "band aid box": "tea_tin",
+    "t10": "tea_tin",
+    "t 10": "tea_tin",
 }
 HAND_VERBS = ("hand", "give", "pass", "bring", "fetch", "get")
 # keyword_route: words that may lead a "stop" ("please stop what you are doing"); words that negate a
@@ -202,6 +212,37 @@ def route(
     return _finish(result)
 
 
+def _object_details(scene: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    """Per object and obstacle in the scene: what it is and what people call it (config/objects.yaml
+    `called`, the slot names are fixed) and its table position in meters (x out from the arm, y to its
+    left), so "the box", a misheard "T10" or "on the right" can be routed."""
+    called = _called_names()
+    out: dict[str, dict[str, Any]] = {}
+    for group in ("objects", "obstacles"):
+        for name, item in (scene.get(group) or {}).items():
+            entry: dict[str, Any] = {"kind": group[:-1], "called": called.get(name, [])}
+            if isinstance(item, Mapping):
+                try:
+                    entry["x"], entry["y"] = round(float(item["x"]), 2), round(float(item["y"]), 2)
+                except (KeyError, TypeError, ValueError):
+                    pass
+            out[str(name)] = entry
+    return out
+
+
+def _called_names() -> dict[str, list[str]]:
+    """config/objects.yaml's `called` lists by object name ({} when the file or the field is missing)."""
+    try:
+        raw = yaml.safe_load(OBJECTS_CONFIG.read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError):
+        return {}
+    out: dict[str, list[str]] = {}
+    for entry in raw.values() if isinstance(raw, dict) else []:
+        if isinstance(entry, dict) and isinstance(entry.get("called"), list):
+            out[str(entry.get("name"))] = [str(v) for v in entry["called"]]
+    return out
+
+
 def build_messages(
     text: str, skills: Sequence[Mapping[str, Any]], scene: Mapping[str, Any]
 ) -> list[dict[str, str]]:
@@ -220,6 +261,7 @@ def build_messages(
             "objects_not_currently_seen": unseen,
             "obstacles": list((scene.get("obstacles") or {}).keys()),
             "zones": list((scene.get("zones") or {}).keys()),
+            "object_details": _object_details(scene),
         },
         "request": text,
     }

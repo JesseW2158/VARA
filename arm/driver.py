@@ -140,6 +140,37 @@ ROBOT_CONFIG: dict[str, Any] = {
     "disable_torque_on_disconnect": False,
 }
 
+# Servo position gain (P_Coefficient) written to the five arm joints at connect. LeRobot writes 16 to every
+# motor; at 16 the arm sagged about 3 cm at home and could not lift a held prop to its carry height
+# (2026-10-18). The gripper keeps LeRobot's 16 so it does not squeeze harder (its torque is capped at 50 %).
+# VARA_ARM_P overrides it within ARM_P_RANGE; the servos only accept it while torque is off.
+ARM_P_DEFAULT = 24
+ARM_P_RANGE = (8, 40)
+GAIN_WRITE_RETRIES = 2  # a dropped status packet on the bus is retried this many times per gain write
+
+
+def arm_p_coefficient() -> int:
+    """The P gain for the five arm joints: VARA_ARM_P when set, else ARM_P_DEFAULT; ValueError outside
+    ARM_P_RANGE or for a non-integer value."""
+    raw = os.environ.get("VARA_ARM_P", "").strip()
+    if not raw:
+        return ARM_P_DEFAULT
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ValueError(f"VARA_ARM_P must be an integer, got {raw!r}") from None
+    lo, hi = ARM_P_RANGE
+    if not lo <= value <= hi:
+        raise ValueError(f"VARA_ARM_P must be between {lo} and {hi}, got {value}")
+    return value
+
+
+def _write_arm_gains(bus: Any, p: int) -> None:
+    """P_Coefficient for the five arm joints (not the gripper). Torque must be off (configure's window)."""
+    for motor in JOINTS:
+        bus.write("P_Coefficient", motor, p, num_retry=GAIN_WRITE_RETRIES)
+
+
 # MJCF ranges (sim/model/so101_new_calib.xml), used until A6 writes config/limits.yaml.
 DEFAULT_LIMITS: dict[str, list[float]] = {
     "shoulder_pan": [-1.9199, 1.9199],
@@ -1151,6 +1182,7 @@ class Driver(_DriverBase):
                     "the follower's port in .env"
                 )
             follower_id = self.follower_id
+            arm_p = arm_p_coefficient()  # a bad VARA_ARM_P refuses before the port opens
             robot = self._robot_factory(port=port, id=follower_id, **ROBOT_CONFIG)
             bus = robot.bus
             try:
@@ -1168,10 +1200,21 @@ class Driver(_DriverBase):
                 self.goal_syncs += 1
                 enable_torque = bus.enable_torque
 
+                gains_written = False
+
                 def sync_and_enable(motors: Any = None, num_retry: int = 0) -> None:
-                    nonlocal present
+                    nonlocal present, gains_written
                     # LeRobot 0.6.2 torque_disabled() calls this in its finally, including after a
                     # configuration exception. The initial sync is stale if an unpowered joint sagged.
+                    if not gains_written:
+                        gains_written = True
+                        try:
+                            # torque is still off here, after configure() wrote its P of 16 to every motor
+                            _write_arm_gains(bus, arm_p)
+                            log.info("Driver.connect: arm joints P_Coefficient %d (gripper unchanged)", arm_p)
+                        except Exception:
+                            # never leave the arm limp over a gain: keep LeRobot's and power it as usual
+                            log.exception("Driver.connect: could not write the arm gains; keeping LeRobot's")
                     present = _sync_goals(bus)
                     self.goal_syncs += 1
                     enable_torque(motors, num_retry=num_retry)

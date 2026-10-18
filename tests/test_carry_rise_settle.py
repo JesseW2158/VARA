@@ -106,3 +106,52 @@ def test_a_blocked_arm_still_stops_holding_the_object_after_the_top_ups():
     assert result["reason"] == "error"
     assert any("did not reach its clearance height" in e for e in result["events"]), result["events"]
     assert d.stopped and "released" not in result["events"]
+
+
+def _occluding_scene(driver, hand=(0.26, 0.134, 0.03), hidden_within=0.15):
+    """The wristband, hidden from the overhead camera while the grasp center is within `hidden_within`
+    of it (the arm covers the marker), seen otherwise; the tracker keeps its last pose when unseen."""
+    base = json.loads(json.dumps(FAKE_SCENE))
+    base["hand"].update({"x": hand[0], "y": hand[1], "z": hand[2], "seen": True})
+
+    def scene():
+        q, _g = FakeDriver.read(driver)
+        (gx, gy, gz), _ = ik.fk_grasp(q)
+        s = json.loads(json.dumps(base))
+        s["hand"]["seen"] = math.dist((gx, gy, gz), hand) > hidden_within
+        return s
+
+    return scene
+
+
+def test_a_hand_the_arm_covers_keeps_its_last_position_and_the_object_is_released_there():
+    # 2026-10-18, real arm: the wristband vanished under the arm 15 cm out, the carry turned to the handoff
+    # zone on the other side, the wristband reappeared, and the arm went back and forth
+    hand = (0.26, 0.134, 0.03)
+    d = FakeDriver(q0=START, gripper0=0.2)
+    result = real_robot.carry_to_hand(
+        "pill_bottle", driver=d, scene=_occluding_scene(d, hand), realtime=False
+    )
+    events = result["events"]
+    assert result["ok"], events
+    assert any("hand unseen; using its last position (0.260, 0.134)" in e for e in events), events
+    assert "released" in events and not any("falling back to the handoff zone" in e for e in events)
+    # never turned away: once within 15 cm, the grasp center never got more than 3 cm further from the hand
+    dists = [math.dist(ik.fk_grasp(q)[0], hand) for q, _g in d.commands]
+    first_close = next(i for i, x in enumerate(dists) if x <= 0.15)
+    release_at = next(i for i, (_q, g) in enumerate(d.commands) if i > first_close and g >= 0.99)
+    assert max(dists[first_close:release_at]) <= 0.18, max(dists[first_close:release_at])
+
+
+def test_the_speed_cap_near_the_hand_holds_while_it_is_covered():
+    hand = (0.26, 0.134, 0.03)
+    d = FakeDriver(q0=START, gripper0=0.2)
+    real_robot.carry_to_hand("pill_bottle", driver=d, scene=_occluding_scene(d, hand), realtime=False)
+    slow = replay.TIP_SPEED_NEAR_HAND * replay.TICK
+    tips = [ik.fk_tip(q) for q, _g in d.commands]
+    near = [
+        math.dist(a, b)
+        for a, b in zip(tips, tips[1:], strict=False)
+        if min(math.dist(a, hand), math.dist(b, hand)) < replay.HAND_SLOW_M
+    ]
+    assert near and max(near) <= slow * (1 + 1e-6), max(near)
