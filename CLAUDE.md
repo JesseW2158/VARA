@@ -85,5 +85,5 @@ Verified 2026-10-17. Full notes: `C:\Users\jesse\lerobot-tools\HANDOFF.md`, outs
 - LeRobot 0.6.2 (Seeed fork) is installed editable from `C:\Users\jesse\lerobot` in the conda env `lerobot` (Python 3.12, under `C:\Users\jesse\miniforge3`, not on PATH). There is no `python3.12` on PATH. The project `.venv` is also verified: Python 3.12.15, the same editable LeRobot 0.6.2, and no pip module. Run `.venv/Scripts/python.exe`; install with `uv pip install --python .venv/Scripts/python.exe ...`. Use `requirements-rl.txt` for PPO and browser-compatible video encoding.
 - The SenseCraft Robotics app also opens COM7 and COM8, and only one program can hold a port. Close it first.
 - LeRobot's interactive CLIs (calibrate, record) read the physical keyboard, so run them in a visible console, never in the background.
-- The built-in webcam is OpenCV index 0 (DSHOW only), so `OVERHEAD_CAM=0` from `.env.example` opens the laptop camera, not the overhead one.
+- DSHOW camera indices shift on replug or reboot (2026-10-18: overhead 0, built-in webcam 1, wrist 2). Run `python -m vision.cameras --list`, look at the saved frames, then set `OVERHEAD_CAM` and `WRIST_CAM` in `.env`.
 - No NVIDIA GPU: PPO trains on the CPU or in Daytona sandboxes.

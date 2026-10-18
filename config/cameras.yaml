@@ -1,7 +1,8 @@
 # Camera settings (B1). Both cameras run at 640x480, 30 fps, MJPG so two streams fit one USB bus.
 # The index is overridden by the environment: OVERHEAD_CAM and WRIST_CAM (set them in .env; they come
-# from lerobot-find-cameras opencv). On the demo laptop OpenCV index 0 is the built-in webcam (DSHOW),
-# and the current USB overhead camera is 2 and wrist camera is 1. With FAKE_CAMERA=1 (or FAKE=1)
+# from lerobot-find-cameras opencv). On the demo laptop the DSHOW order shifts on replug or reboot: on
+# 2026-10-18 index 0 was the overhead camera, 1 the built-in webcam and 2 the wrist camera. Check with
+# `python -m vision.cameras --list` (it saves one frame per index) before setting them. With FAKE_CAMERA=1 (or FAKE=1)
 # vision.cameras.get_camera() returns a FakeCamera that renders config/fake_scene.json instead.
 overhead: {index: 0, width: 640, height: 480, fps: 30, fourcc: MJPG}
 # The wrist camera only shows the scene to people (and one still per grasp), so it keeps the camera's auto
