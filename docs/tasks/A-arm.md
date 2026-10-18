@@ -73,6 +73,8 @@ Assembled kits normally ship with motor IDs set. Run `lerobot-setup-motors` only
 
 **Done when:** `pytest -q tests/test_config.py` passes, and teleoperation holds each object 5 of 5 times.
 
+**Tools added 2026-10-17:** `.\.venv\Scripts\python.exe -m arm.driver --real --measure-grip --objects pill_bottle juice_box tea_tin --grasps 5` runs steps 1, 2 and 4: it asks for the jaw opening in mm, reads the empty-closed value 0.5 s after a close on nothing, then closes on each object five times and asks whether it held. It writes `runs/calibration/gripper-<UTC>.json` (or a new `--out PATH`) and prints the `gripper:` line for `config/joint_map.yaml` and `held_min` per object for `config/objects.yaml`; paste them by hand, then run `.\.venv\Scripts\python.exe -m pytest -q tests/test_config.py`. Nothing under `config/` is written. Like the A6 jog, it refuses with exit 2, before anything moves, when a joint of the start pose lies more than 0.5 degrees outside the commandable band (`config/limits.yaml` minus 3 degrees), and names the joint; the rest pose is outside the placeholder band, so pose the arm mid-range first. Esc freezes the arm and ends the session; the partial report is still written, without paste lines. The first real session must check that the Esc watcher does not take characters typed at the prompts. Offline: `.\.venv\Scripts\python.exe -m arm.driver --fake --measure-grip --objects pill_bottle --grasps 2 --fake-contact 25 --out <new path>`. Order: Part 3 of the [operator runbook](../runbook.md#part-3-arm-calibration-a6-a11-a13).
+
 ## A4 · Driver with freeze (`arm/driver.py`)
 
 **Needs:** A3. **By:** Sat 1:30 AM. **Files:** `arm/driver.py`, `tests/test_driver_fake.py`.
@@ -101,6 +103,8 @@ countdown, goal synchronization and Esc watcher. The wrapper reads the configure
 
 **Done when:** `pytest -q tests/test_driver_fake.py` passes, and `python -m arm.driver --real --jog` moves each joint +10° and back at 30 Hz, while Esc pressed mid-move holds the arm where it is without sagging.
 
+**Tools added 2026-10-17:** `.\.venv\Scripts\python.exe -m arm.driver --fake --jog` runs the same jog on the in-memory arm as a dry run; `--real` and `--fake` are mutually exclusive, and `--port` and `--id` default to `FOLLOWER_PORT` from `.env` and `my_awesome_follower_arm`. During `.\.venv\Scripts\python.exe -m arm.driver --real --jog`, every Esc pressed after the confirmation prints `Esc -> freeze command: N ms` and appends a record with its phase to `runs/calibration/esc-latency.jsonl`, which A13 judges. The power-on and goal-sync routine before this command is Part 2 of the [operator runbook](../runbook.md#part-2-power-on-routine-every-time-before-anything-connects-to-the-follower).
+
 ## A5 · Simulation model
 
 **Needs:** A1. **By:** Sat 1:00 AM, with the tip site pushed by 12:45 AM so Lane D can start. **Files:** `sim/model/`.
@@ -126,6 +130,8 @@ The [read-only hardware report](../hardware-calibration.md) records encoder cali
 fingerprint without moving the arms. It supports A6 evidence collection; it does not replace the
 five physical measurements. The 2026-10-17 check found the leader's saved calibration differs from
 its hardware, so reconcile that separately before teleoperation.
+
+**Tools added 2026-10-17:** The sign test is `.\.venv\Scripts\python.exe -m arm.driver --real --jog-joint NAME --deg 20 --hold 10`: only that joint moves out by 20 degrees at 1 degree per 30 Hz tick, holds 10 s and returns, printing the LeRobot degrees, the mapped radians, the expected +0.349 rad and the fk tip to compare with the viewer; it writes no config. It refuses with exit 2, before anything moves, when any joint of the start pose lies more than 0.5 degrees outside the commandable band (`config/limits.yaml` minus 3 degrees), and names the joint; the rest pose is outside the placeholder band, so pose the arm mid-range first. After a read-only `.\.venv\Scripts\python.exe -m arm.inspect_hardware --follower-port COM8 --out runs/calibration/reference-pose.json` at a reference pose, `.\.venv\Scripts\python.exe -m arm.check_mapping --solve runs/calibration/solve.json` computes `offset_deg = model_deg - sign * lerobot_deg` and the calibrated `[lo, hi]` radians, prints both YAML blocks to paste, and writes `runs/calibration/solve-<UTC stamp>.json` (or a new `--out PATH`; `--calibration-file PATH` requires the current encoder cache to match the report's fingerprint). It never edits `config/`. On a rerun after recalibration, restore the placeholder joint lines in both config files first, because the sign rule assumes `sign: 1`, and re-jog after pasting to confirm each sign. Full procedure: [joint calibration](../joint-calibration.md) and Part 3 of the [operator runbook](../runbook.md#part-3-arm-calibration-a6-a11-a13).
 
 ## A7 · Inverse kinematics (`arm/ik.py`)
 
@@ -163,6 +169,8 @@ Implement `replay(traj)` per Contracts, Trajectory: bridging moves, 30 Hz stream
 
 **Done when:** `pytest -q tests/contract/test_trajectory_validate.py tests/test_replay_fake.py` passes (on the fake arm, STOP mid-path freezes, a missed grasp aborts and goes home, and a hand within 10 cm freezes), and `python -m arm.replay --real --traj <a sim-planned place_in_tray>` succeeds 4 of 5 times.
 
+**Tools added 2026-10-17:** `.\.venv\Scripts\python.exe -m arm.replay --real --traj <sim-planned traj.json> --tracker --record place_in_tray` appends one line per attempt to `runs/calibration/replays-place_in_tray.jsonl` (time, trajectory path and sha256, skill, mode, ok, reason, event count, elapsed seconds) and prints `place_in_tray: k of n ok`; a failed validation, a declined confirmation or a refused hand source leaves no line. The hand check takes `--tracker` or `--scene-file FILE`, never both. With `--real`, `--tracker` is refused (exit 2, before the prompt and before a Driver exists) when the tracker or its camera is a fake, cannot be built, or delivers no new frame in 5 s. With `--real`, `--scene-file FILE` accepts only the file of a running `.\.venv\Scripts\python.exe -m vision.scene --out FILE` on the real camera: its provenance sidecar `FILE.source.json` must say `writer: vision.scene`, `source: live` and `is_fake: false`, and the file must show a fresh scene within 5 s, otherwise the CLI exits 2 with nothing moved; an accepted file prints its writer's tracker, camera and pid. During the run a scene older than about 0.6 s reads as all unseen, and a sidecar that disappears or changes (the writer stopped or restarted) freezes the arm with torque on. `--tracker` is the stricter source: a writer whose camera returns only missed grabs keeps publishing fresh all-unseen scenes, which passes the scene-file check while the arm runs without hand data. Each Esc is recorded for A13 with source `arm.replay`. Offline rehearsal: the same command with `--fake` instead of `--real`.
+
 ## A10 · Live primitives (`arm/real_robot.py`)
 
 **Needs:** A9, B6. **By:** Sat 5:30 AM. **Files:** `arm/real_robot.py`, `config/rl.yaml`.
@@ -173,6 +181,8 @@ Implement `replay(traj)` per Contracts, Trajectory: bridging moves, 30 Hz stream
 - Hand tracking uses repeated IK moves at 10 Hz, or the RL policy when `config/rl.yaml` says `use_policy: true` (D7 sets it once M4 passes).
 
 **Done when:** `hand_over` on the pill bottle succeeds 4 of 5 times with the hand still, and `python -m arm.real_robot --real --carry-test` follows a hand moving at 5 cm/s or slower.
+
+**Tools added 2026-10-17:** `.\.venv\Scripts\python.exe -m arm.real_robot --real --carry-test --object pill_bottle --tracker` takes the hand from the live overhead tracker, with the same refusals as A9 (a fake tracker or camera, or no new frame in 5 s, exits 2 before the prompt). The alternative is `--scene-file runs/live/scene.json` with `.\.venv\Scripts\python.exe -m vision.scene --out runs/live/scene.json` running in a second window. With `--real` that file needs the writer's live provenance sidecar `runs/live/scene.json.source.json`, which `vision.scene --out` writes before its first scene and removes when it stops, so a fake or leftover scene file is refused with nothing moved. The printed result's events include one line per seen hand at 10 Hz (`carry_to_hand t=... s: hand (x, y), d m from the grasp center`), from which the 5 cm/s hand speed is read, and each Esc is recorded for A13 with source `arm.real_robot`. `carry_to_hand(..., policy={"use_policy": True, "policy": "<zip>"})` switches the RL policy on for one call without editing `config/rl.yaml` (D7 uses it). Offline: `.\.venv\Scripts\python.exe -m arm.real_robot --fake --carry-test --tracker` ends with `handoff_done`. Order: Part 5 of the [operator runbook](../runbook.md#part-5-arm-meets-camera-i2-a9-a10-a12-i3).
 
 ## A12 · Starter skills (`skills/_starter/`)
 
@@ -185,6 +195,8 @@ Write both in the skill format with `trusted: true`:
 
 **Done when:** both pass 5 of 5 trials with `python -m sim.run_candidate --skill skills/_starter/<name>.json --args '{"object": "juice_box"}' --scene config/fake_scene.json --trials 5 --seed 7 --out runs/check`, and each replays on the real arm 4 of 5 times.
 
+**Tools added 2026-10-17:** Tally each skill's real replays with the A9 recorder, for example `.\.venv\Scripts\python.exe -m arm.replay --real --traj <sim-planned traj.json> --tracker --record hand_over`, which appends to `runs/calibration/replays-hand_over.jsonl` and prints `hand_over: k of n ok` (`--record place_in_tray` likewise). `hand_over` needs a hand source, `--tracker` or `--scene-file` with the live provenance sidecar described under A9; without scene data its carry ends `error: carry clearance unavailable (no scene data)`.
+
 ## A13 · Safety layer
 
 **Needs:** A9, A10. **By:** Sat 1:00 PM. **Files:** `arm/driver.py`, `arm/replay.py`, `arm/real_robot.py`, `tests/test_safety.py`.
@@ -192,6 +204,8 @@ Write both in the skill format with `trusted: true`:
 Implement every code rule in Safety rules: the workspace box, speed caps (0.1 m/s within 15 cm of the hand), the 0.30 m ceiling, no gripper close within 10 cm of the wristband, and freeze on STOP from Esc, the dashboard and voice.
 
 **Done when:** `pytest -q tests/test_safety.py` passes (out-of-box targets refused, speed caps hold, a close near the hand refused), and on the real arm Esc freezes motion within 0.2 s, measured from the key press to the freeze command in the log.
+
+**Tools added 2026-10-17:** Every `--real` entry point (`arm.driver`, `arm.replay`, `arm.real_robot`, `scripts/touch_markers.py`, `rl.policy_runner` and the orchestrator's console Esc, recorded as `orchestrator-console`) appends each Esc to `runs/calibration/esc-latency.jsonl` with its source and a phase: `session` when pressed after the driver's connect returned, `connect` when pressed while connecting, with nothing moving. `.\.venv\Scripts\python.exe -m arm.driver --esc-latency-report` (or `--file PATH`) prints the records and the verdict without touching hardware. Only session-phase records count against 200 ms; connect-phase records are listed apart and never judged. It exits 0 when every session record is within 200 ms, 1 when one is over or never froze, and 2 when the file is missing, empty, malformed or has no session record. `POST /stop` takes `{source, t_client_ms}`, freezes before reading the body, and returns `source`, `latency_ms` (server side) and `press_to_freeze_ms` (key press to freeze on the laptop clock), the same fields the `stopped` event carries in `runs/<task_id>/events.jsonl`. The dashboard and the voice page log `stop <source>: server N ms, round trip N ms, press to freeze N ms`, a spoken stop adds `talk release to response N ms`, and on the real connected arm the stop is also appended to `esc-latency.jsonl` as `dashboard-<source>`. Windows timestamps tick about every 15.6 ms, so each latency is accurate to about one tick. Drill: Part 3, step 6 of the [operator runbook](../runbook.md#part-3-arm-calibration-a6-a11-a13).
 
 ## A14 · Voice page (`web/voice.html`)
 
@@ -219,3 +233,5 @@ Start from the xAI cookbook's Web Agent (WebSocket) example and serve it at `/vo
 5. Write the 30-second reset checklist, drill STOP with the teammate on the power plug, and run the full script three times.
 
 **Done when:** M5 passes.
+
+**Tools added 2026-10-17:** For steps 2 and 3, `.\.venv\Scripts\python.exe scripts/rehearsal_report.py` reads every learn under the runs folder without changing anything and prints each candidate's result and `fail_reason` plus step 3's cereal-box verdict (keep it, move it 3 cm toward or away, or rerun); `--task ID`, `--since WHEN` and `--last N` filter, and `--out PATH` also writes a new JSON report (a `.json` file, or a folder that receives `rehearsal-<stamp>.json`). For step 4, `.\.venv\Scripts\python.exe -m agents.library --save-backup clear_table --note "learned on the real arm, layout L1" --keep-real --force` validates the skill, copies it to `skills/_backup/clear_table.json` and appends the note to `skills/_backup/provenance.jsonl`. It refuses trusted skills, starter names and an existing backup without `--force`, and `--keep-real` belongs only on a skill learned on the physical arm (otherwise the real counts are reset to 0). The checked-in `skills/_backup/clear_table.json` comes from a fake learn (real 0 of 0), so replace it after the physical rehearsal. Step 5's checklist is [Physical reset, 30 seconds](../demo.md#physical-reset-30-seconds), and the order is Part 7 of the [operator runbook](../runbook.md#part-7-rehearse-freeze-submit-judge).

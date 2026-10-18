@@ -35,6 +35,8 @@ Each teammate pulls `main`, creates their lane branch and runs `/verify`. From h
 
 **Done when:** `/verify` passes on all four laptops, and with `FAKE=1` the dashboard at `http://localhost:8000` shows six cards after typing "put the juice box in the tray".
 
+**Tools added 2026-10-17:** `/verify` now runs `.\.venv\Scripts\python.exe scripts/verify.py`, which runs `pytest -q` (any failure, error, skip or xfail fails it), `scripts/e2e_fake.py "put the juice box in the tray"` (passes when the last stage is `saved`) and `ruff check .` with the venv interpreter. It keeps each step's log in `runs/verify/<hostname>-<UTC stamp>/` and writes `runs/verify/<hostname>-<UTC stamp>.json` with the host identity (hostname, OS, Python, git HEAD, dirty flag), each step's result and `complete`. Partial runs (`--skip-e2e`, `--only`, `--pytest-args`) record `complete: false` and do not count. Save `.\.venv\Scripts\python.exe scripts/check_setup.py --out runs/verify/<hostname>-<UTC stamp>/setup.json` beside it (its report now starts with the same host block), check the six cards on the `FAKE=1` dashboard by hand, and fill that laptop's row in the [I1 table of gates.md](../gates.md#i1-per-laptop).
+
 ## I2 · Arm meets camera
 
 **Owner:** A and B. **Needs:** A6, A9, B6. **By:** Sat 5:30 AM. **Files:** `scripts/touch_markers.py`.
@@ -42,6 +44,8 @@ Each teammate pulls `main`, creates their lane branch and runs `/verify`. From h
 Lay 5 loose object markers on the table. The script reads their positions from the scene state, plans a move to 5 cm above each in simulation, validates and replays it on the real arm, and prompts you to measure the gap between the tip and the marker center.
 
 **Done when:** `python scripts/touch_markers.py --real` lands within 1.5 cm of all 5 markers. If it doesn't, fix the `config/joint_map.yaml` offsets (A6) or the homography (B5) before anything else.
+
+**Tools added 2026-10-17:** `.\.venv\Scripts\python.exe scripts/make_markers.py` prints the spare 3 cm cards 13 to 17, labelled "spare, I2 check"; lay them flat on the table. `.\.venv\Scripts\python.exe scripts/touch_markers.py --real --loose` finds every object-size id 10 to 19 seen in at least half of 10 overhead frames, maps each center through the saved homography at table height and hovers above it through the usual validate-then-replay flow. `--loose` leaves out the ids `config/objects.yaml` assigns (10, 11 and 12, glued on top of objects, where a hover planned from the table would drive the tip into the object) and prints each left-out id, so it targets the spare cards 13 to 17 and the objects may stay on the table. `--object-cards-flat` includes the assigned ids only when those cards lie flat on the table with the objects removed. Fewer than `--count` markers seen (1 to 10, default 5), or a marker named with `--objects marker_<id>` that is not seen, stops the run with nothing moved (exit 1), and with `--real` a fake tracker or camera is refused (exit 2) before any prompt. The gaps, `count`, `left_out`, `object_cards_flat` and `loose_detections` go to `runs/touch_markers/results.json`, which each run overwrites, and each Esc is recorded for A13 with source `touch_markers`. Offline: `.\.venv\Scripts\python.exe scripts/touch_markers.py --fake --chain --loose`. Order: Part 5 of the [operator runbook](../runbook.md#part-5-arm-meets-camera-i2-a9-a10-a12-i3).
 
 ## I3 · First real learn
 

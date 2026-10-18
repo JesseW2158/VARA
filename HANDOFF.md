@@ -1,28 +1,294 @@
 # VARA implementation handoff
 
-## Active camera follow-up (2026-10-17)
+## Read this first: software complete, physical work next (2026-10-18 00:45, Claude, session bd169b9b)
 
-The user asked to continue and update this handoff throughout the work. Starting from HEAD e460eb7;
-only the user/external `.env.example` camera-index edit was pending. The previous 1,406-test full gate
-remains the baseline; do not rerun it unless a new change warrants it.
+**The software pass is finished and committed.** All 42 missing pieces from the scoping pass are built
+(tools for the documented measurements, recorders for the acceptance counts, the CLIs and artifacts the
+docs name). Gate on the final tree: the full suite gave 2,222 passed, no skips or failures, in 373.50 s (`runs/verification/resume-20261017/pytest-full-run5.log`; the doc tests were rerun after the last doc edit, 36 passed); `ruff check .` and `ruff format --check .` pass; no changed
+text file holds a carriage return; `docs/interfaces.md`, `schemas/` and `tests/contract/` are unchanged;
+the fake juice-box learn ends in `saved`. Task-sized local commits on `master`, not pushed. Details per
+package: [verification record](docs/verification-2026-10-17.md#resume-pass-2026-10-17-1945-to-0045-claude).
 
-Root is investigating the camera-2 timing failure with bounded, non-motion diagnostics. New worker
-`/root/camera_review` is reviewing DirectShow/OpenCV configuration semantics and reader behavior
-without hardware access. Prior workers exhausted their usage allowances; this new attempt has not
-reported a result yet. Table preparation and API credentials remain external prerequisites; preserve
-`.env` and all physical configuration measurements. No robot movement is planned without calibration.
+**What to do next:** follow [docs/runbook.md](docs/runbook.md), the ordered procedure from tonight's state
+(arm, camera and table not calibrated, no keys) to the judging table. Part 1 is a complete offline demo and
+the backup clip; Parts 2 to 7 are the physical and keyed gates in dependency order.
 
-**Confirmed physical configuration bug:** on both cameras, requesting FOURCC first returned MJPG,
-but the later height setting silently switched it to YUY2; FPS left it there. Every property setter
-reported success. Evidence: `runs/setup/camera-format-20261017/before.json`. OpenCV 4.13 DirectShow
-source confirms later geometry/FPS changes can recreate the stream without the requested format.
-The camera worker has changed the order to FPS, width, height, FOURCC and added format readback logs;
-focused tests are running. Root is now comparing physical format/timing after this fix.
+**The four safety leads below are closed in code:**
 
-Worker `/root/table_capture` is adding a read-only observed-pixel capture helper and a five-spot
-measurement workflow to `docs/table-calibration.md`; it opens no devices during development/tests.
-Neither worker edits `.env`, saved homography, joint maps or protected contracts. New changes in this
-follow-up are uncommitted until checks pass.
+1. I2 `--loose` now leaves out the ids `config/objects.yaml` assigns (glued on objects) and targets the
+   spare cards 13 to 17; `--object-cards-flat` includes them only on the operator's word.
+2. `--jog-joint` and `--measure-grip` refuse a start pose more than 0.5 degrees outside the commandable
+   band, before anything moves; readings taken after an Esc are discarded and print no paste lines.
+3. Esc records carry `phase`; connect-phase presses are kept apart from A13's 200 ms bar
+   (`python -m arm.driver --esc-latency-report`). Every `--real` CLI, the orchestrator console and a
+   dashboard STOP on the real arm write records.
+4. `--real --scene-file` (arm.replay, arm.real_robot, rl.policy_runner) needs the live provenance
+   sidecar that `python -m vision.scene --out` writes and a fresh scene; no schema change.
+
+**Open decisions and caveats:**
+
+- D7/M4: offline, the trained policy steers the jaw tip to the target while the M4 verdict measures the
+  grasp center 2.46 cm behind it, so `python -m rl.policy_runner --fake --stage slow` reports 0 of 5. Either
+  judge M4 on the tip or retarget the policy by the tip-to-grasp offset (a motion change). `use_policy`
+  stays false; the schedule cuts RL on the real arm first anyway.
+- A scene-file writer whose camera only misses grabs still publishes fresh, all-unseen scenes, which pass
+  the startup check; `--tracker` is the stricter hand source for the real arm.
+- `skills/clear_table.json` is an untracked copy of the backup, probably from the dashboard's Load backup.
+  While it exists, `scripts/e2e_fake.py "clear the table"` replays it instead of learning. Delete it when
+  it is not needed; it was never committed.
+- `scripts/story_numbers.py` notes, but does not yet count, the `--bench-run` summary layout.
+- The physical paths of every new tool ran only against stubs: no arm motion, camera, serial port, xAI or
+  Daytona call happened in this pass.
+
+How this pass ran: run 4 stopped at 19:36 on a session limit after finishing P4, P6, P7, P8 and P14. Run 5
+used plain subagents without review rounds (P5, P9b, P10a, P10b, P11, W2a, W2c, W2d, W2e, W3c) while the
+coordinator did the safety fixes (P1, P13), the Esc wiring (W2b), the policy runner's scene-file check, the
+runbook and the docs. Every report is in `runs/verification/resume-20261017/prior/` (gitignored). The
+sections below are history.
+
+## Resume pass, fourth run (superseded, 2026-10-17, Claude coordinator)
+
+**Run `wf_5da0089c-094` started at 19:27** with
+`runs/verification/resume-20261017/vara-implement-rest-run4.js` (transcripts and `journal.jsonl` in
+`C:\Users\jesse\.claude\projects\C--Users-jesse-GitHub-VARA\c89231c3-87a7-45ff-b545-f04f604f3994\subagents\workflows\wf_5da0089c-094\`).
+Run 3 (below) also stopped on credits, after about 9 minutes and 2.1 M subagent tokens, with no
+agent finished. Its agents edited only `tests/test_verify_cli.py` (P4, 5 edits), and
+`docs/table-calibration.md` and `tests/test_capture_table.py` (P8, 1 edit each). Their condensed
+logs are `prior/*-run3-interrupted.txt`. Several of them had called the costly advisor tool.
+
+Run 4 changes the approach so a partial budget still yields finished packages:
+
+- At most 8 package chains run at once, in priority order: real-arm safety and tonight's physical
+  bring-up first (P1, P13, P8, P4, P3, P7), then the dashboard and demo (P6, P14, P5, W2b), then
+  submission and cloud tooling (P11, P9b, P10b, P10a, W2c, W2a, W2d).
+- P2 is not scheduled; it is finished.
+- After 3 packages in a row end with a failed agent, no new chain starts and the gate is skipped.
+- Agents are told not to call the advisor tool.
+- Each package gets a review and one fix round. P1, P13, W2b and W2d also get a second review.
+- A gate agent and an independent verifier run last.
+- Docs (runbook, README/env/verification, task ledgers) and the completeness critics are left for a
+  separate run after the coordinator commits run 4's work.
+
+### Run 3 (superseded)
+
+**Run `wf_db545ada-f25` started at 19:06** after the user re-added credits and asked to finish the
+project. Script: `runs/verification/resume-20261017/vara-implement-rest-resume2.js`; transcripts and
+`journal.jsonl` in
+`C:\Users\jesse\.claude\projects\C--Users-jesse-GitHub-VARA\c89231c3-87a7-45ff-b545-f04f604f3994\subagents\workflows\wf_db545ada-f25\`.
+It follows the recipe under "How to resume" below and adds the following:
+
+- Up to three reviews and two fix rounds per package (two reviews for docs).
+- P2 also gets a review.
+- P1's first fix round always runs, settles safety leads 2 and 3 and applies P2's doc snippet.
+- P13's fix fails closed for glued object markers.
+- A fourth follow-up, W2d, adds a scene-file provenance sidecar for safety lead 4 without changing
+  the schema.
+- One read-only completeness critic per lane checks all 42 scope gaps offline, and gap packages build
+  whatever is partial or missing.
+- The docs packages run next, then a final gate agent whose results an independent verifier re-runs.
+
+Check progress with `journal_status.py` on that journal. The section below describes the state this
+run started from.
+
+## Resume pass paused: agent credits ran out (2026-10-17, Claude coordinator)
+
+**Read this first.** HEAD is `dfc47e7`, the user's commit of the camera property-order fix, the read-only
+table capture helper and their tests. The full suite passed at that commit: 1,424 tests, no failures,
+412 s while other agents shared the CPU (`runs/verification/resume-20261017/pytest-full-1.log`).
+Nothing from this pass is committed.
+
+**Status.** Run `wf_2a5c23cd-e19` stopped at 18:45 when the account's credit balance ran out: 17 of its
+20 agents failed with "Credit balance is too low". Three finished: the P2 fix, the P3 finisher and the
+P13 review. Workflow and subagent calls fail until credits are added, so do not relaunch before then.
+Eight finishers were cut off after editing files, so the working tree holds unfinished, unreviewed
+edits in P4, P6, P7, P8, P9b, P10a, P10b and P14. After the stop the full suite gave 1,996 passed and
+2 failed (both in P11's unfinished story-numbers tests), and Ruff flags two test files; see "Gate
+after the stop". Four safety leads, one of them a contract decision for the team, must be settled
+before any real-arm run of the new tools.
+
+The user asked for the rest of the project to be implemented without re-auditing earlier work. A
+read-only scoping pass found 42 pieces of missing software for the open tasks: tools for documented
+measurements, recorders for acceptance counts, CLIs the docs name, and artifacts the docs expect. The
+scouts' specifications are saved in `runs/verification/resume-20261017/scope.json` (gitignored).
+
+### How the pass got here
+
+The software is built by a workflow in 14 disjoint packages, three follow-ups (W2) that start when the
+packages they depend on finish, and three documentation packages (W3). Run `wf_f2cb7bd2-dc8` (session
+`fc0530d3`) stopped twice. The Fable usage limit cut off 18 agents, and its Opus 5.5 resume ended with
+that session at 18:23. At that point P1 and P13 were implemented but unreviewed, and P2 had been
+reviewed with one should-fix (the sign-test rule in `docs/joint-calibration.md`) and two nits. P4, P6,
+P7, P9b, P10b and P14 each had a finished first attempt that a hardening re-run was revising; P3, P5,
+P8, P10a and P11 had two unfinished attempts. All 11 re-runs were cut off. W2 and W3 had made no edits.
+
+Session `c89231c3` resumed the pass at 18:33 as run `wf_2a5c23cd-e19`: finishers for the 11 packages,
+reviewers for P1 and P13 and a fixer for P2, then one review and at most one fix round per package,
+then W2 and W3. It stopped on credits at 18:45, after about 11 minutes.
+
+| Package | Tasks | Files it owns | State after `wf_2a5c23cd-e19` | Still to do |
+| --- | --- | --- | --- | --- |
+| P1 | A11 grip measurement, A6 single-joint jog, A13 latency helpers | `arm/driver.py`, `docs/hardware-calibration.md` | implemented (report `prior/P1-driver-grip-jog.impl.json`); both reviewers were cut off before reporting, and their notes hold safety leads 2 and 3 | review, then fix the leads; also apply the P2 fixer's replacement for the placeholder-sign sentence in `docs/hardware-calibration.md` (`doc_snippets.other` in `prior/P2-check-mapping-solver.fix-run2.json`; its `doc_snippets.tasks` holds the matching `docs/tasks/A-arm.md` note for W3c) |
+| P2 | A6 offset and limit solver | `arm/check_mapping.py`, `docs/joint-calibration.md` | done: review issues fixed in the doc and `tests/test_mapping_solver.py` (68 focused tests passed in the fixer's report); the fix is not re-reviewed | full gate only |
+| P3 | A10 `--tracker` hand source, A9/A12 replay `--record`, policy override for D7 | `arm/real_robot.py`, `arm/replay.py` | finished (report `prior/P3-tracker-record-policy.finish-run2.json`: 129 focused tests passed, Ruff clean); its reviewer failed on credits while still reading the scope, no findings | review |
+| P4 | Scene-file writer, B6 accuracy check, B7 verify CLI | `vision/scene.py`, `vision/verify.py` | finisher cut off after 21 edits (`vision/verify.py` 10, `tests/test_scene_tools.py` 8, `vision/scene.py` 2, `tests/test_verify_cli.py` 1) | finish, review |
+| P5 | A15 backup save and artifact, rehearsal report, physical reset checklist | `agents/library.py`, `scripts/rehearsal_report.py`, `skills/_backup/`, `docs/demo.md` | finisher cut off before editing anything; earlier drafts are in the tree | finish, review; explain `skills/clear_table.json` |
+| P6 | C8 `--bench-run`, STOP latency fields, `/calibrate` check points | `agents/orchestrator.py` | finisher cut off after 16 edits (`agents/orchestrator.py` 6, `tests/test_orchestrator.py` 10) | finish, review |
+| P7 | B1 soak report file, timing diagnostic, camera listing | `vision/cameras.py` | finisher cut off after 12 edits (`vision/cameras.py` 8, `tests/test_camera_check.py` 3, `tests/test_camera_tools.py` 1) | finish, review |
+| P8 | B3/B4 visibility check, B5 check-point appender, lens module | `scripts/capture_table.py`, `vision/lens.py`, `docs/table-calibration.md` | finisher cut off after 16 edits (`scripts/capture_table.py` 6, `tests/test_capture_table.py` 4, `docs/table-calibration.md` 3, `tests/test_lens.py` 2, `vision/lens.py` 1) | finish, review |
+| P9b | D3 snapshot check, D5 `--include-run`, tracked curves and video | `rl/train_parallel.py`, `.gitignore`, `web/static/rl/curves.json` | finisher cut off after 12 edits (`rl/train_parallel.py` 8, `tests/test_rl_glue.py` 4) | finish, review |
+| P10a | Live-gate script, sandbox inventory and cleanup, smoke evidence | `scripts/live_gates.py`, `agents/sandbox_pool.py`, `scripts/daytona_smoke.py` | finisher cut off after 32 edits (`scripts/live_gates.py` 17, `tests/test_sandbox_inventory.py` 7, `tests/test_daytona_smoke.py` 6, `scripts/daytona_smoke.py` 2) | finish, review |
+| P10b | C3 eval skill list, I1 verify script, host block in setup report | `agents/candidates.py`, `scripts/verify.py`, `scripts/check_setup.py` | finisher cut off after 25 edits (`scripts/verify.py` 10, `agents/candidates.py` 5, `tests/test_verify_script.py` 5, `tests/test_candidates.py` 4, `.claude/skills/verify/SKILL.md` 1) | finish, review |
+| P11 | D8 story numbers, Devpost slots, M-gate ledger | `scripts/story_numbers.py`, `docs/devpost-draft.md`, `docs/gates.md` | finisher cut off before editing a repo file; earlier drafts are in the tree | finish, review |
+| P13 | I2 five loose markers and spare marker printing | `scripts/touch_markers.py`, `scripts/make_markers.py` | implemented and reviewed: one should-fix (safety lead 1, `prior/P13-loose-markers.review-run2.json`); its fixer failed on credits before editing | fix |
+| P14 | Dashboard STOP latency and check-point display | `web/` | finisher cut off after 17 edits (`tests/web/app_checks.mjs` 8, `web/static/app.js` 5, `tests/test_web_pages.py` 4) | finish, review |
+| W2a | D7 policy bring-up CLI and M4 trial recorder | `rl/policy_runner.py` | failed on credits at start, no edits | implement after P1 and P3 |
+| W2b | A13 Esc latency records in every `--real` CLI, `--esc-latency-report` | arm CLIs, `scripts/touch_markers.py`, `agents/orchestrator.py` | never started (P6 produced no report) | implement after P1, P3, P6 and P13 |
+| W2c | B5 lens wiring | `vision/scene.py`, `vision/calibrate.py` | never started (P4 and P8 produced no report) | implement after P4 and P8 |
+| W3a | Operator runbook and a test that keeps its commands valid | `docs/runbook.md`, `tests/test_docs_runbook.py` | failed on credits at start, no edits | write after W1 and W2 |
+| W3b | README, `.env.example`, verification record, setup and live-gate docs | `README.md`, `.env.example`, `docs/verification-2026-10-17.md`, `docs/setup.md`, `docs/live-gates.md` | failed on credits at start, no edits | write after W1 and W2 |
+| W3c | Task-ledger notes, gates pointer in the schedule | `docs/tasks/*.md`, `docs/schedule.md` | failed on credits at start, no edits | write after W1 and W2 |
+
+Edit counts are the Edit and Write calls on repository files in each cut-off finisher's transcript.
+Any of those files may hold a half-applied change. P8, P11 and P14 also wrote probe scripts in the
+session scratchpad, which are not part of the repository.
+
+### Safety leads to settle before real-arm runs of the new tools
+
+1. **P13, reviewed should-fix.** `scripts/touch_markers.py --real --loose` treats a marker glued on top
+   of an object as a card lying flat on the table (`loose_targets`, about line 185, and
+   `_loose_targets_and_hand`, about line 383). With the demo objects still on the table, the arm is
+   planned 2 to 5.5 cm into each object. The reviewer's fix is a doc note and a printed warning. Until it
+   lands, run I2 with only loose cards on the table and the objects removed.
+2. **P1, lead from the cut-off reviewers, consistent with the code.** `measure_grip` and `jog_joint`
+   re-send the starting joint vector with every command, and `Driver.clip` pulls any joint outside the
+   limit band (limits minus 3 degrees) back into it at up to 2 degrees per command. Under the placeholder
+   limits, the measured rest pose has shoulder_lift, elbow_flex and wrist_flex outside the band by 6.7,
+   2.9 and 9.9 degrees. So an A11 session started from rest would also move those joints, although
+   `docs/hardware-calibration.md` says "only the jaws move"; the A6 jog has the same exposure from any
+   reference pose outside the band. Until fixed, start from a pose inside the band or set A6's limits
+   first.
+3. **P1, same source.** An Esc pressed while the driver is connecting is written to
+   `runs/calibration/esc-latency.jsonl` as an Esc-to-freeze latency (609 ms in the reviewer's probe),
+   with nothing marking the phase. That record would fail or mislead A13's 200 ms bar. The second
+   reviewer was also probing what lands in `empty_closed_pct` and the printed paste line when Esc comes
+   during the 0.5 s empty close; it stopped before reporting that.
+4. **P3, from its finisher's report: a contract decision for the team, not a finisher fix.**
+   `python -m arm.real_robot --real --scene-file` and `python -m arm.replay --real --scene-file` cannot
+   tell a scene file written under `FAKE_CAMERA=1` from a live one: `schemas/scene.json` has
+   `additionalProperties: false` and no provenance field, and a fake writer stamps a fresh `t`. So the
+   rule that a fake scene never feeds the real arm holds only for `--tracker`. Closing it needs a
+   team-agreed contract change (for example an optional source field) or a writer-side marker; hard
+   rule 9 forbids changing the schema without the team. Until then, use `--tracker` for real-arm runs.
+
+### Resume inputs and tools
+
+Everything below is in `runs/verification/resume-20261017/` (gitignored):
+
+- `vara-implement-rest-wf_f2cb7bd2-dc8.js` (the original script) and `vara-implement-rest-resume.js`
+  (the script run `wf_2a5c23cd-e19` executed).
+- `prior/`: from the first run, the reports of P1, P2 (with its review) and P13, the first-attempt
+  reports of the six revised packages, and `*.impl-interrupted.txt` / `*.review-interrupted.txt` /
+  `*.fix-interrupted.txt`, condensed logs of the 14 agents still running when it ended. From the second
+  run, `*-run2.json` (the P2 fix report, the P3 finisher's report and the P13 review) and
+  `*-run2-interrupted.txt`, condensed logs of all 17 agents that failed. The 18 agents the Fable limit
+  stopped have no condensed log; their transcripts are in the first run's folder.
+- `journal_status.py JOURNAL` prints every agent's state in a run; `condense_agent_log.py` turns a
+  transcript into a condensed log; `extract_run.py RUN_DIR TAG` does both for a whole run and counts
+  each agent's edits (it produced the run-2 files and the table above).
+- `pytest-full-2.log`: the full suite after the stop.
+
+Agent transcripts: first run in
+`C:\Users\jesse\.claude\projects\C--Users-jesse-GitHub-VARA\fc0530d3-542c-4979-aa21-5df7a721d3bb\subagents\workflows\wf_f2cb7bd2-dc8\`,
+second run in
+`C:\Users\jesse\.claude\projects\C--Users-jesse-GitHub-VARA\c89231c3-87a7-45ff-b545-f04f604f3994\subagents\workflows\wf_2a5c23cd-e19\`.
+
+### Coordinator changes outside the packages
+
+- `tests/test_scaffold.py`: the fake end-to-end test copied the whole live `skills/` folder, so any
+  skill learned or loaded from the backup on this laptop made it fail. It now copies only the shipped
+  skills (`_starter`, `_backup` and the starter live files) through `copy_shipped_skills`. Ruff passes,
+  and `pytest tests/test_scaffold.py -k e2e` passed (2 tests, 6.4 s) with the stray file below present.
+- `skills/clear_table.json` is an untracked, byte-identical copy of `skills/_backup/clear_table.json`.
+  It appeared at 18:08 during the first run, which is what the dashboard's Load backup does. P5's
+  finisher was asked to check whether package code wrote it but stopped before looking. It stays in
+  place for the user to keep or delete. Never commit it.
+- Processes: a uvicorn serving the orchestrator on port 8765 has run since 13:17 (PIDs 33640 and
+  29652). This pass did not start it and left it alone. A second uvicorn, started at 18:22 for port
+  8000 with no live parent and no listening socket, had exited by 18:43.
+
+### Gate after the stop
+
+Run at 18:50 with no agents running, on the tree the cut-off finishers left:
+
+- Full suite (`.venv/Scripts/python.exe -m pytest -q -p no:cacheprovider -rs`): **1,996 passed, 2
+  failed, no skips, in 213.74 s** (`runs/verification/resume-20261017/pytest-full-2.log`). Both failures
+  are in P11's unfinished `tests/test_story_numbers.py`:
+  `test_learn_task_numbers_come_from_the_events_with_their_paths` and
+  `test_markdown_and_summary_name_sources_and_scopes`. Every other package's tests pass on the tree as
+  the cut-off finishers left it, but passing tests do not mean those packages are finished.
+- `ruff check .`: 31 line-length errors, 30 in `tests/test_story_numbers.py` (P11) and 1 in
+  `tests/test_scene_tools.py` (P4). `ruff format --check .` would reformat those same two files.
+- No CRLF in changed or new text files. `docs/interfaces.md`, `schemas/` and `tests/contract/` are
+  unchanged.
+
+### How to resume once credits are available
+
+`resumeFromRunId` cannot help: it works only inside session `c89231c3` and would replay only the three
+finished agents. Make a new script from `vara-implement-rest-resume.js` instead:
+
+1. Skip P2 (done).
+2. P1: review only, from `prior/P1-driver-grip-jog.impl.json`. Give the reviewer both cut-off reviewer
+   logs (`prior/P1-driver-grip-jog.review-interrupted.txt` and `.review-run2-interrupted.txt`) and ask it
+   to confirm or refute safety leads 2 and 3.
+3. P3: review only, from `prior/P3-tracker-record-policy.finish-run2.json`.
+4. P13: fix only, from `prior/P13-loose-markers.impl.json` and the issues in
+   `prior/P13-loose-markers.review-run2.json`.
+5. P4, P5, P6, P7, P8, P9b, P10a, P10b, P11 and P14: finish, with `finishNote` pointing at the newest
+   log `prior/<package>.finish-run2-interrupted.txt` as well as the older `.impl-interrupted.txt` (and
+   `.impl-run1.json` where it exists). This is their third attempt; say so in the note.
+6. Keep W2 and W3 and their dependency rules. The script's `STATE` table assumes the file names
+   `<package>.impl.json` and `<package>.review.json`, so either give it per-package paths or copy the
+   run-2 files to those names.
+7. Repoint the paths. The script sets `SCRATCH`, and through it `PRIOR`, to session `c89231c3`'s
+   `%TEMP%` scratchpad, whose `prior/` copy lacks every run-2 file. Set `SCRATCH` to the new session's
+   scratchpad and `PRIOR` to `C:\Users\jesse\GitHub\VARA\runs\verification\resume-20261017\prior`, the
+   only complete copy.
+8. Delete the sentences in `RULES` and `REVIEWER` that say to ignore
+   `tests/test_scaffold.py::test_e2e_fake_learns_and_saves_the_juice_box_skill`. That test is fixed and
+   must pass now.
+
+Without agents, a coordinator can finish the packages by hand in the same order: the P13 fix and the
+P1 leads first, then each cut-off finisher, reading the end of its condensed log to see where it
+stopped. Each package's files are disjoint, so the packages can be finished one at a time.
+
+### Finishing the pass
+
+1. Run the full gate once, with no agents running:
+   `.venv/Scripts/python.exe -m pytest -q -p no:cacheprovider -rs` (no failures, no skips),
+   `.venv/Scripts/python.exe -m ruff check .`, `.venv/Scripts/python.exe -m ruff format --check .`, no
+   CRLF in changed or new text files, an empty `git diff --stat HEAD -- docs/interfaces.md schemas
+   tests/contract`, and `FAKE=1 .venv/Scripts/python.exe scripts/e2e_fake.py "put the juice box in the
+   tray"` ending in `saved`. Reviewers run only their own package's tests, so expect some
+   cross-package failures.
+2. Put the test count in `README.md` and `docs/verification-2026-10-17.md` (W3b leaves it out on
+   purpose), then rewrite this section with the outcome.
+3. Commits: none were made in this pass yet. At 19:08 the user chose task-sized local commits on
+   `master` (message `<ID>: <title>`, no push) once the final gate passes. Files edited by several
+   packages go into one commit with the last package that touched them. New package files are
+   untracked and must be added (new tests and scripts, `vision/lens.py`, `docs/gates.md`,
+   `docs/live-gates.md`, `skills/_backup/`, `web/static/rl/curves.json`, `web/static/rl_sim.mp4`), but
+   never `skills/clear_table.json` or `.env`.
+
+No arm motion, camera opening, xAI call or Daytona call was part of this pass.
+
+**Camera evidence correction.** The earlier "Active camera follow-up" section described two workers
+that no longer exist; their changes landed in `dfc47e7`. After the property-order fix, a 60-second
+independent-reader diagnostic read both feeds as MJPG at about 30 fps with no failed reads. Camera 2
+delivered 1,771 frames with 2 late gaps and a 0.110 s maximum gap; wrist camera 1 delivered 1,800 frames
+with 4 late gaps and a 0.109 s maximum gap. Before the fix camera 2 had 172 late gaps in a minute.
+Evidence: `runs/setup/camera-format-20261017/before.json` and `after-independent-readers.json`. The strict
+B1 criterion counts every gap over 2.5 frame periods, so a strict 30-minute soak can still fail even
+though both gaps stay far below the tracker's 0.5 s seen timeout. B1 remains open.
 
 ## Current completion checkpoint (2026-10-17, Codex)
 
@@ -94,9 +360,8 @@ learn reached `saved`. Full evidence: [verification record](docs/verification-20
    boolean-only check: XAI_API_KEY and DAYTONA_API_KEY absent. Never print the file/values. Once keys
    exist, run the documented live model, Daytona smoke/pool and voice checks within sandbox caps,
    cleaning up all created cloud resources. Fixtures do not satisfy those live gates.
-5. `.env` and `.env.example` now select OVERHEAD_CAM=2 through a user/external change. Preserve it.
-   The example's camera-index change is intentionally left unstaged/uncommitted; our model-options
-   hunk was committed separately. All our code/documentation changes are committed; only the unowned example-camera edit remains.
+5. `.env` and `.env.example` select OVERHEAD_CAM=2 through a user change. Preserve it. The user has
+   since committed the example's camera-index change in `dfc47e7`, so it is no longer pending.
 
 All three worker agents have now reached usage limits. Their earlier completed work is included.
 The last requested additional mapping review did not receive a final agent report; root inspected

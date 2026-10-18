@@ -229,3 +229,58 @@ motion is implied by these checks. The local prerequisite report is `runs/setup/
 
 Task checkboxes are updated only where the stated acceptance can be supported by available evidence.
 Hardware, live-service and human-observation checks remain open.
+
+## Resume pass (2026-10-17, 19:45 to 00:45, Claude)
+
+This pass finished the 42 pieces of missing software that the scoping pass listed: tools for the documented
+measurements, recorders for the acceptance counts, the CLIs the docs name and the artifacts they expect. No
+arm motion, camera opening, serial connection, xAI call or Daytona call happened in it; every check below
+used the fakes, stubs or synthetic files. Package reports are under
+`runs/verification/resume-20261017/prior/` (gitignored).
+
+- A6 (P2): `python -m arm.check_mapping --solve` derives `offset_deg` and the calibrated limits from one
+  reference-pose report and the sign test; it prints the YAML and never edits `config/`.
+- A6, A11, A13 (P1, then the coordinator's fixes): `--jog-joint`, `--measure-grip` and the Esc records in
+  `python -m arm.driver`. The jog and the grip session refuse a start pose more than 0.5 degrees outside the
+  commandable band (they re-send that pose and the clip would move it); a reading taken after Esc is
+  discarded and a stopped session prints no paste lines; every Esc record carries a phase, and connect-phase
+  presses stay out of the 200 ms bar.
+- A13 everywhere (W2b): `arm.replay`, `arm.real_robot`, `scripts/touch_markers.py`, `rl.policy_runner`,
+  the orchestrator's console Esc and a dashboard STOP on the real arm append to
+  `runs/calibration/esc-latency.jsonl`; `python -m arm.driver --esc-latency-report` gives the verdict.
+- A9, A10, A12 (P3): `--tracker` hand source and `--record NAME` replay tallies; a per-call policy override
+  for D7.
+- Scene files (P4, W2d): `python -m vision.scene --out FILE` writes the scene file and a provenance sidecar;
+  `--real --scene-file` in `arm.replay`, `arm.real_robot` and `rl.policy_runner` refuses a file without a
+  live sidecar or without a fresh scene, and a stale scene reads as unseen. This closes HANDOFF safety
+  lead 4 without a schema change.
+- B6, B7 (P4): `python -m vision.scene --accuracy LAYOUT.json` and `python -m vision.verify --before/--after`.
+- B1 (P7): `python -m vision.cameras --check` writes a report with `--criterion strict|tracking`,
+  `--diagnose` runs one reader per feed and `--list` identifies the indexes.
+- B3, B4, B5 (P8, W2c, W2e): `scripts/capture_table.py --expect-all`, `--printed-side-mm` and
+  `--check-point`; `python -m vision.lens` (the B5 fallback), now applied before detection in the tracker,
+  calibration, capture tool, `POST /calibrate` and verify whenever `config/lens.npz` exists.
+- I2 (P13): `scripts/touch_markers.py --loose` targets the spare cards 13 to 17 and leaves out the ids
+  `config/objects.yaml` assigns (glued on objects; a hover planned from the table there would hit the
+  object) unless `--object-cards-flat`; `scripts/make_markers.py` prints the spare cards. This closes HANDOFF
+  safety lead 1.
+- A15 (P5): `scripts/rehearsal_report.py`, `python -m agents.library --save-backup` with
+  `skills/_backup/provenance.jsonl`, the checked-in fake-learn backup and the physical reset checklist.
+- C8, M3, B5 (P6, P14): `--bench-run TEXT`, STOP latency fields on `/stop` and the dashboard, `check_points`
+  on `/calibrate` and its display.
+- C1 to C6 (P10a, P10b): `scripts/live_gates.py` (dry run, ten steps, evidence and cleanup), sandbox
+  inventory and cleanup, smoke evidence, `--skills` and `--spec` for the candidates CLI, `scripts/verify.py`
+  and the host block in `scripts/check_setup.py`.
+- D3, D5, D7 (P9b, W2a): `--verify-snapshot`, `--include-run`, `--no-copy`, tracked curves and video, and
+  `python -m rl.policy_runner` for the staged bring-up with an M4 trial record. Offline, the policy steers
+  the jaw tip while M4 measures the grasp center 2.46 cm behind it, so M4 does not pass yet;
+  `use_policy` stays false.
+- D8, S1 (P11): `scripts/story_numbers.py`, the Devpost slots and sponsor-challenge table, and the gate ledger
+  `docs/gates.md`.
+- S0 (W3): [docs/runbook.md](runbook.md), the ordered procedure, with `tests/test_docs_runbook.py` checking
+  every command in it.
+
+Gate on the final tree: the full suite gave 2,222 passed, no skips or failures, in 373.50 s (`runs/verification/resume-20261017/pytest-full-run5.log`; the doc tests were rerun after the last doc edit, 36 passed). `ruff check .` and `ruff format --check .` pass (120 files), no changed or
+new text file holds a carriage return, `docs/interfaces.md`, `schemas/` and `tests/contract/` are unchanged,
+and `FAKE=1 scripts/e2e_fake.py "put the juice box in the tray"` ended in `saved`
+(`runs/verification/resume-20261017/e2e-run5.log`).

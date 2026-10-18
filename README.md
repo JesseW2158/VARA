@@ -76,6 +76,9 @@ Its environment has no pip module, so install packages through uv:
 .\.venv\Scripts\python.exe -m ruff check .
 ```
 
+The last full run on this laptop (2026-10-18) gave 2,222 passed, no skips, in about six minutes;
+`scripts/verify.py` runs the same gate plus the fake end-to-end run and Ruff and saves a record.
+
 For a fresh Windows checkout with uv available, create the environment first with
 `uv venv --python 3.12 .venv`. For Linux/macOS:
 
@@ -138,8 +141,16 @@ The benchmark resets its configured skill library between runs.
 ```
 
 Linux/macOS users can install the same requirements with their activated environment's pip.
-`web/static/rl_sim.mp4` is a generated, gitignored artifact. Keep `config/rl.yaml` at
+`web/static/rl_sim.mp4` (H.264) and `web/static/rl/curves.json` are tracked so a fresh clone's dashboard
+shows the video and the curves; regenerate the video with the command above. Keep `config/rl.yaml` at
 `use_policy: false` until the real-arm acceptance in D7/M4 passes.
+
+Reward search (D3 to D5): `python -m rl.rewards.write_rewards`, then `python -m rl.train_parallel
+--build-snapshot --verify-snapshot` once per Daytona account, then `python -m rl.train_parallel` (or
+`--local`) with `--include-run rl/runs/baseline` to compare against the baseline without retraining it, and
+`--no-copy` to compare without replacing `rl/policies/handoff_best.zip`. The module docstring documents the
+whole chain. `python -m rl.policy_runner --fake --stage slow --tracker` rehearses D7's staged bring-up and
+writes an M4 trial record under `runs/rl/`.
 
 ## Hardware status
 
@@ -170,6 +181,42 @@ Capture an inspection report without motor writes:
 Use a new output filename. See [safety rules](docs/safety.md) and
 [hardware calibration](docs/hardware-calibration.md) before any motion command. Clear-table candidates
 currently release props from 15 cm into the tray; that maneuver has simulation evidence only.
+
+## Physical setup and tools
+
+**What is still physical:** the arm mapping (A6), grip (A11), Esc drill (A13), camera mount and table
+calibration (B3 to B6), the camera soak (B1), the first real learn (I3) and every keyed service gate.
+[docs/runbook.md](docs/runbook.md) is the one ordered procedure from tonight's state to the judging table;
+`tests/test_docs_runbook.py` keeps its commands valid. Every tool below writes timestamped evidence under
+`runs/` (`VARA_RUNS_DIR` moves it) and never overwrites it. Commands that move the arm take `--real`, ask
+you to type that the arm is clear, count down 3 s and freeze the arm on Esc.
+
+- **Arm calibration aids:** `python -m arm.driver --real --jog-joint NAME --deg 20 --hold 10` (A6 sign test),
+  `python -m arm.check_mapping --solve runs/calibration/solve.json` (offsets and limits from one reference
+  pose), `python -m arm.driver --real --measure-grip` (A11, prints the lines to paste) and
+  `python -m arm.driver --esc-latency-report` (A13 verdict over every Esc record). The jog and the grip
+  session refuse a start pose outside the commandable band.
+- **Camera and table:** `python -m vision.cameras --list` (which index is which), `--check 1800
+  [--criterion strict|tracking]` and `--diagnose 60` (B1); `scripts/capture_table.py --expect-all`
+  (B3/B4 visibility) and `--check-point X Y` (B5 check spots); `python -m vision.lens` (B5 lens fallback);
+  `python -m vision.scene --accuracy LAYOUT.json` (B6) and `--out FILE` (a scene file for `--scene-file`);
+  `python -m vision.verify --before --after --spec FILE` (B7).
+- **Arm meets camera:** `scripts/touch_markers.py --real --loose` (I2, on the spare cards 13 to 17),
+  `python -m arm.replay --real --traj FILE --tracker --record NAME` (A9/A12 tallies) and
+  `python -m arm.real_robot --real --carry-test --tracker` (A10).
+- **Rehearsal and backup:** `scripts/rehearsal_report.py` (A15 candidate table and cereal-box verdict),
+  `python -m agents.library --save-backup NAME --note TEXT [--keep-real]` (stage backup with provenance),
+  `python -m agents.orchestrator --bench-run "hand me my pills"` (C8).
+- **Live gates:** `scripts/live_gates.py --dry-run`, then without `--dry-run` (C1, C2, C3, C5, C6, C8 and
+  the voice token; see [live gates](docs/live-gates.md)); `python -m agents.sandbox_pool --list` and
+  `--cleanup` for stragglers; `python -m agents.candidates --eval TEXT --skills none` (C3).
+- **Verification and story:** `scripts/verify.py` (I1 record per laptop under `runs/verify/`),
+  `scripts/story_numbers.py --markdown` (D8 numbers with their source files) and the gate ledger in
+  [docs/gates.md](docs/gates.md).
+
+**Sponsor challenges:** the [Devpost draft](docs/devpost-draft.md) names Best Use of Daytona and Make It
+Legendary with the evidence each needs. Neither has its evidence yet: no keyed Daytona or xAI run has been
+made, and no Cursor screenshots exist in the repository.
 
 ## Project guide
 

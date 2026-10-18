@@ -69,6 +69,8 @@ A second Daytona image with `mujoco numpy pyyaml gymnasium stable-baselines3` pl
 
 **Done when:** a sandbox from the snapshot runs `python -c "import torch, stable_baselines3, mujoco"`, then is deleted.
 
+**Tools added 2026-10-17:** `.\.venv\Scripts\python.exe -m rl.train_parallel --verify-snapshot --build-snapshot` (drop `--build-snapshot` once `arm-rl-v1` exists; `--check-snapshot` is an alias) creates one sandbox from the RL snapshot the way the trainer does, runs `python -c "import torch, stable_baselines3, mujoco"`, deletes the sandbox in a `finally` and writes a new `runs/rl/snapshot-check-<UTC stamp>.json` (snapshot, command, exit code, output, deleted, ok). Before creating anything it counts the account's RL sandboxes against the 4-sandbox cap, and it never trains. It exits 0 only when the import passed and the sandbox is gone, 1 on a failed build, create, exec or delete or a reached cap, and 2 without `DAYTONA_API_KEY`. It has not run with a key yet: an earlier keyed call reported that `arm-rl-v1` does not exist, so the first run must build it.
+
 ## D4 · Reward-writing agent (`rl/rewards/write_rewards.py`)
 
 **Needs:** C1. **By:** Sat 9:30 AM. **Files:** `rl/rewards/write_rewards.py`, `rl/rewards/variant_*.py`.
@@ -88,6 +90,8 @@ One `CODEGEN_MODEL` call returns four functions, each `def reward(obs, action, p
 5. Download everything, delete the sandboxes in a `finally`, pick the best by success rate and then by mean steps to success, and copy it to `rl/policies/handoff_best.zip`.
 
 **Done when:** four curves and the chosen policy appear on the dashboard, and the Daytona dashboard shows all 4 sandboxes deleted.
+
+**Tools added 2026-10-17:** `--include-run DIR` (repeatable) adds an already trained run, such as `rl/runs/baseline`, to the selection and the curves under its folder name without retraining; the trained rewards stay capped at 4. `.\.venv\Scripts\python.exe -m rl.train_parallel --rewards --include-run rl/runs/baseline --include-run <other run> --no-copy --out <new folder>` compares existing runs only, with no training and no sandbox, and leaves `rl/policies/handoff_best.zip` and its provenance untouched; it still rewrites `web/static/rl/curves.json` unless `--curves PATH` points elsewhere. Every run writes `<out>/result.json` with the candidates, the included runs, the chosen one, `source_policy` and `policy_sha256`, to compare with `rl/policies/handoff_best.json`, and `--out` must be a fresh folder. On 2026-10-17 a compare-only run reproduced the tracked curves with `baseline` chosen. After a keyed training run, `.\.venv\Scripts\python.exe -m agents.sandbox_pool --list --label rl` prints `remaining (rl/rl-check): 0` when every RL sandbox is deleted. `web/static/rl/curves.json` and `web/static/rl_sim.mp4` are no longer gitignored.
 
 ## D6 · Simulation video
 
@@ -110,8 +114,12 @@ Bring it up in stages: target fixed on a table marker, then a slowly moving hand
 
 **Done when:** M4 passes; then set `use_policy: true`. If the real policy oscillates or misses, leave it false, keep IK tracking, and present RL from simulation, labeled as simulation.
 
+**Tools added 2026-10-17:** `.\.venv\Scripts\python.exe -m rl.policy_runner --real --stage fixed --target-marker ID --tracker`, then `--stage slow`, then `--stage normal --trials 5`, runs the staged bring-up. Each trial sends the arm home and calls `carry_to_hand` with the policy switched on for that call only; the tool never grips and never changes `config/rl.yaml`. Every `--real` run needs `--tracker` or `--scene-file FILE` (the same live-provenance check as A9), uses the usual confirmation, countdown and Esc freeze, and records each Esc for A13 with source `rl.policy_runner`. `carry_to_hand` opens the jaws at release and the tool never closes them, so run one trial per invocation when a held object matters. Each run writes a new `runs/rl/m4-<UTC>.json` (or a new `--out FILE`), rewritten after every trial, with the grasp-center and tip distances, the longest within-3-cm streaks, the tip speed against the 0.2 and 0.1 m/s caps, and the verdict. M4 passes on a real `--stage normal` report with 4 of 5 trials holding the grasp center within 3 cm for 10 readings and no trial over a cap; the exit code is 0 pass, 1 fail, 2 misuse or refusal. Finding from the offline rehearsal (`--fake --stage slow`): the trained policy steers the jaw tip, which sits 2.46 cm ahead of the grasp center the M4 verdict measures, so the tip succeeds 5 of 5 while the grasp center ends about 2.8 cm off with no 10-reading streak, and the report reads FAIL 0 of 5. `--stage fixed` also times out, because the marker counts as the hand and the whole reach runs under the 0.1 m/s near-hand cap. M4 therefore does not pass offline yet, and `use_policy` stays false until the team decides whether to judge M4 on the tip or have the policy runner aim the grasp center.
+
 ## D8 · Story work
 
 **Needs:** D7, or the D-GO fallback. **By:** from Sat 6:00 PM. Own the Devpost text, video and README per Pitch and Devpost. Pull every number from `runs/` (candidates per task, pass rates, time to learn a skill, real success counts, sandbox runs) instead of estimating.
 
 **Done when:** M7 passes.
+
+**Tools added 2026-10-17:** `.\.venv\Scripts\python.exe scripts/story_numbers.py --markdown` reads `runs/`, `skills/` and the RL provenance files without changing them, prints the tables with the source path behind every number, and writes a new `runs/story/<UTC stamp>.json` on every run; `--strict` exits 1 when any file was skipped or malformed. Take every number on the Devpost page and in the video from it. [gates.md](../gates.md) is the gate ledger with its ticking rule, and [devpost-draft.md](../devpost-draft.md) holds the submission fields and the sponsor-challenge evidence table, which still lacks Cursor screenshots and any keyed Daytona or xAI run. The `summary.json` that `--bench-run` writes is not parsed yet and shows up as an "unknown summary layout" note. Order: Part 7 of the [operator runbook](../runbook.md#part-7-rehearse-freeze-submit-judge).

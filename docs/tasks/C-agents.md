@@ -67,6 +67,8 @@ End with "Return one Python code block and nothing else." Generate all six in pa
 
 **Done when:** `python -m agents.candidates --eval "put the juice box in the tray"` shows at least 5 of 6 passing `check_source` on the first try.
 
+**Tools added 2026-10-17:** For the live run use `.\.venv\Scripts\python.exe -m agents.candidates --eval "put the juice box in the tray" --skills none --task-dir runs/c3-<stamp>`. `--skills none` hides the saved skills from the router and the prompt, so the phrase stays a learn even though a saved skill covers it, and `--skills starter` shows the starters only. `--spec FILE` generates from a task spec JSON, checked against `schemas/task_spec.json`, without routing. Both forms write `<task_dir>/summary.json` with the model, the timings and one row per candidate (its first-try and final `check_source` results). The task dir must be new or empty (default `runs/eval-<spec name>-<UTC stamp>`), and the exit code is 0 when at least 5 of 6 pass on the first try. The keyed run is the `candidates` step of `scripts/live_gates.py`, described under C5 and in [live gates](../live-gates.md).
+
 ## C4 · Runner on MuJoCo (`sim/run_candidate.py`, `sim/scoring.py`)
 
 **Needs:** A8. **By:** Sat 5:00 AM. **Files:** `sim/run_candidate.py`, `sim/scoring.py`, `tests/test_scoring.py`.
@@ -98,6 +100,8 @@ Check class and method names against the [Daytona Python SDK](https://pypi.org/p
 
 **Done when:** `python scripts/daytona_smoke.py` prints a valid score line in under 60 s, and the Daytona dashboard shows no sandbox left running.
 
+**Tools added 2026-10-17:** `.\.venv\Scripts\python.exe scripts/daytona_smoke.py` (add `--build-snapshot` the first time) keeps its evidence in a new `runs/daytona-smoke/<UTC stamp>/` (or `--out DIR`): the candidate's outputs and `result.json` with the runner, the score line, the seconds and `under_60`, which is true when create, score and delete took 60 s or less (`--max-seconds` sets the exit-code limit). The sandbox is still deleted in a `finally`. `.\.venv\Scripts\python.exe -m agents.sandbox_pool --list` stands in for the dashboard check: it prints every `vara`-labelled sandbox and `remaining (pool): N`, writes `runs/sandboxes/inventory-<UTC stamp>.json`, and exits 0 only when none remain. `.\.venv\Scripts\python.exe scripts/live_gates.py` runs the keyed checks in order as child processes (model ping, router, candidates, this smoke test, the C6 bench, the C8 bench-run and the voice token, with a sandbox inventory before and after each Daytona step) and writes every log plus `summary.json` to `runs/live-gates/<UTC stamp>/`. It refuses (exit 2) when a fake flag is on or either key is missing, and `--dry-run` prints the plan without running anything. Order: Part 6 of the [operator runbook](../runbook.md#part-6-live-services-c1-to-c8-a14-costs-model-calls-and-sandboxes).
+
 ## C6 · Sandbox pool (`agents/sandbox_pool.py`)
 
 **Needs:** C4, C5. **By:** Sat 1:30 PM. **Files:** `agents/sandbox_pool.py`, `tests/test_pool_fake.py`.
@@ -110,6 +114,8 @@ Check class and method names against the [Daytona Python SDK](https://pypi.org/p
 - Check the organization's vCPU quota in the Daytona dashboard before Lane D's RL run, and ask at the Daytona workshop if it's too low.
 
 **Done when:** `python -m agents.sandbox_pool --bench` finishes 6 candidates × 5 trials in under 35 s on each of 3 tasks, `pytest -q tests/test_pool_fake.py` passes, and shutdown leaves 0 sandboxes.
+
+**Tools added 2026-10-17:** `.\.venv\Scripts\python.exe -m agents.sandbox_pool --bench` now ends with `remaining: N`, the account's `vara=pool` sandboxes after shutdown, and writes under `runs/bench` unless `--out DIR` says otherwise. `.\.venv\Scripts\python.exe -m agents.sandbox_pool --list --label pool --wait 30` writes `runs/sandboxes/inventory-<UTC stamp>.json` and exits 0 only when none in scope remain; `--cleanup` deletes the sandboxes carrying the label (stragglers after a crash), then lists into `cleanup-<stamp>.json`. Never clean `--label rl` while a training runs. Both refuse (exit 2) without `DAYTONA_API_KEY` or under `FAKE` or `FAKE_SANDBOX`. `SandboxPool.start()` now lists the account's pool sandboxes before creating any, so the 7-sandbox cap holds across processes whenever that listing succeeds. The keyed bench is the `bench` step of `scripts/live_gates.py`, which takes an inventory before and after it and runs `--cleanup` on a failure.
 
 ## C7 · Selection, repair and budgets
 
@@ -131,6 +137,8 @@ These checks use fixture model replies and a fake arm; C1/C5/C6 live-service gat
 `plan(skill, args, scene) -> (trajectory, final_scene)` runs the skill once (trial 1 only) through `sim.run_candidate`. Trusted starter skills run in a local subprocess; learned skills run in the planning sandbox, falling back to a local subprocess labeled "local".
 
 **Done when:** "hand me my pills" goes from command to the arm moving in under 5 s (median of 5 runs) with the live router.
+
+**Tools added 2026-10-17:** `.\.venv\Scripts\python.exe -m agents.orchestrator --bench-run "hand me my pills" --runs 5 --live-router` times each run from the command to its first `executing`, prints the median against the 5 s target and writes `runs/bench/run-<UTC stamp>/summary.json`, with its own copy of the library and its `t-*` task folders beside it, so the library's real counts never change. `--live-router` uses the xAI router while the arm, the cameras and the sandboxes stay fake, and exits 2 before anything starts when `XAI_API_KEY` is empty; without it every fake is forced. The exit code is 0 only when every run reached `executing` and the median is at most 5 s. The all-fake run on 2026-10-17 reached `executing` in 5 of 5 runs with a median of 1.2 s; the live-router run is the `bench-run` step of `scripts/live_gates.py` and is still to be filed.
 
 ## C9 · Real execution and saving
 

@@ -6,6 +6,8 @@ Each lane's bars run from Friday 10 PM to Sunday noon. The diamonds are the gate
 
 **Gates.** Tick one only when its test passes on the demo laptop, and hold a two-minute standup at each.
 
+[gates.md](gates.md) is the evidence ledger (a gate is ticked here only after its row there reads `pass`), and [runbook.md](runbook.md) is the ordered operator procedure that produces that evidence on the demo laptop.
+
 - [ ] **S0, Sat 1:30 AM.** Scaffold on `main`: `pytest -q` and the fake end-to-end run pass.
 - [ ] **I1, Sat 2:00 AM.** `/verify` passes on all four laptops.
 - [ ] **M1a, Sat 3:00 AM.** Each lane's first deliverable passes (Team table below).
