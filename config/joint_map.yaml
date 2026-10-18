@@ -7,19 +7,22 @@
 # Gripper:
 #   gripper = (pct - closed_pct) / (open_pct - closed_pct), clipped to [0, 1]
 #
-# PLACEHOLDERS: sign 1 and offset_deg 0.0 for every joint, gripper 0 to 100, until A6 measures them against the
-# MuJoCo model (send +20 degrees on one joint, compare with +0.349 rad in the viewer) and A11 records the
-# gripper's closed and open readings. Redo A6 after any recalibration: LeRobot's 0 is the midpoint of each
-# joint's calibrated range, so the offsets depend on the calibration file.
+# MEASURED 2026-10-17 21:39 (A6 steps 1 to 3): signs from the jog-joint sign test (all five turn the same
+# way as the model) and offsets solved from one reference pose, the model's zero pose (arm straight forward,
+# forearm and gripper level, moving jaw on top), report runs/calibration/reference-zero-pose.json, solve
+# record runs/calibration/solve-20261018-013942-662672.json, encoder calibration sha256 5494adfa...bbe6c.
+# The five-pose accuracy check (A6 step 4) is still to run. The gripper line is A11's default (0 to 100)
+# until A11 measures it. Redo A6 after any recalibration: LeRobot's 0 is the midpoint of each joint's
+# calibrated range, so the offsets depend on the calibration file.
 #
 # lerobot_robot_type is the registry name for `--robot.type`. The demo laptop's LeRobot 0.6.2 (Seeed fork,
 # module lerobot.robots.so_follower) registers SOFollowerRobotConfig under both "so101_follower" and
 # "so100_follower" (config_so_follower.py), so this value works there and on upstream releases.
 lerobot_id: my_awesome_follower_arm
 lerobot_robot_type: so101_follower
-shoulder_pan: {sign: 1, offset_deg: 0.0}
-shoulder_lift: {sign: 1, offset_deg: 0.0}
-elbow_flex: {sign: 1, offset_deg: 0.0}
-wrist_flex: {sign: 1, offset_deg: 0.0}
-wrist_roll: {sign: 1, offset_deg: 0.0}
+shoulder_pan: {sign: 1, offset_deg: 7.956}
+shoulder_lift: {sign: 1, offset_deg: -1.582}
+elbow_flex: {sign: 1, offset_deg: -8.044}
+wrist_flex: {sign: 1, offset_deg: -1.055}
+wrist_roll: {sign: 1, offset_deg: 3.473}
 gripper: {closed_pct: 0, open_pct: 100}

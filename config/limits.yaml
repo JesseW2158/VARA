@@ -2,11 +2,14 @@
 # wrist_flex, wrist_roll]. Everything that moves the arm (arm/driver.py, arm/replay.py validate, arm/ik.py)
 # clamps to these minus 3 degrees.
 #
-# PLACEHOLDER: these are the MuJoCo ranges from sim/model/so101_new_calib.xml ("new calibration", every
-# joint's zero is mid-range). A6 (joint map and accuracy check) replaces them with the calibrated ranges
-# measured on our follower arm and must redo that after any recalibration.
+# MEASURED 2026-10-17 21:39 (A6): each joint is the overlap of our follower's calibrated range, converted
+# through the solved joint map (runs/calibration/solve-20261018-013942-662672.json), and the MuJoCo range
+# of sim/model/so101_new_calib.xml. The physical ranges reach 7.7 to 20.7 degrees past the model on every
+# joint (pan [-1.9333, 2.2110], lift [-1.8796, 1.8243], elbow [-1.8474, 1.5666], wrist_flex
+# [-1.8167, 1.7799], roll [-3.0810, 3.2022]); they were narrowed deliberately so the arm is never
+# commanded where the model cannot plan. Redo A6 after any recalibration.
 shoulder_pan: [-1.9199, 1.9199]
 shoulder_lift: [-1.7453, 1.7453]
-elbow_flex: [-1.69, 1.69]
+elbow_flex: [-1.69, 1.5666]
 wrist_flex: [-1.6581, 1.6581]
 wrist_roll: [-2.7438, 2.8412]
