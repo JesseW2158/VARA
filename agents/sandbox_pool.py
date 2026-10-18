@@ -741,15 +741,17 @@ def wait_for_sandboxes_gone(
     poll: float = 2.0,
 ) -> list[dict[str, Any]]:
     """Poll the inventory until nothing in scope (optionally only the sandboxes `ids`) is present, or until
-    `timeout` passes; returns the records still present. It keeps waiting only while one of them is
-    `destroying` (deletes are fire-and-forget), so a listing of live sandboxes answers at once."""
+    `timeout` passes; returns the records still present. Without `ids` it keeps waiting only while one of
+    them is `destroying` (deletes are fire-and-forget), so a listing of live sandboxes answers at once. With
+    `ids` (sandboxes the caller just deleted) it waits for them whatever state they report: right after a
+    delete Daytona can still list one as started before it turns `destroying`."""
     wanted = None if ids is None else {str(i) for i in ids}
     deadline = time.monotonic() + max(0.0, float(timeout))
     while True:
         records = present_records(list_vara_sandboxes(client, labels=labels))
         if wanted is not None:
             records = [r for r in records if r["id"] in wanted]
-        vanishing = any(r["state"] in LEAVING_STATES for r in records)
+        vanishing = wanted is not None or any(r["state"] in LEAVING_STATES for r in records)
         if not records or not vanishing or time.monotonic() >= deadline:
             return records
         time.sleep(poll)

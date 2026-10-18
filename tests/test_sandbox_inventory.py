@@ -200,6 +200,26 @@ def test_inventory_wait_polls_only_while_a_sandbox_is_destroying(client):
     assert [r["state"] for r in stuck] == ["destroying"]  # timeout: reported, not hidden
 
 
+def test_inventory_wait_for_our_own_deleted_ids_waits_whatever_state_they_report(client):
+    """Measured on the live account (2026-10-18): right after a delete Daytona still listed the smoke's
+    sandbox as started, so the smoke reported it undeleted although it was gone a moment later."""
+    client.listed = [Listed("ours", {"vara": "pool"}, state="started")]
+
+    def settle(call: int) -> None:
+        if call == 2:
+            client.listed[0].state = "destroying"
+        if call >= 4:
+            client.listed[0].state = "destroyed"
+
+    client.on_list = settle
+    assert sp.wait_for_sandboxes_gone(client, ids=["ours"], timeout=5.0, poll=0.001) == []
+    assert client.list_calls == 4
+    client.on_list = None
+    client.listed = [Listed("ours", {"vara": "pool"}, state="started")]
+    left = sp.wait_for_sandboxes_gone(client, ids=["ours"], timeout=0.0, poll=0.001)
+    assert [r["id"] for r in left] == ["ours"]  # a delete that never took is reported after the timeout
+
+
 def test_inventory_after_shutdown_reports_ours_gone_and_the_remaining_count(client):
     client.listed = [
         Listed("ours", {"vara": "pool"}, state="destroyed"),
