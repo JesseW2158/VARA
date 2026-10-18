@@ -35,9 +35,28 @@ review their evidence separately. This command never emits a motion-readiness ce
 Removing placeholder comments cannot establish calibration, and the presence of
 `homography.npy` cannot establish that it came from the physical table.
 
+The report starts with a `host` block (`hostname`, `os`, `python`, `git_head`, `git_dirty`, `utc`), so a
+saved report says which laptop and which commit it describes.
+
 For the motor inspection workflow and measured encoder mismatch, see
-[hardware calibration](hardware-calibration.md). For executable software validation, run
-`pytest -q` and the fake end-to-end example documented in [README](../README.md).
+[hardware calibration](hardware-calibration.md).
+
+## Verify a laptop (I1)
+
+`scripts/verify.py` is the `/verify` check with the venv's interpreter named explicitly. It runs the whole
+test suite (any skipped, xfailed or failed test fails it), the fake end-to-end run `put the juice box in the
+tray` (its last stage must be `saved`) and `ruff check .`, then writes
+`runs/verify/<hostname>-<timestamp>.json` with the host block, each step's exit code, duration and output
+tail, and full logs beside it. Exit 0 only when every step passed. A full run takes about seven minutes:
+
+```powershell
+.\.venv\Scripts\python.exe scripts/verify.py
+```
+
+`--skip-e2e`, `--only pytest|e2e|ruff` and `--pytest-args "tests/test_setup_check.py"` make partial
+reruns; such a record says `complete: false`. Record each laptop's result in the I1 table of
+[gates.md](gates.md). The key-dependent gates (model, Daytona and the voice token) are separate: see
+[live gates](live-gates.md).
 
 ## Live model configuration
 

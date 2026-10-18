@@ -538,3 +538,238 @@ def test_eval_cli_refuses_a_non_learn_request(tmp_path, capsys, no_dotenv):
     assert code == 1
     assert "not a learn request" in capsys.readouterr().out
     assert len(no_dotenv) == 1
+
+
+# --- the CLI: --skills and --spec -------------------------------------------------------------------
+
+
+@pytest.fixture
+def route_spy(monkeypatch):
+    """Records the skill names every `route` call sees; the fake router still answers from the fixtures."""
+    import agents.router as router_mod
+
+    seen: list[list[str]] = []
+    real_route = router_mod.route
+
+    def spy(text, skills, scene, **kwargs):
+        seen.append([s["name"] for s in skills])
+        return real_route(text, skills, scene, **kwargs)
+
+    monkeypatch.setattr(router_mod, "route", spy)
+    return seen
+
+
+def test_skill_summaries_lists():
+    everything = candidates._skill_summaries()
+    assert everything == candidates._skill_summaries("all")
+    assert {"name", "description", "params"} <= set(everything[0])
+    starters = candidates._skill_summaries("starter")
+    assert {s["name"] for s in starters} == {p.stem for p in candidates.STARTER_DIR.glob("*.json")}
+    assert {s["name"] for s in starters} <= {s["name"] for s in everything}
+    assert candidates._skill_summaries("none") == []
+    with pytest.raises(ValueError, match="skill list"):
+        candidates._skill_summaries("eval")
+
+
+def test_eval_cli_skill_lists_reach_the_router_and_the_prompt(tmp_path, route_spy, no_dotenv):
+    text = "put the juice box in the tray"
+    assert candidates.main(["--eval", text, "--task-dir", str(tmp_path / "default")]) == 0
+    assert candidates.main(["--eval", text, "--skills", "none", "--task-dir", str(tmp_path / "none")]) == 0
+    assert (
+        candidates.main(["--eval", text, "--skills", "starter", "--task-dir", str(tmp_path / "starter")]) == 0
+    )
+    assert candidates.main(["--eval", text, "--skills", "all", "--task-dir", str(tmp_path / "all")]) == 0
+    names = [s["name"] for s in candidates._skill_summaries()]
+    assert route_spy[0] == names  # the default is unchanged: every saved skill plus the starters
+    assert route_spy[1] == []
+    assert set(route_spy[2]) == {p.stem for p in candidates.STARTER_DIR.glob("*.json")}
+    assert route_spy[3] == names
+    none_prompt = (tmp_path / "none" / "prompts" / "write_skill_1.md").read_text(encoding="utf-8")
+    assert "(none saved yet)" in none_prompt
+    all_prompt = (tmp_path / "all" / "prompts" / "write_skill_1.md").read_text(encoding="utf-8")
+    assert "`place_in_tray`" in all_prompt and "(none saved yet)" not in all_prompt
+    assert len(no_dotenv) == 4
+
+
+def test_eval_cli_writes_summary_json(tmp_path, no_dotenv):
+    task_dir = tmp_path / "eval"
+    code = candidates.main(
+        ["--eval", "put the juice box in the tray", "--skills", "none", "--task-dir", str(task_dir)]
+    )
+    assert code == 0
+    summary = json.loads((task_dir / "summary.json").read_text(encoding="utf-8"))
+    assert summary["text"] == "put the juice box in the tray" and summary["spec_path"] is None
+    assert summary["spec_name"] == "juice_box_to_tray"
+    assert summary["skills"] == "none" and summary["skill_names"] == []
+    assert summary["fake_llm"] is True and summary["model"] is None  # the fixtures answered, no model
+    assert summary["demo_mode"] is False and summary["timeout_s"] == 45.0
+    assert summary["task_dir"] == str(task_dir)
+    assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", summary["utc"])
+    assert summary["n"] == 6 and summary["first_try"] == 6 and summary["final"] == 6 and summary["ok"] is True
+    assert isinstance(summary["elapsed_s"], float)
+    assert (task_dir / "summary.json").read_bytes().count(b"\r") == 0
+    rows = summary["candidates"]
+    assert [r["index"] for r in rows] == [1, 2, 3, 4, 5, 6]
+    assert [r["hint"] for r in rows] == list(HINTS)
+    assert all(
+        r["attempt"] == 1 and r["accepted"] is True and r["problem"] is None and r["lines"] > 0 for r in rows
+    )
+
+
+def test_summary_json_records_rejections(tmp_path, monkeypatch, no_dotenv):
+    import agents.router as router_mod
+
+    _bad_fixtures(tmp_path, monkeypatch)  # cand_1 is rejected; the other five fall back to the default
+    monkeypatch.setattr(
+        router_mod, "route", lambda text, skills, scene, **kw: {"action": "learn", "spec": SPEC}
+    )
+    task_dir = tmp_path / "eval"
+    code = candidates.main(["--eval", "put the juice box in the tray", "--demo", "--task-dir", str(task_dir)])
+    assert code == 0  # 5 of 6 on the first try is the gate; demo mode never regenerates
+    summary = json.loads((task_dir / "summary.json").read_text(encoding="utf-8"))
+    assert summary["ok"] is True and summary["demo_mode"] is True and summary["timeout_s"] == 30.0
+    assert summary["first_try"] == 5 and summary["final"] == 5
+    first = summary["candidates"][0]
+    assert first["accepted"] is False and "import" in first["problem"] and first["attempt"] == 1
+    assert all(row["accepted"] for row in summary["candidates"][1:])
+
+
+def test_spec_cli_generates_without_routing(tmp_path, monkeypatch, no_dotenv):
+    import agents.router as router_mod
+
+    def no_route(*args, **kwargs):
+        raise AssertionError("route() must not be called with --spec")
+
+    monkeypatch.setattr(router_mod, "route", no_route)
+    spec_path = FIXTURES / "task_spec_clear_table.json"
+    task_dir = tmp_path / "spec"
+    assert candidates.main(["--spec", str(spec_path), "--task-dir", str(task_dir)]) == 0
+    assert len(no_dotenv) == 1
+    for i in range(1, 7):
+        fixture = (LLM_FIXTURES / "candidates" / "clear_table" / f"cand_{i}.py").read_text(encoding="utf-8")
+        assert (task_dir / f"cand_{i}.py").read_text(encoding="utf-8") == fixture
+    assert not (task_dir / "prompts" / "router.md").exists()
+    prompt = (task_dir / "prompts" / "write_skill_1.md").read_text(encoding="utf-8")
+    assert "Put every object on the table into the tray." in prompt and "`place_in_tray`" in prompt
+    summary = json.loads((task_dir / "summary.json").read_text(encoding="utf-8"))
+    assert summary["text"] is None and summary["spec_path"] == str(spec_path)
+    assert summary["spec_name"] == "clear_table" and summary["skills"] == "all"
+    assert summary["first_try"] == 6 and summary["ok"] is True
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        '{"name": "clear_table"}',
+        "not json",
+        '{"name": "Bad Name", "description": "x", "params": {}, "success": {"event": "e"}, "english": "x"}',
+        '{"name": "ok_name", "description": "x", "params": {"a": "string"}, '
+        '"success": {"event": "e"}, "english": "x"}',
+    ],
+)
+def test_spec_cli_rejects_an_invalid_spec_before_writing_anything(tmp_path, no_dotenv, capsys, content):
+    bad = tmp_path / "bad.json"
+    bad.write_text(content, encoding="utf-8")
+    task_dir = tmp_path / "t"
+    with pytest.raises(SystemExit) as error:
+        candidates.main(["--spec", str(bad), "--task-dir", str(task_dir)])
+    assert error.value.code == 2
+    assert "--spec" in capsys.readouterr().err
+    assert not task_dir.exists() and len(no_dotenv) == 0
+
+
+def test_spec_cli_rejects_a_missing_file_and_bad_flag_combinations(tmp_path, no_dotenv):
+    for argv in (
+        ["--spec", str(tmp_path / "missing.json")],
+        ["--eval", "x", "--spec", str(FIXTURES / "task_spec_clear_table.json")],
+        ["--eval", "x", "--skills", "eval"],
+    ):
+        with pytest.raises(SystemExit) as error:
+            candidates.main(argv)
+        assert error.value.code == 2, argv
+    assert candidates.main([]) == 2
+    assert len(no_dotenv) == 0
+
+
+def test_load_task_spec_validates(tmp_path):
+    spec = candidates.load_task_spec(FIXTURES / "task_spec_clear_table.json")
+    assert spec["name"] == "clear_table"
+    bad = tmp_path / "bad.json"
+    bad.write_text(json.dumps({**spec, "params": {"x": "string"}}), encoding="utf-8")
+    with pytest.raises(ValueError, match="params"):
+        candidates.load_task_spec(bad)
+    bad.write_text("{", encoding="utf-8")
+    with pytest.raises(ValueError, match="not JSON"):
+        candidates.load_task_spec(bad)
+    with pytest.raises(OSError):
+        candidates.load_task_spec(tmp_path / "missing.json")
+    with_bom = tmp_path / "bom.json"
+    with_bom.write_bytes(b"\xef\xbb\xbf" + json.dumps(spec).encode("utf-8"))  # PowerShell's UTF-8 writes one
+    assert candidates.load_task_spec(with_bom) == spec
+
+
+def test_eval_cli_never_writes_into_a_folder_that_holds_files(tmp_path, no_dotenv, capsys):
+    task_dir = tmp_path / "eval"
+    text = "put the juice box in the tray"
+    assert candidates.main(["--eval", text, "--task-dir", str(task_dir)]) == 0
+    first = (task_dir / "summary.json").read_bytes()
+
+    def snapshot():
+        return {
+            str(p.relative_to(task_dir)): p.stat().st_mtime_ns for p in task_dir.rglob("*") if p.is_file()
+        }
+
+    before = snapshot()
+    assert "summary.json" in before and len(before) > 6
+    capsys.readouterr()
+    with pytest.raises(SystemExit) as error:  # a rerun into the same folder is refused before any work
+        candidates.main(["--eval", text, "--task-dir", str(task_dir)])
+    assert error.value.code == 2
+    assert "--task-dir" in capsys.readouterr().err
+    assert (task_dir / "summary.json").read_bytes() == first
+    assert snapshot() == before
+    a_file = tmp_path / "a_file.txt"
+    a_file.write_text("x", encoding="utf-8")
+    with pytest.raises(SystemExit) as error:
+        candidates.main(["--spec", str(FIXTURES / "task_spec_clear_table.json"), "--task-dir", str(a_file)])
+    assert error.value.code == 2 and "not a folder" in capsys.readouterr().err
+    assert len(no_dotenv) == 1  # only the first, valid call read .env
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    assert (
+        candidates.main(["--spec", str(FIXTURES / "task_spec_clear_table.json"), "--task-dir", str(empty)])
+        == 0
+    )
+    assert (empty / "summary.json").is_file()
+
+
+def test_eval_cli_default_folder_is_new_per_run(tmp_path, monkeypatch, fake_env, no_dotenv, capsys):
+    real_strftime = time.strftime
+
+    def fixed(fmt, *args):  # two runs in the same second: the second folder gets "-2"
+        return "20261017-120000" if fmt == "%Y%m%d-%H%M%S" else real_strftime(fmt, *args)
+
+    monkeypatch.setattr(candidates.time, "strftime", fixed)
+    spec_path = str(FIXTURES / "task_spec_clear_table.json")
+    assert candidates.main(["--spec", spec_path]) == 0
+    assert candidates.main(["--spec", spec_path]) == 0
+    folders = sorted(p.name for p in fake_env.iterdir())
+    assert folders == ["eval-clear_table-20261017-120000", "eval-clear_table-20261017-120000-2"]
+    for name in folders:
+        summary = json.loads((fake_env / name / "summary.json").read_text(encoding="utf-8"))
+        assert summary["task_dir"] == str(fake_env / name) and summary["first_try"] == 6
+        assert (fake_env / name / "cand_6.py").is_file()
+    assert f"files in {fake_env / folders[1]}" in capsys.readouterr().out
+
+
+def test_eval_cli_refuses_a_bad_timeout_before_reading_env(tmp_path, no_dotenv, capsys):
+    for value in ("0", "-5", "nan", "inf", "soon"):
+        with pytest.raises(SystemExit) as error:
+            candidates.main(["--eval", "put the juice box in the tray", "--timeout", value])
+        assert error.value.code == 2, value
+        assert "--timeout" in capsys.readouterr().err
+    assert len(no_dotenv) == 0
+    task_dir = tmp_path / "eval"
+    args = ["--eval", "put the juice box in the tray", "--timeout", "12.5", "--task-dir", str(task_dir)]
+    assert candidates.main(args) == 0
+    assert json.loads((task_dir / "summary.json").read_text(encoding="utf-8"))["timeout_s"] == 12.5

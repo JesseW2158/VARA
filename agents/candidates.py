@@ -29,8 +29,20 @@ runs them in a sandbox or a clean subprocess.
   CR and a BOM are normalized first.
 - `generate` and `repair` raise `ValueError` for a `task_id` that is not a plain identifier, before any
   file is written.
-- `python -m agents.candidates --eval "<text>"`: route the text, generate, and print how many candidates
-  pass `check_source` on the first try (with FAKE_LLM=1 everything comes from the fixtures).
+- `python -m agents.candidates --eval "<text>" | --spec FILE [--skills all|starter|none] [--task-dir DIR]`:
+  route the text, generate, and print how many candidates pass `check_source` on the first try (with
+  FAKE_LLM=1 everything comes from the fixtures). `--skills` is the skill list the router and the prompt
+  see: every saved skill plus the starters (`all`, the default and the old behaviour), the starters only,
+  or none at all (`none` keeps "put the juice box in the tray" a learn with the live model although
+  skills/place_in_tray.json exists, so the C3 gate has a reliable live form). `--spec FILE` generates
+  straight from a task spec JSON (validated against schemas/task_spec.json by `load_task_spec`) without
+  any router call. Every run writes into a new folder: `--task-dir` must be missing or empty, and the
+  default is `runs/eval-<spec name>-<UTC stamp>` (`-2`, `-3`, ... on a clash). Both forms write
+  `<task_dir>/summary.json`, never overwritten: the request or spec path, the skill list, whether the
+  fixtures answered (`fake_llm`) and the code model otherwise, the budget, the UTC time, the counts and one
+  row per candidate (attempt, accepted, lines, first problem, hint). A bad call (no request, both forms, an
+  unknown skill list, an invalid spec, a `--timeout` that is not a positive number, a `--task-dir` that
+  holds files) exits 2 before `.env` is read or any model is asked.
 """
 
 from __future__ import annotations
@@ -39,6 +51,7 @@ import argparse
 import ast
 import json
 import logging
+import math
 import os
 import re
 import sys
@@ -59,11 +72,13 @@ __all__ = [
     "CLOSING_LINE",
     "Candidate",
     "HINTS",
+    "SKILL_LISTS",
     "STARTER_EXAMPLES",
     "check_source",
     "extract_code",
     "extract_code_blocks",
     "generate",
+    "load_task_spec",
     "render_messages",
     "repair",
     "repair_messages",
@@ -86,6 +101,7 @@ SYSTEM_PROMPT = (
 GRACE_S = 2.0  # how long generate() waits past its budget for replies already on the wire
 MIN_RETRY_S = 5.0  # no regeneration when less than this is left of the budget
 SKILL_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{1,40}$")
+SKILL_LISTS: tuple[str, ...] = ("all", "starter", "none")  # the `--skills` choices of the CLI
 
 HINTS: tuple[str, ...] = (
     "Nearest object first, default parameters.",
@@ -608,10 +624,74 @@ def routine_candidate(steps: Sequence[Mapping[str, Any]]) -> str:
 # --- CLI ---------------------------------------------------------------------------------------------
 
 
-def _skill_summaries() -> list[dict[str, Any]]:
-    """`{"name", "description", "params"}` for every skill under skills/ and skills/_starter/."""
+def load_task_spec(path: str | Path) -> dict[str, Any]:
+    """The task spec in a JSON file, validated against schemas/task_spec.json.
+
+    Raises OSError when the file cannot be read and ValueError when it is not UTF-8 JSON (a BOM is fine) or
+    not a valid spec."""
+    from agents.library import validate_task_spec  # its LibraryError is a ValueError
+
+    text = Path(path).read_text(encoding="utf-8-sig")
+    try:
+        spec = json.loads(text)
+    except ValueError as exc:
+        raise ValueError(f"not JSON: {exc}") from None
+    validate_task_spec(spec)
+    return spec
+
+
+def _check_fresh_dir(path: Path) -> None:
+    """Raise ValueError unless `path` is missing or an empty folder, so an eval never overwrites a run."""
+    try:
+        if not path.exists():
+            return
+        if not path.is_dir():
+            raise ValueError("is a file, not a folder")
+        if any(path.iterdir()):
+            raise ValueError("already holds files; choose a new or empty folder (a run is never overwritten)")
+    except OSError as exc:
+        raise ValueError(f"cannot be inspected: {exc}") from None
+
+
+def _new_eval_dir(name: str) -> Path:
+    """Create and return `runs/eval-<name>-<UTC stamp>`, or that name plus `-2`, `-3`, ... when it exists."""
+    base = f"eval-{name}-{time.strftime('%Y%m%d-%H%M%S', time.gmtime())}"
+    n = 1
+    while True:
+        path = llm.RUNS / (base if n == 1 else f"{base}-{n}")
+        try:
+            path.mkdir(parents=True)
+            return path
+        except FileExistsError:
+            n += 1
+
+
+def _write_new(path: Path, text: str) -> None:
+    """Create `path` holding `text` with LF line ends; FileExistsError (an OSError) when it already exists."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("x", encoding="utf-8", newline="\n") as handle:
+        handle.write(text)
+
+
+def _seconds(text: str) -> float:
+    """The argparse type of `--timeout`: a finite number of seconds above 0."""
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a number of seconds: {text!r}") from None
+    if not math.isfinite(value) or value <= 0:
+        raise argparse.ArgumentTypeError(f"must be a positive number of seconds, got {text!r}")
+    return value
+
+
+def _skill_summaries(which: str = "all") -> list[dict[str, Any]]:
+    """`{"name", "description", "params"}` per skill: `all` reads skills/ then skills/_starter/ (a saved
+    skill wins over a starter of the same name), `starter` reads skills/_starter/ only, `none` is `[]`."""
+    if which not in SKILL_LISTS:
+        raise ValueError(f"skill list must be one of {SKILL_LISTS}, got {which!r}")
+    folders = {"all": (SKILLS_DIR, STARTER_DIR), "starter": (STARTER_DIR,), "none": ()}[which]
     out: dict[str, dict[str, Any]] = {}
-    for folder in (SKILLS_DIR, STARTER_DIR):
+    for folder in folders:
         for path in sorted(folder.glob("*.json")) if folder.is_dir() else []:
             try:
                 skill = json.loads(path.read_text(encoding="utf-8"))
@@ -639,33 +719,84 @@ def _utf8_stdout() -> None:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """`python -m agents.candidates --eval "<text>"`: route, generate and count the accepted candidates."""
+    """`python -m agents.candidates --eval "<text>" | --spec FILE [--skills all|starter|none]
+    [--task-dir DIR]`: route the text (or load the spec), generate into a new folder, write
+    `<task_dir>/summary.json` and count the accepted candidates.
+
+    Exit 0 when at least 5 of 6 pass `check_source` on the first try; 1 otherwise, when the text is not a
+    learn request, or when the folder or summary.json cannot be written; 2 on a bad call (no request, both
+    forms, an unknown skill list, an invalid spec, a bad `--timeout`, a `--task-dir` that holds files),
+    before `.env` is read or any model is asked."""
     parser = argparse.ArgumentParser(prog="python -m agents.candidates", description="candidate generation")
-    parser.add_argument("--eval", metavar="TEXT", help="route this request and generate its candidates")
-    parser.add_argument("--task-dir", default=None, help="where to write (default runs/eval-<spec name>)")
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument("--eval", metavar="TEXT", help="route this request and generate its candidates")
+    source.add_argument(
+        "--spec",
+        metavar="FILE",
+        help="generate for this task spec JSON (schemas/task_spec.json) without routing",
+    )
+    parser.add_argument(
+        "--skills",
+        choices=SKILL_LISTS,
+        default="all",
+        help="the skill list the router and the prompt see: every saved skill plus the starters (default), "
+        "the starters only, or none (so a phrase a saved skill already covers is still a learn)",
+    )
+    parser.add_argument(
+        "--task-dir",
+        default=None,
+        metavar="DIR",
+        help="a new or empty folder to write into (default runs/eval-<spec name>-<UTC stamp>)",
+    )
     parser.add_argument("--demo", action="store_true", help="DEMO_MODE budgets: no regeneration, 30 s")
-    parser.add_argument("--timeout", type=float, default=None, help="generation budget in seconds")
+    parser.add_argument(
+        "--timeout",
+        type=_seconds,
+        default=None,
+        metavar="S",
+        help="generation budget in seconds (default 45; 30 with --demo or DEMO_MODE=1)",
+    )
     args = parser.parse_args(argv)
-    if not args.eval:
+    if not args.eval and not args.spec:
         parser.print_help()
         return 2
+    spec: dict[str, Any] | None = None
+    if args.spec:
+        try:
+            spec = load_task_spec(args.spec)
+        except (OSError, ValueError) as exc:
+            parser.error(f"--spec {args.spec}: {exc}")
+    task_dir = Path(args.task_dir) if args.task_dir is not None else None
+    if task_dir is not None:
+        try:
+            _check_fresh_dir(task_dir)
+        except ValueError as exc:
+            parser.error(f"--task-dir {task_dir}: {exc}")
     from dotenv import load_dotenv
 
     load_dotenv()
     logging.basicConfig(level=logging.WARNING, stream=sys.stderr)
     _utf8_stdout()
-    from agents.router import route
-
     demo_mode = args.demo or os.environ.get("DEMO_MODE") == "1"
     timeout = args.timeout if args.timeout is not None else (30.0 if demo_mode else 45.0)
-    skills = _skill_summaries()
+    skills = _skill_summaries(args.skills)
     scene = json.loads(FAKE_SCENE_PATH.read_text(encoding="utf-8"))
-    result = route(args.eval, skills, scene)
-    if result.get("action") != "learn":
-        print(f"not a learn request: {json.dumps(result)}")
-        return 1
-    spec = result["spec"]
-    task_dir = Path(args.task_dir) if args.task_dir else llm.RUNS / f"eval-{spec['name']}"
+    if spec is None:
+        from agents.router import route
+
+        result = route(args.eval, skills, scene)
+        if result.get("action") != "learn":
+            print(f"not a learn request: {json.dumps(result)}")
+            return 1
+        spec = result["spec"]
+    if task_dir is None:
+        try:
+            task_dir = _new_eval_dir(str(spec["name"]))
+        except OSError as exc:
+            print(f"cannot create a folder under {llm.RUNS}: {exc}", file=sys.stderr)
+            return 1
+    fake = llm.is_fake()
+    utc = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     started = time.monotonic()
     candidates = generate(spec, scene, skills, task_dir=task_dir, timeout=timeout, demo_mode=demo_mode)
     elapsed = time.monotonic() - started
@@ -675,11 +806,47 @@ def main(argv: Sequence[str] | None = None) -> int:
         state = "ok" if c.accepted else c.problems[0]
         lines = len(c.source.splitlines())
         print(f"cand_{c.index} (attempt {c.attempt}, {lines} lines): {state}\n    hint: {c.hint}")
+    ok = first_try >= min(5, len(candidates))
+    summary = {
+        "text": args.eval,
+        "spec_path": str(args.spec) if args.spec else None,
+        "spec_name": spec["name"],
+        "skills": args.skills,
+        "skill_names": [s["name"] for s in skills],
+        "fake_llm": fake,
+        "model": None if fake else codegen_model(),
+        "demo_mode": demo_mode,
+        "timeout_s": timeout,
+        "task_dir": str(task_dir),
+        "utc": utc,
+        "n": len(candidates),
+        "first_try": first_try,
+        "final": final,
+        "elapsed_s": round(elapsed, 3),
+        "ok": ok,
+        "candidates": [
+            {
+                "index": c.index,
+                "attempt": c.attempt,
+                "accepted": c.accepted,
+                "lines": len(c.source.splitlines()),
+                "problem": c.problems[0] if c.problems else None,
+                "hint": c.hint,
+            }
+            for c in candidates
+        ],
+    }
+    summary_path = task_dir / "summary.json"
+    try:
+        _write_new(summary_path, json.dumps(summary, indent=2) + "\n")
+    except OSError as exc:
+        print(f"could not write {summary_path}: {exc}", file=sys.stderr)
+        return 1
     print(
         f"{first_try} of {len(candidates)} passed check_source on the first try; "
         f"{final} of {len(candidates)} after regeneration; {elapsed:.1f} s; files in {task_dir}"
     )
-    return 0 if first_try >= min(5, len(candidates)) else 1
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":

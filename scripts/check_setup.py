@@ -1,4 +1,9 @@
-"""Inspect local setup without opening hardware, cameras, or network connections."""
+"""Inspect local setup without opening hardware, cameras, or network connections.
+
+The report starts with a `host` block (hostname, OS, Python version, git HEAD, dirty flag, UTC time) so a
+saved copy (`--out`, the per-laptop I1 evidence) says which laptop it describes; `host_block` reads
+platform/sys and runs `git rev-parse` and `git status` in the repo, nothing else.
+"""
 
 from __future__ import annotations
 
@@ -6,7 +11,11 @@ import argparse
 import importlib.util
 import json
 import os
+import platform
 import re
+import subprocess
+import sys
+import time
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -48,6 +57,37 @@ def _port(value: object, secrets: tuple[str, ...] = ()) -> str | None:
     if not isinstance(value, str) or any(secret in value for secret in secrets):
         return None
     return value if re.fullmatch(r"COM\d+|/dev/tty[\w./-]+", value, re.I) else None
+
+
+def _git(root: Path, *args: str) -> str | None:
+    """stdout of `git <args>` run in `root`, stripped; None when git is missing, fails or times out."""
+    try:
+        done = subprocess.run(
+            ["git", *args],
+            cwd=str(root),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return done.stdout.strip() if done.returncode == 0 else None
+
+
+def host_block(root: Path) -> dict:
+    """The laptop's identity: hostname, OS, Python version, git HEAD, whether the tree is dirty (None when
+    git cannot say) and the UTC time. No device, port, camera or network is touched."""
+    status = _git(root, "status", "--porcelain")
+    return {
+        "hostname": platform.node() or "unknown",
+        "os": platform.platform(),
+        "python": sys.version.split()[0],
+        "git_head": _git(root, "rev-parse", "--short", "HEAD"),
+        "git_dirty": None if status is None else bool(status),
+        "utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
 
 
 def build_report(root: Path, env: Mapping[str, str], hardware_report: Path | None = None) -> dict:
@@ -138,6 +178,7 @@ def build_report(root: Path, env: Mapping[str, str], hardware_report: Path | Non
             historical["error"] = "Report missing, malformed, or incomplete; no hardware was checked."
             blockers.append(historical["error"])
     return {
+        "host": host_block(root),
         "non_invasive": True,
         "dependency_check": "Module discovery only; no hardware or service imports.",
         "offline_prerequisites_ok": all(dependencies.values())

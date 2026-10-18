@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import builtins
 import json
+import re
+import subprocess
+import sys
 
 import pytest
 
@@ -172,6 +175,63 @@ def test_live_configuration_gate_can_pass_without_certifying_manual_checks(setup
     report = json.loads(capsys.readouterr().out)
     assert not report["live_configuration_blockers"]
     assert report["manual_acceptance_required"]
+
+
+def test_report_carries_the_host_identity(setup_root, monkeypatch):
+    answers = {("rev-parse", "--short", "HEAD"): "abc1234", ("status", "--porcelain"): " M arm/driver.py\n"}
+    monkeypatch.setattr(check_setup, "_git", lambda root, *args: answers[args])
+    report = check_setup.build_report(setup_root, {})
+    assert list(report)[0] == "host"
+    host = report["host"]
+    assert set(host) == {"hostname", "os", "python", "git_head", "git_dirty", "utc"}
+    assert host["hostname"] and isinstance(host["hostname"], str)
+    assert host["os"] and isinstance(host["os"], str)
+    assert host["python"] == sys.version.split()[0]
+    assert host["git_head"] == "abc1234" and host["git_dirty"] is True
+    assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", host["utc"])
+    assert report["offline_prerequisites_ok"]  # the block changes no verdict
+
+
+def test_host_block_reports_a_clean_tree_and_a_missing_git(setup_root, monkeypatch):
+    monkeypatch.setattr(check_setup, "_git", lambda root, *args: "" if args[0] == "status" else "abc1234")
+    assert check_setup.host_block(setup_root)["git_dirty"] is False
+    monkeypatch.setattr(check_setup, "_git", lambda root, *args: None)
+    host = check_setup.host_block(setup_root)
+    assert host["git_head"] is None and host["git_dirty"] is None
+
+
+def test_git_helper_runs_in_the_root_and_never_raises(tmp_path, monkeypatch):
+    seen = []
+
+    def outside_a_repository(args, **kwargs):
+        seen.append((args, kwargs.get("cwd")))
+        return subprocess.CompletedProcess(args, 128, "", "fatal: not a git repository")
+
+    monkeypatch.setattr(check_setup.subprocess, "run", outside_a_repository)
+    assert check_setup._git(tmp_path, "rev-parse", "--short", "HEAD") is None
+    assert seen == [(["git", "rev-parse", "--short", "HEAD"], str(tmp_path))]
+
+    def missing(*args, **kwargs):
+        raise FileNotFoundError("git")
+
+    monkeypatch.setattr(check_setup.subprocess, "run", missing)
+    assert check_setup._git(tmp_path, "status", "--porcelain") is None
+
+    def clean(args, **kwargs):
+        return subprocess.CompletedProcess(args, 0, "dfc47e7\n", "")
+
+    monkeypatch.setattr(check_setup.subprocess, "run", clean)
+    assert check_setup._git(tmp_path, "rev-parse", "--short", "HEAD") == "dfc47e7"
+
+
+def test_cli_report_and_saved_file_include_the_host_block(setup_root, capsys):
+    out = setup_root / "reports" / "host.json"
+    assert check_setup.main(["--out", str(out)]) == 0
+    printed = json.loads(capsys.readouterr().out)
+    saved = json.loads(out.read_text(encoding="utf-8"))
+    assert printed["host"]["hostname"] == saved["host"]["hostname"]
+    assert saved["host"]["python"] == sys.version.split()[0]
+    assert "os" in saved["host"] and "utc" in saved["host"]
 
 
 def test_no_hardware_camera_or_service_module_is_imported(setup_root, monkeypatch):

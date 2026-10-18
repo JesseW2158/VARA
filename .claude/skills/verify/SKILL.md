@@ -1,10 +1,11 @@
 ---
 name: verify
-description: Run the no-hardware checks (pytest, the fake end-to-end run, ruff) and report each result with its output.
+description: Run the no-hardware checks (pytest with nothing skipped, the fake end-to-end run, ruff) through scripts/verify.py with the project interpreter, and report the record it writes.
 disable-model-invocation: true
 ---
-1. Run `pytest -q`.
-2. Run `python scripts/e2e_fake.py "put the juice box in the tray"` and confirm the last stage printed is `saved`.
-3. Run `ruff check .`.
+1. From the repo root run `.venv\Scripts\python.exe scripts/verify.py` (Windows; `.venv/Scripts/python.exe scripts/verify.py` in Git Bash) or `.venv/bin/python scripts/verify.py` (macOS, Linux). Never use a bare `python`, `pytest` or `ruff`: they may not be the project's venv. The script runs `-m pytest -q -p no:cacheprovider -rs` (a skipped or xfailed test fails the step), `scripts/e2e_fake.py "put the juice box in the tray"` (the last stage must be `saved`) and `-m ruff check .` with that interpreter, echoes each step and writes `runs/verify/<hostname>-<timestamp>.json` with the full logs in `runs/verify/<hostname>-<timestamp>/`. It takes about seven minutes, so give the shell call a 10-minute timeout (600000 ms) or run it in the background and wait for it to finish. Don't add `--skip-e2e`, `--only` or `--pytest-args` unless I ask for a fast rerun: the record then says `complete: false`, which is not an I1 pass.
+2. Report the record path from the last line (`verify record: ...`), the host line (hostname, OS, Python, git HEAD, clean or dirty) and, per step, pass or fail, the seconds, the reason and the last lines of its output (`output_tail` in the record; the whole log is in the folder printed on the `verify logs: ...` line). Exit code 0 with `complete: true` in the record means I1 passed on this laptop; 1 means a step failed.
+3. Run the same interpreter on `scripts/check_setup.py --out <logs folder>/setup.json`, using the folder from the `verify logs: ...` line, so the laptop's configuration sits next to the record. Report its `offline_prerequisites_ok` and its `host` block. It touches no device, camera or network.
+4. Remind me of the manual half of I1, which is not automated: with `FAKE=1` in `.env`, start `.venv\Scripts\python.exe -m uvicorn agents.orchestrator:app --port 8000`, type "put the juice box in the tray" at http://localhost:8000 and check that six cards appear. Then add this laptop's row to the I1 per-laptop table in docs/gates.md with the record path as evidence.
 
-Report each command with the last lines of its output and a pass or fail. Don't fix anything unless I ask.
+Don't fix anything unless I ask.
