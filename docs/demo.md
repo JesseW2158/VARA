@@ -210,11 +210,11 @@ starting arrangement to measure and test physically, not as an accepted calibrat
 
 | Item | x | y | Note |
 | --- | --- | --- | --- |
-| Pill bottle (`pill_bottle`), marker 10 | 0.18 | -0.12 | 1.75 in across, 3.25 in tall |
-| Power bank (`juice_box`), marker 11 | 0.24 | -0.04 | Yaw 0.3 rad in the fixture; 3.5 in tall |
-| Box (`tea_tin`), marker 12 | 0.15 | 0.03 | Long side along x; 4 in tall |
+| Pill bottle (`pill_bottle`), marker 10 | 0.17 | -0.13 | 2.25 x 1.75 in, 2.875 in tall; long side along x (yaw 0) |
+| Juice box (`juice_box`), marker 11 | 0.24 | -0.04 | 3.5 x 1.25 in, 4.5 in tall; yaw 0.3 rad in the fixture |
+| Tea tin (`tea_tin`), marker 12 | 0.15 | 0.03 | 2.75 x 1.75 in, 4.125 in tall; long side along x |
 | Tape measure (`cereal_box`, the obstacle), marker 30 | 0.28 | 0.07 | On its edge, 2.25 in tall |
-| Drop area (`tray`, taped, no physical tray) | 0.19 | 0.17 | Radius 0.09; spots (0.13, 0.15), (0.22, 0.12), (0.20, 0.22) |
+| Drop area (`tray`, taped, no physical tray) | 0.19 | 0.17 | Radius 0.09; spots (0.14, 0.15), (0.22, 0.13), (0.20, 0.20) |
 | Handoff zone | 0.28 | -0.08 | z = 0.10 |
 
 The exact slots and dimensions are in [config/fake_scene.json](../config/fake_scene.json). The passing

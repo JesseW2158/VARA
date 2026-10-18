@@ -113,12 +113,7 @@ OBJECT_WORDS: dict[str, str] = {
     "tea tin": "tea_tin",
     "tea": "tea_tin",
     "tin": "tea_tin",
-    # the 2026-10-18 props keep the slot names: the power bank is juice_box, the box is tea_tin
-    "power bank": "juice_box",
-    "battery": "juice_box",
-    "charger": "juice_box",
-    "bandage box": "tea_tin",
-    "band aid box": "tea_tin",
+    # speech recognition's spellings of "tea tin"
     "t10": "tea_tin",
     "t 10": "tea_tin",
 }

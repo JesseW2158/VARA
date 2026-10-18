@@ -206,8 +206,13 @@ def test_a_glued_marker_maps_into_its_object_which_is_why_it_is_left_out(
     found = dict(targets)
     for name, item in fake_scene["objects"].items():
         seen = found[f"marker_{item['marker']}"]
-        offset = math.hypot(seen["x"] - item["x"], seen["y"] - item["y"])
-        assert offset < min(item["size"]) / 2, name  # still over the object
+        dx, dy = seen["x"] - item["x"], seen["y"] - item["y"]
+        if table[item["marker"]]["shape"] == "cylinder":
+            assert math.hypot(dx, dy) < item["size"][1] / 2, name  # still over the object
+        else:  # inside the box's footprint, in its own axes (the parallax runs along the 10.5 cm tea tin)
+            along = dx * math.cos(item["yaw"]) + dy * math.sin(item["yaw"])
+            across = -dx * math.sin(item["yaw"]) + dy * math.cos(item["yaw"])
+            assert abs(along) < item["size"][0] / 2 and abs(across) < item["size"][1] / 2, name
         assert ABOVE_HOVER < item["h"], name  # so the 5 cm hover lies below its top
     c, hc = camera_pose(cfg)
     expected = dict(touch.fake_detections(scene, c, hc))

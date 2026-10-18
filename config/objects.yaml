@@ -2,19 +2,22 @@
 # kind: object (skills may move it) | obstacle (never moved; a sim collision body) | hand (the wristband)
 # size: footprint [length along yaw, width across] in meters; the gripper closes across the width.
 # h: height in meters. held_min: gripper reading above empty-closed that means "holding" (0-100 scale).
-# The props changed on 2026-10-18; each keeps the slot name the code and the contract use (tape-measured):
-#   pill_bottle = pill bottle, 1.75 in across, 3.25 in tall
-#   juice_box   = power bank, 2.5 x 1.25 in footprint, 3.5 in tall, gripped across the 1.25 in side
-#   tea_tin     = box, 2.76 x 1.75 in footprint, 4 in tall, gripped across the 1.75 in side
+# The props changed again on 2026-10-18 (second set); each keeps the slot name the code and the contract use
+# (tape-measured):
+#   pill_bottle = pill bottle, 2.25 x 1.75 in footprint, 2.875 in tall, gripped across the 1.75 in side
+#   juice_box   = juice box, 3.5 x 1.25 in footprint, 4.5 in tall, gripped across the 1.25 in side; 11.4 cm is
+#                 over A11's 11 cm height rule, which --measure-grip reports as a problem
+#   tea_tin     = tea tin, 2.75 x 1.75 in footprint, 4.125 in tall, gripped across the 1.75 in side
 #   cereal_box  = tape measure, the obstacle, standing on its edge: 2.75 x 0.75 in, 2.25 tall
-# held_min: A11 on the real props, 2026-10-18 02:48 (runs/calibration/gripper-20261018T064828Z.json, 5 grasps
-# each, empty close 1.9): pill bottle closes at 21-23, power bank at 16.3-16.5, box at 16.7-19.0 (it squeezes).
-10: {name: pill_bottle, kind: object, shape: cylinder, size: [0.0445, 0.0445], h: 0.0826, held_min: 9.6,
+# held_min: still the first 2026-10-18 set's A11 values (runs/calibration/gripper-20261018T064828Z.json), whose
+# widths across the grasp were the same (1.75, 1.25 and 1.75 in). Re-measure with --measure-grip on these props
+# before any real pick.
+10: {name: pill_bottle, kind: object, shape: box, size: [0.0572, 0.0445], h: 0.0730, held_min: 9.6,
     called: [pill bottle, pills, medicine, bottle]}
-11: {name: juice_box, kind: object, shape: box, size: [0.0635, 0.0318], h: 0.0889, held_min: 7.2,
-    called: [power bank, battery, charger, juice box]}
-12: {name: tea_tin, kind: object, shape: box, size: [0.0701, 0.0445], h: 0.1016, held_min: 7.4,
-    called: [box, bandage box, band-aid box, tea tin, tin]}
+11: {name: juice_box, kind: object, shape: box, size: [0.0889, 0.0318], h: 0.1143, held_min: 7.2,
+    called: [juice box, juice, drink]}
+12: {name: tea_tin, kind: object, shape: box, size: [0.0699, 0.0445], h: 0.1048, held_min: 7.4,
+    called: [tea tin, tin, tea]}
 30: {name: cereal_box, kind: obstacle, shape: box, size: [0.0699, 0.0191], h: 0.0572,
     called: [tape measure, measuring tape]}
 40: {name: hand, kind: hand, h: 0.03}

@@ -20,7 +20,7 @@
   <worldbody>
     <light pos="0 0 3.5" dir="0 0 -1" directional="true"/>
     <light pos="0.6 -0.6 1.2" dir="-0.4 0.4 -0.8" diffuse="0.4 0.4 0.4" specular="0 0 0"/>
-    <camera name="overhead" pos="0.23 0 0.635" xyaxes="0 -1 0 1 0 0" fovy="43.6"/>
+    <camera name="overhead" pos="0.26 0 0.635" xyaxes="0 -1 0 1 0 0" fovy="43.6"/>
     <camera name="side" pos="0.30 -1.0 0.45" xyaxes="1 0 0 0 0.35 0.94" fovy="45"/>
 
     <!-- Table: top face at z = 0 -->
@@ -37,19 +37,19 @@
 
     <!-- Objects: one free body each, poses from config/fake_scene.json -->
     <!-- pill_bottle: marker 10 -->
-    <body name="pill_bottle" pos="0.18 -0.12 0.0413" quat="1 0 0 0">
+    <body name="pill_bottle" pos="0.17 -0.13 0.0365" quat="1 0 0 0">
       <freejoint name="pill_bottle"/>
-      <geom name="pill_bottle" type="cylinder" size="0.02225 0.0413" mass="0.05" contype="1" conaffinity="3" rgba="0.95 0.95 0.9 1"/>
+      <geom name="pill_bottle" type="box" size="0.0286 0.02225 0.0365" mass="0.05" contype="1" conaffinity="3" rgba="0.95 0.95 0.9 1"/>
     </body>
     <!-- juice_box: marker 11 -->
-    <body name="juice_box" pos="0.24 -0.04 0.04445" quat="0.988771 0 0 0.149438">
+    <body name="juice_box" pos="0.24 -0.04 0.05715" quat="0.988771 0 0 0.149438">
       <freejoint name="juice_box"/>
-      <geom name="juice_box" type="box" size="0.03175 0.0159 0.04445" mass="0.05" contype="1" conaffinity="3" rgba="0.95 0.55 0.15 1"/>
+      <geom name="juice_box" type="box" size="0.04445 0.0159 0.05715" mass="0.05" contype="1" conaffinity="3" rgba="0.95 0.55 0.15 1"/>
     </body>
     <!-- tea_tin: marker 12 -->
-    <body name="tea_tin" pos="0.15 0.03 0.0508" quat="1 0 0 0">
+    <body name="tea_tin" pos="0.15 0.03 0.0524" quat="1 0 0 0">
       <freejoint name="tea_tin"/>
-      <geom name="tea_tin" type="box" size="0.03505 0.02225 0.0508" mass="0.05" contype="1" conaffinity="3" rgba="0.2 0.55 0.3 1"/>
+      <geom name="tea_tin" type="box" size="0.03495 0.02225 0.0524" mass="0.05" contype="1" conaffinity="3" rgba="0.2 0.55 0.3 1"/>
     </body>
 
     <!-- Obstacles: mocap bodies, never moved by skills -->

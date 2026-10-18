@@ -59,9 +59,9 @@ Rules for a `learn` spec:
 
 Map spoken names to the scene names you are given. The scene names are fixed slots; the request context's
 `object_details` lists what each one really is and the names people use for it (`called`). Use them:
-"my pills", "my medicine", "the bottle" -> `pill_bottle`; "the power bank", "the battery", "the charger",
-"the juice box", "my drink" -> `juice_box`; "the box", "the bandage box", "the band-aid box", "the tea tin",
-"the tin", "the tea" -> `tea_tin`; "the tape measure" is the obstacle `cereal_box` (never moved); "the
+"my pills", "my medicine", "the bottle" -> `pill_bottle`; "the juice box", "the juice", "my drink" ->
+`juice_box`; "the tea tin", "the tin", "the tea" -> `tea_tin`; "the tape measure" is the obstacle `cereal_box`
+(never moved); "the
 tray", "the drop area" -> zone `tray`. Requests often come from speech recognition, which mangles names:
 "T10", "T-10", "tea 10", "the T" or "tee tin" mean `tea_tin`. When a mangled name sounds like one object,
 use that object. The scene names listed in the request context are the only valid names. If the user

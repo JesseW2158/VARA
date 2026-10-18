@@ -3,7 +3,9 @@
 # the home pose.
 workspace: {x: [0.10, 0.40], y: [-0.25, 0.25], z: [0.02, 0.30]}
 zones:
-  tray: {x: 0.19, y: 0.17, r: 0.09, wall: 0.002, slots: [[0.13,0.15], [0.22,0.12], [0.2,0.22]]}
+  # slots pulled 1-2 cm toward the center for the 8.9 cm juice box (second 2026-10-18 props): at the old
+  # (0.13,0.15), (0.22,0.12), (0.20,0.22) its corner crossed the taped rim at every slot
+  tray: {x: 0.19, y: 0.17, r: 0.09, wall: 0.002, slots: [[0.14,0.15], [0.22,0.13], [0.2,0.2]]}
   handoff: {x: 0.28, y: -0.08, z: 0.10}  # moved off the cereal box's -y face (sim layout; A15 re-tapes it)
 camera:
   Hc: 0.635           # lens height above the table (B4), tape 2026-10-18

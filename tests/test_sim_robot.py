@@ -664,12 +664,13 @@ def test_hand_over_juice_box_also_passes(robot):
 
 
 def test_candidate_that_drops_the_box_beside_the_tray_fails_the_spec(robot):
-    # Beside the tray read from the file: on the +x side, 3 cm past the zone's edge plus the juice box's
+    # Beside the tray read from the file: on the +x side, 2 cm past the zone's edge plus the juice box's
     # half-diagonal, so no part of the box can count as inside (the old hard-coded (0.17, 0.22) is inside
-    # the re-taped zone).
+    # the re-taped zone). With the 8.9 cm juice box a 3 cm margin put the drop 0.40 m out, where the jaw
+    # clips the 11.4 cm box on release.
     tray, box = FAKE_SCENE["zones"]["tray"], FAKE_SCENE["objects"]["juice_box"]
     reach = math.hypot(box["size"][0] / 2, box["size"][1] / 2)
-    x, y = tray["x"] + tray["r"] + reach + 0.03, tray["y"]
+    x, y = tray["x"] + tray["r"] + reach + 0.02, tray["y"]
     assert math.hypot(x - tray["x"], y - tray["y"]) > tray["r"] + reach
     assert BOX["x"][0] <= x <= BOX["x"][1] and BOX["y"][0] <= y <= BOX["y"][1]
     src = (
