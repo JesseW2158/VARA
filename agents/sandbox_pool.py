@@ -39,8 +39,31 @@ module-level `_daytona_factory()` so tests inject a fake; nothing here touches t
 `get_pool()` is the singleton the orchestrator uses: a `LocalRunner` when `FAKE_SANDBOX` (or `FAKE`) is "1"
 or `DAYTONA_API_KEY` is unset, else an unstarted `SandboxPool`. `reset_pool()` is for tests.
 `build_snapshot(name="arm-sim-v1")` builds the sandbox image. CLI: `python -m agents.sandbox_pool --bench`
-scores three fixture tasks (6 candidates x 5 trials) on the current pool and prints the wall clock per task;
-`--build-snapshot [NAME]` needs a key.
+scores three fixture tasks (6 candidates x 5 trials) on the current pool, prints the wall clock per task and,
+on a SandboxPool, `remaining: N` (the account's `vara=pool` sandboxes after shutdown); `--build-snapshot
+[NAME]` needs a key.
+
+Inventory (the C5/C6 evidence that shutdown leaves 0 sandboxes): every sandbox this module creates carries
+the label `vara=pool`; rl/train_parallel.py's carry `vara=rl` (training) and `vara=rl-check` (its image
+check), so `VARA_LABELS` is ("pool", "rl", "rl-check") and `LABEL_SCOPES` maps the CLI scopes `pool`, `rl`
+(both RL values) and `all` onto them. `list_vara_sandboxes(client=None, *, labels=None)` asks the server
+once per value, `Daytona.list(ListSandboxesQuery(labels={"vara": value}))` (0.225, verified by
+introspection), and checks the label again on every result, so an unlabelled or foreign sandbox is never
+listed or touched; it returns plain dicts (`sandbox_record`: id, name, state, labels, snapshot, created_at),
+oldest first per value, and labels=None means every VARA value. `present_records` drops `destroyed`
+records and `active_records` also drops `destroying` ones. `delete_vara_sandboxes(client=None, *,
+labels=("pool",))` deletes the active ones in scope in parallel with `sandbox.delete(timeout, wait=True)`
+and returns their records with `deleted` and `error`; `inventory_after_shutdown(client, ids)` waits for a
+pool's own sandboxes to leave the listing and counts the `vara=pool` ones still present.
+`SandboxPool.start()` lists first and refuses (ValueError, nothing created) when the account's active
+`vara=pool` sandboxes plus the request exceed the cap; a listing failure is logged and ignored so an API
+hiccup cannot block the demo. CLI: `--list [--label pool|rl|all] [--wait 30] [--out DIR]` prints every
+VARA sandbox and the count per value, writes `<runs>/sandboxes/inventory-<UTC stamp>.json` (a new file per
+call; runs is VARA_RUNS_DIR or the repo's runs/) and ends with `remaining (<scope>): N`; it exits 0 only
+when none in scope remain. `--cleanup` deletes the scope first (default `pool`; never `rl` while a training
+runs), then lists the same way into `cleanup-<UTC stamp>.json` and exits 0 only when every delete worked
+and none remain. Without DAYTONA_API_KEY, or under FAKE/FAKE_SANDBOX, both refuse with exit 2 before
+building a client (only the key's presence is printed); a listing failure exits 1.
 """
 
 from __future__ import annotations
@@ -63,7 +86,8 @@ import sys
 import tarfile
 import threading
 import time
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -74,23 +98,40 @@ from sim import scoring
 __all__ = [
     "BUNDLE_DIRS",
     "CLEAN_ENV_KEYS",
+    "LABEL_KEY",
+    "LABEL_SCOPES",
     "MAX_SANDBOXES",
+    "POOL_LABEL",
     "REMOTE_ROOT",
+    "RL_CHECK_LABEL",
+    "RL_LABEL",
     "SNAPSHOT",
+    "VARA_LABELS",
     "LocalRunner",
     "SandboxPool",
+    "active_records",
     "build_bundle",
     "build_snapshot",
     "bundle_files",
     "clean_env",
+    "delete_vara_sandboxes",
     "get_pool",
+    "inventory_after_shutdown",
+    "inventory_report",
+    "list_vara_sandboxes",
     "main",
     "parse_score_line",
+    "present_records",
     "read_trial_results",
     "reset_pool",
     "runner_args",
     "runner_error",
+    "runs_dir",
+    "sandbox_record",
     "scored_dict",
+    "utc_stamp",
+    "wait_for_sandboxes_gone",
+    "write_inventory",
 ]
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -103,6 +144,18 @@ REMOTE_ROOT = "/home/daytona/vara"
 BUNDLE_DIRS = ("arm", "sim", "schemas", "config")
 BUNDLE_NAME = "bundle.tgz"
 MAX_SANDBOXES = 7
+LABEL_KEY = "vara"  # every VARA sandbox carries this label; the inventory never touches one without it
+POOL_LABEL = "pool"  # this module's sandboxes
+RL_LABEL = "rl"  # rl/train_parallel.py's training sandboxes
+RL_CHECK_LABEL = "rl-check"  # rl/train_parallel.py's one-sandbox image check
+VARA_LABELS = (POOL_LABEL, RL_LABEL, RL_CHECK_LABEL)
+LABEL_SCOPES: dict[str, tuple[str, ...]] = {
+    "pool": (POOL_LABEL,),
+    "rl": (RL_LABEL, RL_CHECK_LABEL),
+    "all": VARA_LABELS,
+}
+GONE_STATES = ("destroyed",)  # no longer on the account
+LEAVING_STATES = ("destroying",)  # deleted and on the way out: listed, but not counted against the cap
 DEFAULT_TRIALS = 5
 DEFAULT_SEED = 7
 DEFAULT_TIMEOUT = 60.0
@@ -530,7 +583,9 @@ def _daytona_factory() -> Any:
 def _sandbox_params(snapshot: str) -> Any:
     from daytona import CreateSandboxFromSnapshotParams
 
-    return CreateSandboxFromSnapshotParams(snapshot=snapshot, auto_stop_interval=0, labels={"vara": "pool"})
+    return CreateSandboxFromSnapshotParams(
+        snapshot=snapshot, auto_stop_interval=0, labels={LABEL_KEY: POOL_LABEL}
+    )
 
 
 def build_snapshot(name: str = SNAPSHOT, *, on_logs: Callable[[str], Any] | None = print) -> Any:
@@ -540,6 +595,233 @@ def build_snapshot(name: str = SNAPSHOT, *, on_logs: Callable[[str], Any] | None
     image = Image.debian_slim("3.12").pip_install(["mujoco", "numpy", "pyyaml", "jsonschema"])
     daytona = _daytona_factory()
     return daytona.snapshot.create(CreateSnapshotParams(name=name, image=image), on_logs=on_logs)
+
+
+# ---------------------------------------------------------------------------- inventory (C5/C6 evidence)
+
+
+def runs_dir() -> pathlib.Path:
+    """`VARA_RUNS_DIR` when set, else the repo's `runs/`."""
+    return pathlib.Path(os.environ.get("VARA_RUNS_DIR") or ROOT / "runs")
+
+
+def utc_stamp() -> str:
+    """`YYYYMMDD-HHMMSS` in UTC, the stamp the run folders use."""
+    return time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+
+
+def _check_labels(labels: Sequence[str] | str) -> tuple[str, ...]:
+    values = (labels,) if isinstance(labels, str) else tuple(labels)
+    if not values or any(not isinstance(value, str) or not value for value in values):
+        raise ValueError(f"{LABEL_KEY} label values must be non-empty strings, got {values!r}")
+    return values
+
+
+def _text(value: Any) -> str | None:
+    if value is None:
+        return None
+    value = getattr(value, "value", value)  # enums (SandboxState) become their string
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    return str(value)
+
+
+def sandbox_record(sandbox: Any) -> dict[str, Any]:
+    """What the inventory keeps about one sandbox: id, name, state, labels, snapshot and created_at as
+    strings (None when the SDK object lacks the attribute); never the sandbox object itself."""
+    labels = getattr(sandbox, "labels", None)
+    return {
+        "id": _text(getattr(sandbox, "id", None)),
+        "name": _text(getattr(sandbox, "name", None)),
+        "state": _text(getattr(sandbox, "state", None)),
+        "labels": {str(k): str(v) for k, v in labels.items()} if isinstance(labels, Mapping) else {},
+        "snapshot": _text(getattr(sandbox, "snapshot", None)),
+        "created_at": _text(getattr(sandbox, "created_at", None)),
+    }
+
+
+def _list_query(value: str) -> Any:
+    """The server-side filter for one label value: `ListSandboxesQuery(labels={"vara": value})` (0.225)."""
+    from daytona import ListSandboxesQuery
+
+    return ListSandboxesQuery(labels={LABEL_KEY: value})
+
+
+def _vara_sandboxes(client: Any, labels: Sequence[str] | str | None) -> list[tuple[dict[str, Any], Any]]:
+    """`(record, sandbox)` for every sandbox on the account carrying `vara=<value>` for a value in `labels`
+    (None: every value in VARA_LABELS). Daytona 0.225, verified by introspection: `Daytona.list(query)` yields
+    every matching `Sandbox` page by page, and `ListSandboxesQuery(labels=...)` filters on the server. The
+    label is checked again here, so even a server that ignored the filter never hands back an unlabelled or
+    foreign sandbox."""
+    values = VARA_LABELS if labels is None else _check_labels(labels)
+    found: dict[str, tuple[dict[str, Any], Any]] = {}
+    for value in dict.fromkeys(values):
+        for sandbox in client.list(_list_query(value)):
+            record = sandbox_record(sandbox)
+            if record["labels"].get(LABEL_KEY) != value:
+                continue
+            found.setdefault(record["id"] or f"{value}-{len(found)}", (record, sandbox))
+    return sorted(
+        found.values(),
+        key=lambda pair: (
+            pair[0]["labels"].get(LABEL_KEY, ""),
+            pair[0]["created_at"] or "",
+            pair[0]["id"] or "",
+        ),
+    )
+
+
+def list_vara_sandboxes(
+    client: Any | None = None, *, labels: Sequence[str] | str | None = None
+) -> list[dict[str, Any]]:
+    """The sandboxes on the Daytona account carrying `vara=<value>` for a value in `labels` (default None:
+    every VARA value, `pool`, `rl` and `rl-check`) as `sandbox_record` dicts, oldest first per value. The
+    client comes from `_daytona_factory()` when none is given. Raises ValueError on an empty or blank label
+    value and lets a listing failure propagate; callers that must not stop (`start()`, the smoke test, the
+    bench) catch and log it."""
+    client = _daytona_factory() if client is None else client
+    return [record for record, _sandbox in _vara_sandboxes(client, labels)]
+
+
+def delete_vara_sandboxes(
+    client: Any | None = None,
+    *,
+    labels: Sequence[str] | str | None = (POOL_LABEL,),
+    wait: bool = True,
+    timeout: float = 60.0,
+) -> list[dict[str, Any]]:
+    """Delete every active sandbox carrying `vara=<value>` for a value in `labels` (default only `pool`:
+    deleting `rl` would kill a running training; None means every VARA value) and return their records, in
+    listing order, with `deleted` (bool) and `error` (None or the exception text). The deletes run in
+    parallel and each is tried even when another raises. A `destroying` or `destroyed` sandbox is not deleted
+    again (the caller waits for it), and an unlabelled sandbox is never touched."""
+    client = _daytona_factory() if client is None else client
+    targets = [
+        (dict(record), sandbox)
+        for record, sandbox in _vara_sandboxes(client, labels)
+        if record["state"] not in GONE_STATES + LEAVING_STATES
+    ]
+
+    def delete(pair: tuple[dict[str, Any], Any]) -> dict[str, Any]:
+        record, sandbox = pair
+        value = record["labels"].get(LABEL_KEY)
+        try:
+            sandbox.delete(timeout, wait=wait)
+        except Exception as exc:  # noqa: BLE001 - keep deleting the others
+            record["deleted"], record["error"] = False, f"{type(exc).__name__}: {exc}"
+            log.error("sandbox %s (%s=%s): delete failed: %s", record["id"], LABEL_KEY, value, exc)
+        else:
+            record["deleted"], record["error"] = True, None
+            log.info("sandbox %s (%s=%s) deleted", record["id"], LABEL_KEY, value)
+        return record
+
+    if not targets:
+        return []
+    with ThreadPoolExecutor(max_workers=min(len(targets), MAX_SANDBOXES)) as executor:
+        return list(executor.map(delete, targets))
+
+
+def present_records(records: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """The records that still count as present on the account: every state but `destroyed`."""
+    return [dict(r) for r in records if r.get("state") not in GONE_STATES]
+
+
+def active_records(records: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """The records that count against the cap: neither `destroyed` nor `destroying` (already deleted and on
+    the way out, so a restart right after a shutdown is not refused)."""
+    return [dict(r) for r in records if r.get("state") not in GONE_STATES + LEAVING_STATES]
+
+
+def wait_for_sandboxes_gone(
+    client: Any,
+    *,
+    labels: Sequence[str] | str | None = (POOL_LABEL,),
+    ids: Iterable[str] | None = None,
+    timeout: float = 30.0,
+    poll: float = 2.0,
+) -> list[dict[str, Any]]:
+    """Poll the inventory until nothing in scope (optionally only the sandboxes `ids`) is present, or until
+    `timeout` passes; returns the records still present. It keeps waiting only while one of them is
+    `destroying` (deletes are fire-and-forget), so a listing of live sandboxes answers at once."""
+    wanted = None if ids is None else {str(i) for i in ids}
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    while True:
+        records = present_records(list_vara_sandboxes(client, labels=labels))
+        if wanted is not None:
+            records = [r for r in records if r["id"] in wanted]
+        vanishing = any(r["state"] in LEAVING_STATES for r in records)
+        if not records or not vanishing or time.monotonic() >= deadline:
+            return records
+        time.sleep(poll)
+
+
+def inventory_after_shutdown(
+    client: Any, ids: Iterable[str], *, timeout: float = 30.0
+) -> dict[str, Any] | None:
+    """After a `shutdown()`: wait up to `timeout` s for the sandboxes `ids` to leave the `vara=pool` listing
+    and report `{"ours_gone" (none of `ids` is present), "ours_active" (the ids still neither destroying nor
+    destroyed: a delete that did not take), "remaining" (pool sandboxes still present, ours included),
+    "sandboxes"}`; None when the listing failed (logged: an API hiccup must not turn a finished run into a
+    crash)."""
+    ids = [str(i) for i in ids]
+    try:
+        ours = wait_for_sandboxes_gone(client, labels=(POOL_LABEL,), ids=ids, timeout=timeout)
+        present = present_records(list_vara_sandboxes(client, labels=(POOL_LABEL,)))
+    except Exception as exc:  # noqa: BLE001 - the SDK raises many types
+        log.warning("could not list the account's sandboxes: %s", _scrub_key(f"{type(exc).__name__}: {exc}"))
+        return None
+    return {
+        "ours_gone": not ours,
+        "ours_active": [r["id"] for r in active_records(ours)],
+        "remaining": len(present),
+        "sandboxes": present,
+    }
+
+
+def inventory_report(
+    records: Iterable[Mapping[str, Any]],
+    *,
+    scope: Sequence[str] | str = (POOL_LABEL,),
+    deleted: Iterable[Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """The JSON the CLI writes. `records` is a listing of every VARA value (`list_vara_sandboxes()`), so
+    `counts` (present sandboxes per `vara` value, every VARA value included) is true for all of them;
+    `scope` is the values the verdict is about and `remaining` how many present ones carry them. Also: when
+    (`at`, UTC), the present records and the delete results of a `--cleanup`."""
+    values = _check_labels(scope)
+    present = present_records(records)
+    extra = sorted({r["labels"].get(LABEL_KEY) for r in present} - set(VARA_LABELS) - {None})
+    return {
+        "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "scope": list(values),
+        "remaining": sum(1 for r in present if r["labels"].get(LABEL_KEY) in values),
+        "counts": {
+            value: sum(1 for r in present if r["labels"].get(LABEL_KEY) == value)
+            for value in (*VARA_LABELS, *extra)
+        },
+        "sandboxes": present,
+        "deleted": [dict(r) for r in (deleted or [])],
+    }
+
+
+def _scrub_key(text: str) -> str:
+    """`text` with the Daytona key's value (if it ever appears in an SDK message) replaced by its name."""
+    key = os.environ.get("DAYTONA_API_KEY", "").strip()
+    return text.replace(key, "[DAYTONA_API_KEY]") if len(key) >= 4 else text
+
+
+def write_inventory(out_dir: str | os.PathLike[str], report: Mapping[str, Any], kind: str) -> pathlib.Path:
+    """Write `<out_dir>/<kind>-<UTC stamp>.json`, a new file every time (a counter on a same-second clash)."""
+    out = pathlib.Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    stamp = utc_stamp()
+    path = out / f"{kind}-{stamp}.json"
+    n = 1
+    while path.exists():
+        n += 1
+        path = out / f"{kind}-{stamp}-{n}.json"
+    path.write_text(json.dumps(dict(report), indent=2) + "\n", encoding="utf-8", newline="\n")
+    return path
 
 
 class _SandboxFailure(Exception):
@@ -701,6 +983,13 @@ class SandboxPool:
         if not roles:
             return len(self.sandboxes)
         client = self._client_or_create()
+        on_account = self._pool_sandboxes_on_account(client)
+        if on_account is not None and on_account + len(roles) > MAX_SANDBOXES:
+            raise ValueError(
+                f"refusing to create {len(roles)} sandboxes: the account already holds {on_account} "
+                f"{LABEL_KEY}={POOL_LABEL} sandbox(es) and the cap is {MAX_SANDBOXES}; stop the other VARA "
+                "process or run `python -m agents.sandbox_pool --cleanup` for stragglers"
+            )
         threads = [
             threading.Thread(target=self._create_slot, args=(client, role, number), daemon=True)
             for role, number in zip(roles, numbers, strict=True)
@@ -712,6 +1001,32 @@ class SandboxPool:
         live = len(self.sandboxes)
         log.info("sandbox pool: %d of %d sandboxes live", live, len(roles))
         return live
+
+    @staticmethod
+    def _pool_sandboxes_on_account(client: Any) -> int | None:
+        """How many active `vara=pool` sandboxes the whole account holds now (this pool's included; a
+        `destroying` one no longer counts), or None when the listing fails: an API hiccup is logged and must
+        not block the demo."""
+        try:
+            return len(active_records(list_vara_sandboxes(client, labels=(POOL_LABEL,))))
+        except Exception as exc:  # noqa: BLE001 - the SDK raises many types; a fake may have no list()
+            log.warning(
+                "could not list the account's sandboxes (%s: %s); the cap holds per process only",
+                type(exc).__name__,
+                exc,
+            )
+            return None
+
+    @property
+    def client(self) -> Any:
+        """The Daytona client this pool uses (built on first use; the smoke test lists through it)."""
+        return self._client_or_create()
+
+    @property
+    def sandbox_ids(self) -> list[str]:
+        """The ids of every sandbox this pool holds, dead ones included: what `shutdown()` deletes."""
+        with self._lock:
+            return [slot.id for slot in self._slots]
 
     def _create_slot(self, client: Any, role: str, number: int) -> None:
         sandbox = None
@@ -1331,7 +1646,16 @@ def bench(out_root: pathlib.Path, trials: int = DEFAULT_TRIALS) -> list[dict]:
             )
     finally:
         if isinstance(pool, SandboxPool):
+            ids = pool.sandbox_ids
             pool.shutdown()
+            try:
+                after = inventory_after_shutdown(pool.client, ids)
+            except Exception as exc:  # noqa: BLE001 - no client at all: report unknown, keep the real error
+                log.warning(
+                    "could not list the account's sandboxes: %s", _scrub_key(f"{type(exc).__name__}: {exc}")
+                )
+                after = None
+            print(f"remaining: {'unknown' if after is None else after['remaining']}", flush=True)
     return rows
 
 
@@ -1350,10 +1674,43 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="build the sandbox image (needs a key)",
     )
     parser.add_argument(
-        "--out", default=str(ROOT / "runs" / "bench"), help="where the bench writes (default runs/bench)"
+        "--list",
+        action="store_true",
+        help="list every vara-labelled sandbox on the account and the count per value; exit 0 only when "
+        "none carrying --label remain (needs DAYTONA_API_KEY)",
+    )
+    parser.add_argument(
+        "--cleanup",
+        action="store_true",
+        help="delete the sandboxes carrying --label (stragglers after a crash), then list as --list does",
+    )
+    parser.add_argument(
+        "--label",
+        choices=tuple(LABEL_SCOPES),
+        default=POOL_LABEL,
+        help="scope of --list/--cleanup: pool (default, this module's vara=pool), rl (rl/train_parallel.py's "
+        "vara=rl and vara=rl-check: never clean it while a training runs) or all",
+    )
+    parser.add_argument(
+        "--wait",
+        type=float,
+        default=30.0,
+        help="--list/--cleanup: seconds to wait for destroying sandboxes to vanish (default 30)",
+    )
+    parser.add_argument(
+        "--out",
+        default=None,
+        help="where the bench writes (default runs/bench) or where --list/--cleanup write their JSON "
+        "(default runs/sandboxes); both under VARA_RUNS_DIR when it is set",
     )
     parser.add_argument("--trials", type=int, default=DEFAULT_TRIALS)
     ns = parser.parse_args(argv)
+    if (ns.list or ns.cleanup) and (ns.bench or ns.build_snapshot):
+        parser.error("--list/--cleanup cannot be combined with --bench or --build-snapshot")
+    if ns.wait < 0:
+        parser.error(f"--wait must be 0 or more seconds, got {ns.wait:g}")
+    if ns.trials < 1:
+        parser.error(f"--trials must be at least 1, got {ns.trials}")
     logging.basicConfig(level=logging.INFO, stream=sys.stderr, format="%(levelname)s %(name)s: %(message)s")
     if ns.build_snapshot:
         if not os.environ.get("DAYTONA_API_KEY"):
@@ -1362,11 +1719,58 @@ def main(argv: Sequence[str] | None = None) -> int:
         build_snapshot(ns.build_snapshot)
         print(f"snapshot {ns.build_snapshot} built")
         return 0
+    if ns.list or ns.cleanup:
+        return _inventory_cli(ns)
     if ns.bench:
-        rows = bench(pathlib.Path(ns.out), ns.trials)
+        rows = bench(pathlib.Path(ns.out) if ns.out else runs_dir() / "bench", ns.trials)
         return 0 if rows else 1
     parser.print_help()
     return 2
+
+
+def _inventory_cli(ns: argparse.Namespace) -> int:
+    """`--list` / `--cleanup` (see the module docstring): refuse (2) without the live API; else delete the
+    scope on --cleanup, wait for destroying ones, list every VARA value, write the JSON under --out, print
+    the table, the counts and `remaining (<scope>): N`. Exit 0 only when nothing in scope remains (and every
+    delete worked), 1 otherwise or when the listing fails."""
+    action = "--cleanup" if ns.cleanup else "--list"
+    if _fake("FAKE_SANDBOX"):
+        print(
+            f"FAKE or FAKE_SANDBOX is 1: {action} needs the live Daytona API; nothing listed", file=sys.stderr
+        )
+        return 2
+    if not os.environ.get("DAYTONA_API_KEY", "").strip():
+        print(
+            f"DAYTONA_API_KEY is not set (present: False): {action} refused; nothing listed", file=sys.stderr
+        )
+        return 2
+    scope = LABEL_SCOPES[ns.label]
+    out_dir = pathlib.Path(ns.out) if ns.out else runs_dir() / "sandboxes"
+    deleted: list[dict[str, Any]] | None = None
+    try:
+        client = _daytona_factory()
+        if ns.cleanup:
+            deleted = delete_vara_sandboxes(client, labels=scope)
+            for record in deleted:
+                verdict = "ok" if record["deleted"] else f"FAILED {_scrub_key(str(record['error']))}"
+                print(f"deleted {record['id']} ({LABEL_KEY}={record['labels'].get(LABEL_KEY)}): {verdict}")
+        wait_for_sandboxes_gone(client, labels=scope, timeout=ns.wait)
+        listed = list_vara_sandboxes(client)
+    except Exception as exc:  # noqa: BLE001 - the SDK raises many types; fail loud, never claim 0 remain
+        print(f"{action} failed: {_scrub_key(f'{type(exc).__name__}: {exc}')}", file=sys.stderr)
+        return 1
+    report = inventory_report(listed, scope=scope, deleted=deleted)
+    path = write_inventory(out_dir, report, "cleanup" if ns.cleanup else "inventory")
+    print(f"{'id':<38} {'state':<11} {LABEL_KEY:<9} {'snapshot':<14} created_at")
+    for record in report["sandboxes"]:
+        print(
+            f"{str(record['id']):<38} {str(record['state']):<11} {record['labels'].get(LABEL_KEY, ''):<9} "
+            f"{str(record['snapshot']):<14} {record['created_at']}"
+        )
+    print("counts: " + ", ".join(f"{LABEL_KEY}={value} {n}" for value, n in report["counts"].items()))
+    print(f"remaining ({'/'.join(scope)}): {report['remaining']}; written {path}")
+    ok = report["remaining"] == 0 and all(record["deleted"] for record in deleted or [])
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":
