@@ -4,7 +4,12 @@ Static checks run everywhere. The behaviour checks run web/static/app.js and voi
 small fake DOM in tests/web/ (start-up while a deferred script stalls, junk and 5 MB curves.json, Chart.js
 arriving late, hung /stop and /state, 5000-character texts, trial rows and the "rejected:" label, non-integer
 candidate indices, the DEMO countdown under clock skew, junk /state entries and a throwing render, T
-forwarding to the voice iframe, and the voice page's tool calls, task announcements, junk audio deltas and
+forwarding to the voice iframe, the STOP latency measurement (the {source, t_client_ms} body, the console
+line and the timeline entry in both orders of reply and event, an older reply shape, no performance.now, a
+re-send, the voice page's numbers reaching the dashboard, pairing by source, latency_ms and
+press_to_freeze_ms while other stops land in between, also when latency_ms is quantized to 0, the press
+from the event's timeStamp, and a spoken stop timed from the push-to-talk release), the calibration result
+with and without check_points, and the voice page's tool calls, task announcements, junk audio deltas and
 forwarded keys); they are skipped when node is not installed. Nothing touches the network.
 """
 
@@ -190,6 +195,45 @@ def test_voice_pending_tasks_have_no_prototype() -> None:
     assert "Object.prototype.hasOwnProperty.call(pendingTasks, ev.task_id)" in voice
 
 
+def test_stop_requests_carry_their_source_and_press_time() -> None:
+    """Every STOP path (Esc, the STOP buttons, the voice `stop` tool) posts {source, t_client_ms} with the
+    wall clock at the press (the server turns it into press_to_freeze_ms on the same laptop), measures the
+    round trip on the monotonic clock from the key or click event's timeStamp, and logs one 'stop <source>:
+    server <latency_ms> ms, round trip <ms> ms, press to freeze <ms> ms' line (an older server reports
+    neither server number); a spoken stop adds the time from the push-to-talk release. The dashboard pairs
+    a line with its own stop's timeline entry by source, latency_ms and press_to_freeze_ms (the server puts
+    the same three in the reply and the event; latency_ms alone mostly reads 0 on a 15.6 ms server clock)."""
+    for script in (APP_JS, VOICE_JS):
+        code = code_only(script)
+        assert "function pressStamp(ev)" in code and "ev.timeStamp" in code, script.name
+        assert "{ source: wire, t_client_ms: press.wall }" in code, script.name
+        assert '"server latency not reported"' in code, script.name
+        assert '", round trip "' in code, script.name
+        assert '", press to freeze "' in code, script.name
+        assert '", talk release to response "' in code, script.name
+        assert "performance.now()" in code, script.name
+    app = code_only(APP_JS)
+    assert 'stop("Esc", 0, pressStamp(ev))' in app and 'stop("button", 0, pressStamp(ev))' in app
+    assert "stopKey(d.source, num(d.latency_ms), num(d.press_to_freeze_ms))" in app
+    assert "stopKey(source, num(m.latency_ms), num(m.press_to_freeze_ms))" in app
+    voice = code_only(VOICE_JS)
+    assert 'doStop("Esc", pressStamp(ev))' in voice and 'doStop("button", pressStamp(ev))' in voice
+    assert 'doStop("voice", null, releasedAt)' in voice
+    assert "release_to_response_ms: r.ok ? sinceRelease : null" in voice
+
+
+def test_calibration_result_has_two_lines_with_their_own_colours() -> None:
+    """The independent check-points line (B5) sits under the marker line; each line carries its own ok/bad
+    colour, and a missing or null check_points says so instead of hiding it."""
+    rules = css_rules(STYLE.read_text(encoding="utf-8"))
+    assert rules[".result .line"]["display"] == "block"
+    assert rules[".result .line.ok"]["color"] == "var(--good)"
+    assert rules[".result .line.bad"]["color"] == "var(--serious)"
+    code = code_only(APP_JS)
+    assert '"no independent check points recorded"' in code
+    assert '"-point check: mean "' in code
+
+
 def test_pages_behave_under_node() -> None:
     node = shutil.which("node")
     if not node:
@@ -203,5 +247,20 @@ def test_pages_behave_under_node() -> None:
     )
     report = proc.stdout + proc.stderr
     assert proc.returncode == 0, report
-    assert "FAIL" not in proc.stdout, report
+    # The harness prints "FAIL <name>" at the start of a line; a check's name may quote the page's own
+    # "(FAIL)" verdict text, so only a line-leading FAIL is a failed check.
+    assert not re.search(r"^FAIL ", proc.stdout, re.M), report
     assert re.search(r"==== (\d+)/\1 checks passed ====", proc.stdout), report
+    # The STOP latency and calibration scenarios ran (their check names carry these words).
+    phrases = (
+        "t_client_ms",
+        "stop voice: server",
+        "re-send 1",
+        "check_points null",
+        "talk release to response 1237 ms",
+        "another tab's Esc",
+        "latency_ms quantized to 0",
+        "event's timeStamp",
+    )
+    for phrase in phrases:
+        assert phrase in proc.stdout, phrase

@@ -7,10 +7,23 @@ only ever runs through `sim.run_candidate` in a sandbox or the pool's clean loca
 
 Endpoints (docs/interfaces.md "Orchestrator API", shapes from the brief 8.6):
 - `POST /command {"text"}` -> `{"task_id"}`, or 409 `{"detail": "busy"}` while a task runs or the arm is
-  stopped; `POST /stop` -> `driver.freeze()` first, then the task is cancelled, `stopped` is emitted and the
-  state stays `stopped` until `POST /resume`, which calls `driver.resume()`, sends the arm home at <= 30 deg/s
-  and returns `{"state": "idle"}`; `POST /torque_off` (409 while busy); `POST /calibrate` -> `{"error_cm"}`
-  (0.8 under FAKE_CAMERA); `POST /reset_demo` and `POST /load_backup` -> `{"skills": [names]}`;
+  stopped; `POST /stop` (optional body `{"source": esc|button|voice|keyboard|api, "t_client_ms": number}`,
+  read only after the freeze; nothing in or about the body can refuse a STOP) -> `driver.freeze()` first,
+  then the task is cancelled, `stopped` is emitted and the state stays `stopped` until `POST /resume`,
+  which calls `driver.resume()`, sends the arm home at <= 30 deg/s and returns `{"state": "idle"}`; the
+  `/stop` reply and the `stopped` detail carry `source`, `latency_ms` (request entry to the freeze call,
+  server side; null for a stop that did not come through `/stop`) and `press_to_freeze_ms` (the client's
+  `t_client_ms` to the end of the freeze call on this laptop's clock; null without a stamp or with one
+  later than the freeze, i.e. from another clock), and the log gets one line
+  `stop: source=<s> request->freeze <n> ms`; on the REAL arm a thread then appends an A13 record
+  (`dashboard-<source>`, latency = `press_to_freeze_ms`) to runs/calibration/esc-latency.jsonl;
+  `POST /torque_off` (409 while busy); `POST /calibrate` -> `{"error_cm", "check_points", "lens"}`
+  (`error_cm` the fit-marker mean, 0.8 under FAKE_CAMERA; `check_points` null, or `{"n", "mean_cm",
+  "max_cm", "ok", "file"}` from the recorded independent check points of docs/table-calibration.md when the
+  file named by `VARA_CHECK_POINTS`, default `measurements/check-points.json`, exists; an invalid file is a
+  400; the fake never reads it; `lens` the sha256 of the config/lens.npz the checked frame was undistorted
+  with, the tracker's own lens, or null for raw frames and under FAKE_CAMERA); `POST /reset_demo` and
+  `POST /load_backup` -> `{"skills": [names]}`;
   `POST /voice/token` -> `{"token", "expires_at", "model"}` minted from xAI with the server's key (503
   without a key, a fake token under FAKE_LLM; the key never appears in a reply, a log or a file);
   `GET /state` -> `{"state", "mode", "carry", "task_id", "skills", "queue", "stopped"}`; `WS /events`
@@ -48,13 +61,27 @@ Flows (every stage checks the stop flag first; events validate against schemas/e
 folders, so tests work in temporary directories; when the skills directory has no `_starter`/`_backup`
 folder of its own, the repo's are used.
 
-    python -m agents.orchestrator [--port 8000] [--real] [--bench-demo]
+    python -m agents.orchestrator [--port 8000] [--real] [--bench-demo | --bench-run TEXT] [--runs N]
+                                  [--live-router]
 
 `--real` watches Esc, asks the human to confirm the arm is clear, counts down 3 s, then connects and serves.
-Esc freezes the arm like `/stop`; without `--real` and without FAKE_ROBOT/FAKE the server runs but any stage
+Esc freezes the arm like `/stop` and, on the real arm once the connect has started, appends an A13 record
+(`orchestrator-console`, with its connect/session phase; `arm.driver.report_esc_latency`). Without
+`--real` and without FAKE_ROBOT/FAKE the server runs but any stage
 that would move the arm ends the task with `error` `{"error": "arm not connected: start with --real"}`.
 `--bench-demo` forces FAKE=1 and DEMO_MODE=1 and runs five learns of "clear the table" through FastAPI's
-TestClient, printing the seconds from the command to `executing` (or `queued`) for each.
+TestClient, printing the seconds from the command to `executing` (or `queued`) for each. `--bench-run TEXT`
+benchmarks the saved-skill path (routing -> planning -> validating -> executing) for TEXT, such as "hand me
+my pills": one line per run with the seconds from the command to `executing`, the median of the runs that
+reached `executing` against the C8 target of 5 s, and `<runs dir>/bench/run-<UTC stamp>/summary.json`
+(phrase, fakes, mode, per-run seconds and end stage, median, verdict); the bench runs on a copy of the
+library in that folder, with its `t-*` task folders beside the summary, so its fake-arm runs never move
+the library's `real` counts or mix with the real tasks. By default every fake is on;
+`--live-router` clears FAKE and FAKE_LLM for this process (the real xAI router; refused with exit 2 when
+XAI_API_KEY is absent) while FAKE_ROBOT, FAKE_CAMERA and FAKE_SANDBOX stay forced, so neither bench ever
+touches the arm, a camera or Daytona. A phrase the router sends to a learn is stopped at `spec_ready` and
+ends the bench (a live learn would spend six code-generation calls a run). The bench exits 0 iff every
+run reached `executing` and the median is within the target.
 """
 
 from __future__ import annotations
@@ -63,8 +90,11 @@ import argparse
 import asyncio
 import json
 import logging
+import math
 import os
 import re
+import shutil
+import statistics
 import sys
 import threading
 import time
@@ -80,7 +110,7 @@ import httpx
 import jsonschema
 import numpy as np
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, WebSocket
+from fastapi import FastAPI, HTTPException, Request, WebSocket
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -97,13 +127,16 @@ from vision import verify as verify_mod
 load_dotenv()
 
 __all__ = [
+    "BENCH_TARGET_S",
     "BUDGETS",
+    "CHECK_POINTS_PATH",
     "EVENT_HISTORY",
     "FAKE_CALIBRATION_CM",
     "FAKE_VOICE_TOKEN",
     "NOT_CONNECTED",
     "OVER_BUDGET",
     "STAGES",
+    "STOP_SOURCES",
     "VOICE_MODEL",
     "VOICE_TOKEN_URL",
     "Busy",
@@ -114,6 +147,8 @@ __all__ = [
     "StageFailed",
     "app",
     "bench_demo",
+    "bench_run",
+    "check_points_path",
     "main",
     "orch",
     "wait_for_stage",
@@ -158,6 +193,11 @@ ROUTINE_HINT = "Routine: run the saved skills in order."
 NOT_CONNECTED = "arm not connected: start with --real"
 OVER_BUDGET = "over the 75 s budget"
 NO_CANDIDATE = "no candidate passed simulation"
+STOP_SOURCES = ("esc", "button", "voice", "keyboard", "api")  # the /stop body's `source`
+CHECK_POINTS_PATH = ROOT / "measurements" / "check-points.json"  # docs/table-calibration.md
+BENCH_TARGET_S = 5.0  # C8: a saved skill from the command to the arm moving, median of five runs
+BENCH_WAIT_S = 150.0  # how long a bench waits for one run to reach its end stage
+BENCH_ROUTED = ("planning", "spec_ready", "queued", *FINAL_STAGES)  # what can follow `routing` first
 GRIP_CLOSE_RE = re.compile(r"^segment \d+: grip close\b")
 BOUNDARY = b"frame"
 
@@ -260,6 +300,16 @@ class _Scored:
         return bool(self.detail.get("passed"))
 
 
+@dataclass(frozen=True)
+class _Frozen:
+    """STOP's first half, handed to its second: when the freeze was called (`time.monotonic()`), when it
+    returned (wall clock, ms) and the task it cancelled."""
+
+    called: float
+    wall_ms: float
+    task_id: str | None
+
+
 # ------------------------------------------------------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------------------------------------------------------
@@ -312,6 +362,52 @@ def _read_json(path: Path, what: str) -> Any:
 
 def _scrub(message: str, secret: str) -> str:
     return message.replace(secret, "[XAI_API_KEY]") if secret else message
+
+
+def _stop_source(value: Any) -> str:
+    """A `/stop` body's `source` normalized to STOP_SOURCES; anything else counts as `api` (logged)."""
+    if isinstance(value, str) and value.strip().lower() in STOP_SOURCES:
+        return value.strip().lower()
+    if value is not None:
+        log.warning("stop: unknown source %r recorded as api", value)
+    return "api"
+
+
+def _client_ms(value: Any) -> float | None:
+    """A `/stop` body's `t_client_ms` as a finite float, or None when absent or unusable (logged)."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
+        return float(value)
+    if value is not None:
+        log.warning("stop: ignoring t_client_ms %r", value)
+    return None
+
+
+def _stop_body(raw: bytes) -> dict[str, Any]:
+    """The `/stop` body as a dict; empty, unreadable or non-object bodies give {} (logged), never an error."""
+    if not raw.strip():
+        return {}
+    try:
+        data = json.loads(raw)
+    except (ValueError, RecursionError) as exc:  # RecursionError: absurdly nested JSON
+        log.warning("stop: ignoring an unreadable body: %s", exc)
+        return {}
+    if not isinstance(data, dict):
+        log.warning("stop: ignoring a %s body", type(data).__name__)
+        return {}
+    return data
+
+
+def check_points_path() -> Path:
+    """The recorded independent check points `/calibrate` reports: `VARA_CHECK_POINTS` or the default."""
+    return _env_path("VARA_CHECK_POINTS", CHECK_POINTS_PATH)
+
+
+def _display_path(path: Path) -> str:
+    """`path` relative to the repo when it is inside it (shorter on the dashboard), else as given."""
+    try:
+        return path.resolve().relative_to(ROOT).as_posix()
+    except (OSError, ValueError):
+        return str(path)
 
 
 def _timeout_score(index: int) -> dict[str, Any]:
@@ -592,16 +688,81 @@ class Orchestrator:
         self._last_id = highest + 1
         return f"t-{self._last_id:04d}"
 
-    def stop(self, reason: str = "stop requested") -> dict[str, Any]:
-        """STOP: freeze the arm first, then cancel the task and enter the `stopped` state."""
+    def stop(
+        self,
+        reason: str = "stop requested",
+        *,
+        source: Any = None,
+        t_client_ms: Any = None,
+        t_entry: float | None = None,
+    ) -> dict[str, Any]:
+        """STOP: freeze the arm first, then cancel the task and enter the `stopped` state.
+
+        `source` says who pressed it (STOP_SOURCES; `keyboard` is the console Esc watcher, anything
+        unknown counts as `api`), `t_entry` is `/stop`'s `time.monotonic()` on entry and `t_client_ms` the
+        client's wall clock in ms at the key press; all three are optional and only looked at after the
+        freeze. The reply and the `stopped` detail carry `source`, `latency_ms` (`t_entry` to the freeze
+        call; null without a stamp) and `press_to_freeze_ms` (`t_client_ms` to the end of the freeze call
+        on this laptop's clock; null without a stamp, or when the stamp is later than the freeze, i.e. from
+        another clock), and one log line says `stop: source=<s> request->freeze <n> ms`. `/stop` runs the
+        two halves itself, `_freeze_now()` before it reads its body and `_record_stop()` after, so that
+        nothing is awaited before the freeze."""
+        frozen = self._freeze_now()
+        return self._record_stop(frozen, reason, source=source, t_client_ms=t_client_ms, t_entry=t_entry)
+
+    def _freeze_now(self) -> _Frozen:
+        """STOP's first half, synchronous: `driver.freeze()`, then the stop flag (the worker abandons its
+        stage within STAGE_POLL_S and emits no `stopped` of its own while the flag is set) and `stopped`."""
+        called = time.monotonic()
         if self.driver is not None:
             self.driver.freeze()
+        wall_ms = time.time() * 1000.0
         self.stop_event.set()
         with self.lock:
             self.state = "stopped"
             task_id = self.task_id
-        self.emit("stopped", {"reason": reason}, task_id)
-        return {"state": "stopped", "task_id": task_id}
+        return _Frozen(called, wall_ms, task_id)
+
+    def _record_stop(
+        self,
+        frozen: _Frozen,
+        reason: str = "stop requested",
+        *,
+        source: Any = None,
+        t_client_ms: Any = None,
+        t_entry: float | None = None,
+    ) -> dict[str, Any]:
+        """STOP's second half (see `stop`): the latencies, the log line, the `stopped` event, the reply."""
+        task_id = frozen.task_id
+        who = _stop_source(source)
+        pressed = _client_ms(t_client_ms)
+        latency_ms = None if t_entry is None else round((frozen.called - t_entry) * 1000.0, 2)
+        press_ms = None if pressed is None else round(frozen.wall_ms - pressed, 1)
+        if press_ms is not None and press_ms < 0.0:
+            log.warning(
+                "stop: t_client_ms is %.0f ms after the freeze (another device's clock?); "
+                "press->freeze not measured",
+                -press_ms,
+            )
+            press_ms = None
+        if latency_ms is None:
+            log.info("stop: source=%s (%s)", who, reason)
+        else:
+            log.info(
+                "stop: source=%s request->freeze %.2f ms%s",
+                who,
+                latency_ms,
+                "" if press_ms is None else f", press->freeze {press_ms:.0f} ms",
+            )
+        detail = {"reason": reason, "source": who, "latency_ms": latency_ms, "press_to_freeze_ms": press_ms}
+        self.emit("stopped", detail, task_id)
+        return {
+            "state": "stopped",
+            "task_id": task_id,
+            "source": who,
+            "latency_ms": latency_ms,
+            "press_to_freeze_ms": press_ms,
+        }
 
     def resume(self) -> dict[str, Any]:
         """Leave `stopped`: the driver resumes, the arm goes home at <= 30 deg/s, the state is `idle`.
@@ -637,23 +798,30 @@ class Orchestrator:
         return {"torque": False, "state": self.state}
 
     def calibrate(self) -> dict[str, Any]:
+        """The marker consistency check: `{"error_cm"}`, the fit-marker mean over the overhead frame (the
+        FAKE_CALIBRATION_CM fixture under FAKE_CAMERA); 503 when it cannot run, 400 when it fails."""
+        return self._marker_check()[0]
+
+    def calibration_report(self) -> dict[str, Any]:
+        """`POST /calibrate`: `calibrate()`'s marker check plus `check_points`, the recorded independent
+        measurements of docs/table-calibration.md against the same homography (`_check_points`; null
+        without a file and always under FAKE_CAMERA, whose fixture never reads it), and `lens`, the sha256
+        of the config/lens.npz the checked frame was undistorted with (null for raw frames and under
+        FAKE_CAMERA)."""
+        result, homography, lens = self._marker_check()
+        check_points = None if homography is None else self._check_points(homography)
+        return {**result, "check_points": check_points, "lens": lens}
+
+    def _marker_check(self) -> tuple[dict[str, Any], np.ndarray | None, str | None]:
+        """`calibrate()`'s reply, the homography it checked (None for the FAKE_CAMERA fixture) and the lens
+        sha256 of the frame it checked (`_calibration_frame`; None for raw frames)."""
         if self.fake_camera:
-            return {"error_cm": FAKE_CALIBRATION_CM}
+            return {"error_cm": FAKE_CALIBRATION_CM}, None, None
         try:
-            frame = None
-            last_frame = getattr(self.tracker, "last_frame", None)
-            if callable(last_frame):
-                frame = last_frame()
-            if frame is None:
-                camera = cameras.get_camera("overhead")
-                try:
-                    frame = camera.read()
-                finally:
-                    camera.release()
-            if frame is None:
-                raise ValueError("no frame from the overhead camera")
+            frame, lens = self._calibration_frame()
+            homography = calibrate.load_homography()
             metrics = calibrate.calibration_metrics(
-                calibrate.load_homography(), markers.detect(frame), calibrate.calib_marker_centers()
+                homography, markers.detect(frame), calibrate.calib_marker_centers()
             )
         except (ValueError, OSError, RuntimeError) as exc:
             raise HTTPException(status_code=503, detail=f"calibration check failed: {exc}") from None
@@ -666,7 +834,79 @@ class Orchestrator:
                     "repeat table calibration and independent check points"
                 ),
             )
-        return {"error_cm": round(float(metrics["mean_cm"]), 2)}
+        return {"error_cm": round(float(metrics["mean_cm"]), 2)}, homography, lens
+
+    def _calibration_frame(self) -> tuple[Any, str | None]:
+        """The overhead frame the marker check runs on and its lens sha256 (None: raw frames), so the check
+        sees pixels undistorted like the homography's fit. The tracker's `last_frame()` is already
+        undistorted by the tracker's own lens (`vision.scene.tracker_diagnostics(tracker)["lens"]`) and is
+        used as it is. Without a tracker frame, one frame is read from the camera and undistorted here with
+        that same lens (`_tracker_lens`), loaded before the camera opens; a tracker or stand-in that reports
+        no lens (the fakes) stays raw. With no tracker at all, config/lens.npz is loaded directly.
+        ValueError for a corrupt lens file, a lens file that no longer matches the tracker's or no frame."""
+        tracker = self.tracker
+        lens_sha = None if tracker is None else scene_mod.tracker_diagnostics(tracker).get("lens")
+        last_frame = getattr(tracker, "last_frame", None)
+        if callable(last_frame):
+            frame = last_frame()
+            if frame is not None:
+                return frame, lens_sha
+        lens = calibrate.load_active_lens() if tracker is None else self._tracker_lens(lens_sha)
+        camera = cameras.get_camera("overhead")
+        try:
+            frame = camera.read()
+        finally:
+            camera.release()
+        if frame is None:
+            raise ValueError("no frame from the overhead camera")
+        return calibrate.undistort_frame(frame, lens), calibrate.lens_hash(lens)
+
+    def _tracker_lens(self, sha: str | None) -> dict[str, Any] | None:
+        """The lens whose sha256 the tracker reports, as a `vision.calibrate.load_active_lens()` result
+        loaded once per orchestrator (the tracker keeps its own copy private); None for a raw tracker.
+        ValueError when config/lens.npz is no longer that file (restart so tracker and check agree)."""
+        if sha is None:
+            return None
+        cached = getattr(self, "_calibration_lens", None)
+        if cached is not None and calibrate.lens_hash(cached) == sha:
+            return cached
+        lens = calibrate.load_active_lens()
+        if calibrate.lens_hash(lens) != sha:
+            found = calibrate.lens_hash(lens) or "absent"
+            raise ValueError(
+                f"config/lens.npz is {found} but the tracker undistorts with {sha}: restart the orchestrator "
+                "so the tracker and this check use the same lens"
+            )
+        self._calibration_lens = lens
+        return lens
+
+    @staticmethod
+    def _check_points(homography: Any) -> dict[str, Any] | None:
+        """`/calibrate`'s `check_points`: null without a measurements file, 400 when the file is invalid,
+        else `{n, mean_cm, max_cm, ok, file}` from `vision.calibrate.check_points_metrics`."""
+        path = check_points_path()
+        if not path.is_file():
+            return None
+        try:
+            metrics = calibrate.check_points_metrics(homography, calibrate.load_check_points(path))
+            mean_cm, max_cm = float(metrics["mean_cm"]), float(metrics["max_cm"])
+            if not (math.isfinite(mean_cm) and math.isfinite(max_cm)):  # JSON cannot carry inf or NaN
+                raise ValueError("a check point maps to infinity through the saved matrix")
+        except (ValueError, OSError, RecursionError) as exc:  # RecursionError: absurdly nested JSON
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"independent check points file {_display_path(path)} is invalid: {exc}; "
+                    "fix or remove it (docs/table-calibration.md)"
+                ),
+            ) from None
+        return {
+            "n": int(metrics["count"]),
+            "mean_cm": round(mean_cm, 3),
+            "max_cm": round(max_cm, 3),
+            "ok": bool(metrics["accepted"]),
+            "file": _display_path(path),
+        }
 
     def reset_demo(self) -> dict[str, Any]:
         with self.lock:
@@ -1323,7 +1563,7 @@ class Orchestrator:
         _write_json(task.dir / "replay.json", result)
         if self.driver.stopped:
             if self.stop_event.wait(0.5):
-                raise Cancelled()  # /stop did it and already emitted `stopped`
+                raise Cancelled()  # /stop did it and records `stopped` itself
             self._enter_stopped(task, str(result.get("reason") or "stopped"))
             raise Cancelled()
         if not result.get("ok"):
@@ -1476,8 +1716,55 @@ async def post_command(body: CommandBody) -> dict[str, Any]:
 
 
 @app.post("/stop")
-async def post_stop() -> dict[str, Any]:
-    return orch.stop()
+async def post_stop(request: Request) -> dict[str, Any]:
+    """STOP. The arm freezes before anything is awaited; only then is the optional body `{"source",
+    "t_client_ms"}` read, leniently (module docstring), and the stop recorded with it. Nothing a client
+    sends, or fails to send, can refuse or delay the freeze, and the `stopped` event is recorded whatever
+    becomes of the body read."""
+    t_entry = time.monotonic()
+    current = orch
+    frozen = current._freeze_now()
+    try:
+        raw = await request.body()
+    except Exception as exc:  # the client went away mid-body: the arm is frozen all the same
+        log.warning("stop: could not read the body (%s: %s)", type(exc).__name__, exc)
+        raw = b""
+    except BaseException:  # the request was cancelled (shutdown): record the stop, then let it end
+        current._record_stop(frozen, t_entry=t_entry)
+        raise
+    body = _stop_body(raw)
+    reply = current._record_stop(
+        frozen, source=body.get("source"), t_client_ms=body.get("t_client_ms"), t_entry=t_entry
+    )
+    _record_dashboard_stop(current.driver, reply)
+    return reply
+
+
+def _record_dashboard_stop(driver: Any, reply: dict[str, Any]) -> None:
+    """A13 evidence for a dashboard/voice STOP on the REAL arm: one `esc-latency.jsonl` record with source
+    `dashboard-<source>`, written on a daemon thread after the freeze (never on the STOP path). Its
+    `latency_ms` is the reply's `press_to_freeze_ms` (key press to freeze on this laptop's clock: the
+    number A13's 200 ms bar is about; null without a client stamp), the server-side `latency_ms` goes in
+    `extra`. Nothing is recorded for the fake arm or a disconnected driver."""
+    if (
+        driver is None
+        or getattr(driver, "is_fake", True) is not False
+        or not getattr(driver, "connected", False)
+    ):
+        return
+
+    def write() -> None:
+        try:
+            driver_mod.record_esc_latency(
+                source=f"dashboard-{reply.get('source')}",
+                latency_ms=reply.get("press_to_freeze_ms"),
+                extra={"server_latency_ms": reply.get("latency_ms"), "task_id": reply.get("task_id")},
+                phase="session",
+            )
+        except Exception:
+            log.exception("stop: could not append the Esc latency record")
+
+    threading.Thread(target=write, name="stop-record", daemon=True).start()
 
 
 @app.post("/resume")
@@ -1498,7 +1785,7 @@ async def post_torque_off() -> dict[str, Any]:
 
 @app.post("/calibrate")
 async def post_calibrate() -> dict[str, Any]:
-    return await asyncio.to_thread(orch.calibrate)
+    return await asyncio.to_thread(orch.calibration_report)
 
 
 @app.post("/reset_demo")
@@ -1560,7 +1847,77 @@ async def events_socket(websocket: WebSocket) -> None:
 # ------------------------------------------------------------------------------------------------------------
 
 
-def bench_demo(text: str = "clear the table", runs: int = 5, timeout: float = 150.0) -> int:
+def _bench_settle(client: Any, task_id: str, timeout: float, *, reset: bool) -> None:
+    """Wait for `task_id` to end and the worker to let go; `/resume` after a stop, `/reset_demo` if asked."""
+    wait_for_stage(orch, task_id, FINAL_STAGES, timeout)
+    deadline = time.monotonic() + 10.0
+    while orch.state == "busy" and time.monotonic() < deadline:
+        time.sleep(0.05)
+    if orch.state == "stopped":
+        client.post("/resume")
+    if reset:
+        client.post("/reset_demo")
+
+
+def _bench_commands(
+    client: Any, text: str, runs: int, timeout: float, *, reset: bool, saved_skill: bool = False
+) -> list[dict[str, Any]]:
+    """The loop both benches share: `runs` commands of `text` through `client`, one at a time, each timed
+    from the POST to its first `executing`/`queued`/`error`/`stopped` event (one printed line per run),
+    then waited to its end, resumed when stopped and, with `reset`, followed by `/reset_demo`. Returns one
+    record per run: `{run, task_id, stage, seconds, detail}` (`stage` is `rejected` for a refused POST and
+    `no end stage` after `timeout`).
+
+    With `saved_skill` (`--bench-run`) a command the router sends to a learn or a routine instead
+    (`spec_ready` before any `planning`) is stopped at once and ends the loop, recorded with the stage
+    `not a saved skill`: it is not the path being measured, and a live learn would spend six
+    code-generation calls per run."""
+    records: list[dict[str, Any]] = []
+    for k in range(1, runs + 1):
+        started = time.monotonic()
+        reply = client.post("/command", json={"text": text})
+        if reply.status_code != 200:
+            print(f"run {k}: POST /command returned {reply.status_code}: {reply.text}")
+            detail = {"status": reply.status_code, "reply": reply.text[:100]}
+            records.append(
+                {"run": k, "task_id": None, "stage": "rejected", "seconds": None, "detail": detail}
+            )
+            continue
+        task_id = reply.json()["task_id"]
+        if saved_skill:
+            routed = wait_for_stage(orch, task_id, BENCH_ROUTED, timeout)
+            if routed is not None and routed["stage"] == "spec_ready":
+                client.post("/stop", json={"source": "api"})
+                name = routed["detail"].get("name")
+                print(
+                    f"run {k} ({task_id}): the router started a learn of {name!r}, not a saved skill: "
+                    "stopped it and the bench (check the phrase and the library)"
+                )
+                detail = {"routed_to": "learn", "spec": name}
+                record = {"run": k, "task_id": task_id, "stage": "not a saved skill", "seconds": None}
+                records.append({**record, "detail": detail})
+                _bench_settle(client, task_id, timeout, reset=reset)
+                break
+        left = max(0.0, timeout - (time.monotonic() - started))  # one budget per run, routing included
+        event = wait_for_stage(orch, task_id, ("executing", "queued", "error", "stopped"), left)
+        seconds = time.monotonic() - started
+        stage = event["stage"] if event else "no end stage"
+        detail = json.dumps(event["detail"])[:100] if event else ""
+        print(f"run {k} ({task_id}): {stage} after {seconds:.1f} s  {detail}")
+        records.append(
+            {
+                "run": k,
+                "task_id": task_id,
+                "stage": stage,
+                "seconds": round(seconds, 3),
+                "detail": dict(event["detail"]) if event else None,
+            }
+        )
+        _bench_settle(client, task_id, timeout, reset=reset)
+    return records
+
+
+def bench_demo(text: str = "clear the table", runs: int = 5, timeout: float = BENCH_WAIT_S) -> int:
     """Five demo-mode learns through the TestClient; prints seconds from the command to `executing`."""
     global orch
     os.environ["FAKE"] = "1"
@@ -1569,32 +1926,140 @@ def bench_demo(text: str = "clear the table", runs: int = 5, timeout: float = 15
 
     orch = Orchestrator()
     cap = float(BUDGETS["demo"]["to_arm"])
-    within = 0
     with TestClient(app) as client:
         client.post("/reset_demo")
-        for k in range(1, runs + 1):
-            started = time.monotonic()
-            reply = client.post("/command", json={"text": text})
-            if reply.status_code != 200:
-                print(f"run {k}: POST /command returned {reply.status_code}: {reply.text}")
-                continue
-            task_id = reply.json()["task_id"]
-            event = wait_for_stage(orch, task_id, ("executing", "queued", "error", "stopped"), timeout)
-            seconds = time.monotonic() - started
-            stage = event["stage"] if event else "no end stage"
-            detail = json.dumps(event["detail"])[:100] if event else ""
-            print(f"run {k} ({task_id}): {stage} after {seconds:.1f} s  {detail}")
-            if stage in ("executing", "queued") and seconds <= cap:
-                within += 1
-            wait_for_stage(orch, task_id, FINAL_STAGES, timeout)
-            deadline = time.monotonic() + 10.0
-            while orch.state == "busy" and time.monotonic() < deadline:
-                time.sleep(0.05)
-            if orch.state == "stopped":
-                client.post("/resume")
-            client.post("/reset_demo")
+        records = _bench_commands(client, text, runs, timeout, reset=True)
+    within = sum(
+        1
+        for record in records
+        if record["stage"] in ("executing", "queued")
+        and record["seconds"] is not None
+        and record["seconds"] <= cap
+    )
     print(f"{within} of {runs} runs reached the arm or were queued within {cap:g} s")
     return 0 if within == runs else 1
+
+
+def _bench_out_dir(base: Path) -> Path:
+    """A new `run-<UTC stamp>` folder under `base`; never reuses one (a suffix separates two in a second)."""
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+    folder = base / f"run-{stamp}"
+    suffix = 2
+    while folder.exists():
+        folder = base / f"run-{stamp}-{suffix}"
+        suffix += 1
+    folder.mkdir(parents=True)
+    return folder
+
+
+def _bench_library(source: Path, dest: Path) -> None:
+    """Copy the skill library to `dest` for one bench: its runs use the fake arm, so the `real` counts they
+    move must never reach the library the dashboard and the story numbers read. `bench_run` has already
+    refused a `dest` inside `source` (the copy would recurse into itself)."""
+    if not source.is_dir():
+        dest.mkdir(parents=True)  # the starters are seeded from the repo's skills/_starter
+        return
+    shutil.copytree(source, dest, ignore=shutil.ignore_patterns("__pycache__"))
+
+
+def bench_run(
+    text: str = "hand me my pills",
+    runs: int = 5,
+    *,
+    live_router: bool = False,
+    timeout: float = BENCH_WAIT_S,
+) -> int:
+    """C8's saved-skill latency: `runs` commands of `text` through the TestClient, each timed from the
+    POST to its `executing` event, the median of the runs that reached `executing` against
+    BENCH_TARGET_S, and `<runs_dir>/bench/run-<UTC stamp>/summary.json` (a new folder per bench) with the
+    phrase, the fakes, the mode, every run's seconds and end stage, the median and the verdict.
+
+    FAKE_ROBOT, FAKE_CAMERA and FAKE_SANDBOX are forced on, so the arm, the cameras and Daytona are never
+    touched; FAKE_LLM is forced on too unless `live_router`, which instead clears FAKE and FAKE_LLM for this
+    process (the real xAI router) and returns 2 before anything starts when XAI_API_KEY is absent (only its
+    presence is ever reported). A command the router sends to a learn instead of a saved skill is stopped
+    at `spec_ready` and ends the bench. The bench runs on a copy of the library (VARA_SKILLS_DIR or
+    skills/) in `run-<stamp>/skills/`, with its task folders in `run-<stamp>/t-*`: fake-arm runs never
+    move the library's `real` counts or mix with the real tasks. Returns 0 iff every run reached
+    `executing` and the median is within the target, 1 otherwise; a blank `text`, `runs` < 1 or a runs
+    folder inside the skills folder is a ValueError before anything is changed or created.
+
+    Its last two lines, which scripts/live_gates.py parses for the C8 gate, are
+    `median <s> s (<n> of <runs> runs reached executing; target 5 s): PASS|FAIL` (`no median` when no run
+    reached `executing`) and `wrote <summary.json path>`."""
+    global orch
+    if runs < 1:
+        raise ValueError(f"runs must be at least 1, got {runs}")
+    if not text.strip():
+        raise ValueError("the bench needs a phrase")
+    source_skills = _env_path("VARA_SKILLS_DIR", ROOT / "skills")
+    bench_dir = _env_path("VARA_RUNS_DIR", ROOT / "runs") / "bench"
+    if source_skills.is_dir() and bench_dir.resolve().is_relative_to(source_skills.resolve()):
+        raise ValueError(f"the bench folder {bench_dir} must not be inside the skills folder {source_skills}")
+    key_present = bool(os.environ.get("XAI_API_KEY", "").strip())
+    if live_router:
+        if not key_present:
+            print(
+                "--live-router needs XAI_API_KEY in .env (present: False); nothing was started",
+                file=sys.stderr,
+            )
+            return 2
+        for name in ("FAKE", "FAKE_LLM"):
+            os.environ.pop(name, None)
+    else:
+        os.environ["FAKE_LLM"] = "1"
+    for name in ("FAKE_ROBOT", "FAKE_CAMERA", "FAKE_SANDBOX"):
+        os.environ[name] = "1"
+    from fastapi.testclient import TestClient
+
+    out_dir = _bench_out_dir(bench_dir)
+    _bench_library(source_skills, out_dir / "skills")
+    os.environ["VARA_SKILLS_DIR"] = str(out_dir / "skills")
+    os.environ["VARA_RUNS_DIR"] = str(out_dir)  # the bench's t-* folders sit beside its summary
+    orch = Orchestrator()
+    fakes = {name: _fake(name) for name in ("FAKE_LLM", "FAKE_ROBOT", "FAKE_CAMERA", "FAKE_SANDBOX")}
+    router_label = "fixtures" if fakes["FAKE_LLM"] else "xAI"
+    print(
+        f"bench-run {text!r} x{runs}: router={router_label} robot=fake camera=fake sandbox=fake "
+        f"mode={orch.mode} (target {BENCH_TARGET_S:g} s)"
+    )
+    started_utc = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    with TestClient(app) as client:
+        records = _bench_commands(client, text, runs, timeout, reset=False, saved_skill=True)
+    # Only a run that reached `executing` has a command-to-arm time; the others count against the verdict.
+    seconds = [record["seconds"] for record in records if record["stage"] == "executing"]
+    executed = len(seconds)
+    median_s = round(statistics.median(seconds), 3) if seconds else None
+    all_executing = executed == runs
+    ok = all_executing and median_s is not None and median_s <= BENCH_TARGET_S
+    summary = {
+        "phrase": text,
+        "runs_requested": runs,
+        "router": router_label,
+        "live_router": live_router,
+        "xai_key_present": key_present,
+        "fakes": fakes,
+        "mode": orch.mode,
+        "skills_source": str(source_skills),
+        "skills_dir": str(orch.skills_dir),
+        "target_s": BENCH_TARGET_S,
+        "runs": records,
+        "executing_runs": executed,
+        "median_s": median_s,
+        "all_executing": all_executing,
+        "ok": ok,
+        "started_utc": started_utc,
+        "finished_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    path = out_dir / "summary.json"
+    path.write_text(json.dumps(_jsonable(summary), indent=2) + "\n", encoding="utf-8")
+    median_text = "no median" if median_s is None else f"median {median_s:.1f} s"
+    print(  # the format scripts/live_gates.py parses (docstring)
+        f"{median_text} ({executed} of {runs} runs reached executing; target {BENCH_TARGET_S:g} s): "
+        f"{'PASS' if ok else 'FAIL'}"
+    )
+    print(f"wrote {path}")
+    return 0 if ok else 1
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -1603,19 +2068,63 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--real", action="store_true", help="connect the real arm (asks for confirmation)")
     parser.add_argument("--bench-demo", action="store_true", help="five demo-mode learns with every fake")
-    parser.add_argument("--runs", type=int, default=5, help="learns for --bench-demo")
+    parser.add_argument(
+        "--bench-run",
+        metavar="TEXT",
+        help=(
+            'benchmark a saved skill, e.g. "hand me my pills": seconds from the command to the arm '
+            "moving per run, the median against the C8 target of 5 s, summary.json under runs/bench/"
+        ),
+    )
+    parser.add_argument("--runs", type=int, default=5, help="runs for --bench-demo and --bench-run")
+    parser.add_argument(
+        "--live-router",
+        action="store_true",
+        help=(
+            "--bench-run with the live xAI router (needs XAI_API_KEY); the arm, the cameras and the "
+            "sandboxes stay fake"
+        ),
+    )
     args = parser.parse_args(argv)
+    if args.runs < 1:
+        parser.error("--runs must be at least 1")
+    if args.bench_demo and args.bench_run is not None:
+        parser.error("--bench-demo and --bench-run are exclusive")
+    if args.live_router and args.bench_run is None:
+        parser.error("--live-router requires --bench-run")
+    if args.real and (args.bench_demo or args.bench_run is not None):
+        parser.error("the benchmarks never use the real arm: drop --real")
+    if args.bench_run is not None and not args.bench_run.strip():
+        parser.error("--bench-run needs a phrase")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     if args.bench_demo:
         return bench_demo(runs=args.runs)
+    if args.bench_run is not None:
+        return bench_run(args.bench_run.strip(), args.runs, live_router=args.live_router)
     watcher = None
     driver = None
+    cli_args = list(sys.argv[1:] if argv is None else argv)
+    # A13: set once the connect starts; an Esc before that (the countdown) aborts and is not recorded
+    console: dict[str, Any] = {"connecting": False, "connected_at": None}
+
+    def on_esc() -> None:
+        """The console Esc: STOP first, then (real arm only) the Esc record for this press."""
+        orch.stop("Esc pressed", source="keyboard")
+        if console["connecting"] and getattr(driver, "is_fake", True) is False:
+            driver_mod.report_esc_latency(
+                watcher,
+                driver,
+                source="orchestrator-console",
+                connected_at=console["connected_at"],
+                extra={"argv": cli_args},
+            )
+
     try:
         if args.real:
             driver = driver_mod.get_driver()
             # The lifespan has not started yet: STOP must already reach the driver during connect().
             orch.driver = driver
-            watcher = driver_mod.EscWatcher(lambda: orch.stop("Esc pressed"))
+            watcher = driver_mod.EscWatcher(on_esc)
             watcher.start()
             if getattr(driver, "is_fake", False):
                 print("FAKE_ROBOT is set: --real connects the in-memory arm only.")
@@ -1624,7 +2133,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             if watcher.pressed or driver.stopped or real_robot.cancelled() or orch.stop_event.is_set():
                 print("startup stopped; nothing connected")
                 return 1
+            console["connecting"] = True
             driver.connect()
+            console["connected_at"] = time.monotonic()
             if watcher.pressed or driver.stopped or real_robot.cancelled() or orch.stop_event.is_set():
                 orch.stop("stopped while connecting")
                 print("startup stopped; arm frozen with torque on")

@@ -18,6 +18,16 @@
  *   7. Inside the dashboard iframe, T presses forwarded by the parent window as postMessage
  *      {type: "vara-key", event: "keydown"|"keyup"|"blur"} drive push to talk like the local keys
  *      ("blur": the dashboard window lost the focus while a forwarded press was down).
+ *   8. STOP (Esc, the button or the `stop` tool) posts {source, t_client_ms: the wall clock at the
+ *      press} to /stop and logs one console line "stop voice: server <latency_ms> ms, round trip <ms>
+ *      ms, press to freeze <ms> ms" from the reply's latency_ms and press_to_freeze_ms (the server's
+ *      request-to-freeze and press-to-freeze times; an older server reports neither) and the round
+ *      trip measured here (from the key or click event's timeStamp, or from the tool call). A `stop`
+ *      call that is the first tool call after a spoken turn adds ", talk release to response <ms> ms":
+ *      push to talk released to the /stop reply, the "saying stop" latency. Inside the dashboard
+ *      iframe the numbers travel with the {type: "vara-stopped", source, latency_ms,
+ *      press_to_freeze_ms, round_trip_ms, release_to_response_ms} message, so the dashboard timeline
+ *      shows them on the entry of the stop.
  */
 (function () {
   "use strict";
@@ -30,6 +40,8 @@
   var MIN_PRESS_S = 0.1;
   var MAX_RECONNECTS = 3;
   var LOG_MAX = 200;
+  var PRESS_MAX_AGE_MS = 60000; // an input event's timeStamp further back than this is not taken as the press
+  var RELEASE_MAX_MS = 60000; // a talk release older than this is not the turn a tool call answers
 
   // The exact sentence from docs/interfaces.md, "Voice tools".
   var INSTRUCTIONS = "You are the voice of a home robot arm. For any physical request, call do_task with the user's exact words. If the user says stop, call stop immediately. If do_task reports busy, say 'One moment.' Keep spoken replies under 12 words.";
@@ -64,6 +76,45 @@
   function humanize(s) { return String(s === undefined || s === null ? "" : s).replace(/_/g, " "); }
   function short(s, n) { s = String(s === undefined || s === null ? "" : s); return s.length > n ? s.slice(0, n - 1) + "\u2026" : s; }
   function clock() { return new Date().toTimeString().slice(0, 8); }
+
+  function num(v) {
+    if (v === null || v === undefined || v === "" || typeof v === "boolean") return null;
+    var n = Number(v);
+    return isFinite(n) ? n : null;
+  }
+
+  // Milliseconds for latency measurements: the browser's monotonic clock, or Date.now() without one.
+  function nowMs() {
+    return (typeof performance === "object" && performance !== null && typeof performance.now === "function") ? performance.now() : Date.now();
+  }
+
+  // When a STOP was pressed, as app.js pressStamp: `at` on the nowMs() clock and `wall` on the wall
+  // clock (the body's t_client_ms). A key or click event's timeStamp is the press when it is a
+  // plausible reading of that clock, so time this page spent busy before the handler ran counts.
+  function pressStamp(ev) {
+    var now = nowMs();
+    var wall = Date.now();
+    var ts = ev && typeof ev.timeStamp === "number" ? ev.timeStamp : NaN;
+    if (isFinite(ts) && ts > 0 && ts <= now && now - ts <= PRESS_MAX_AGE_MS) return { at: ts, wall: wall - (now - ts) };
+    return { at: now, wall: wall };
+  }
+
+  // A duration in ms with at most one decimal ("2.5", "37"), never negative.
+  function fmtMs(v) { return String(Math.max(0, Math.round(v * 10) / 10)); }
+
+  // The one console line per answered STOP, the same shape as the dashboard's (app.js stopLine): the
+  // server's press-to-freeze time is shown only when it fits inside the round trip measured here, and
+  // a spoken stop adds the time from the push-to-talk release to the /stop reply (releaseMs).
+  function stopLine(source, reply, roundTripMs, releaseMs) {
+    var d = reply && typeof reply === "object" ? reply : {};
+    var latency = num(d.latency_ms);
+    var press = num(d.press_to_freeze_ms);
+    var line = "stop " + source + ": " + (latency === null ? "server latency not reported" : "server " + fmtMs(latency) + " ms")
+      + ", round trip " + fmtMs(roundTripMs) + " ms";
+    if (press !== null && press >= 0 && press <= roundTripMs + 5) line += ", press to freeze " + fmtMs(press) + " ms";
+    if (typeof releaseMs === "number" && isFinite(releaseMs) && releaseMs >= 0) line += ", talk release to response " + fmtMs(releaseMs) + " ms";
+    return line;
+  }
 
   // ------------------------------------------------------------------ UI
   function setStatus(text, cls) {
@@ -333,6 +384,16 @@
   var pendingCalls = 0;
   var pendingTasks = Object.create(null); // no prototype: a task id can never reach Object.prototype
   var lastStopAt = 0;
+  // The end of the last spoken turn: nowMs() when push to talk was released and the audio committed.
+  // The first tool call after it is the model's answer to that turn and takes it (takeRelease), so a
+  // `stop` call reports the time from the end of the user's "stop" to the /stop reply.
+  var lastRelease = null;
+
+  function takeRelease() {
+    var at = lastRelease;
+    lastRelease = null;
+    return at !== null && nowMs() - at <= RELEASE_MAX_MS ? at : null;
+  }
 
   // Arguments must be a JSON object (the API sends them as a JSON string). Anything else is answered
   // with an error output so the model can retry; it is never turned into a command for the arm.
@@ -350,6 +411,7 @@
     var name = typeof ev.name === "string" ? ev.name : "";
     var callId = ev.call_id;
     if (!callId) { log("err", "function call " + (name || "?") + " without a call_id, ignored"); return; }
+    var releasedAt = takeRelease();
     var parsed = parseArguments(ev.arguments);
     var args = parsed.args || {};
     pendingCalls += 1;
@@ -358,7 +420,7 @@
     try {
       if (parsed.error) output = "error: invalid arguments (" + parsed.error + ")";
       else if (name === "do_task") output = await doTask(args);
-      else if (name === "stop") output = await doStop("voice");
+      else if (name === "stop") output = await doStop("voice", null, releasedAt);
       else if (name === "list_skills") output = await listSkills();
       else output = "error: unknown tool " + name;
     } catch (e) {
@@ -384,20 +446,50 @@
     return "On it";
   }
 
-  async function doStop(source) {
+  // STOP from Esc, the button or the `stop` tool. `source` is the label shown ("Esc", "button",
+  // "voice"); on the wire it is lowercase, as the server names it. `press` (pressStamp of the key or
+  // click event; the tool call's own moment when absent) holds the press on the wall clock for the
+  // server (press_to_freeze_ms on the same laptop) and on the monotonic clock for the round trip
+  // measured here; `releasedAt` is the end of the spoken turn a `stop` call answers. With the reply's
+  // latency_ms they make the one console line, go on the voice log line and, inside the dashboard
+  // iframe, travel with the "vara-stopped" message.
+  async function doStop(source, press, releasedAt) {
     lastStopAt = Date.now();
+    if (!press) press = pressStamp(null);
+    var wire = String(source).toLowerCase();
     var r;
     try {
-      r = await fetch("/stop", { method: "POST" });
+      // Nothing is awaited ahead of this request: it must leave as fast as it always has.
+      r = await fetch("/stop", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ source: wire, t_client_ms: press.wall }) });
     } catch (e) {
       setError("STOP request failed: " + e.message + ". Use the dashboard STOP or pull the 12 V plug.");
       return "error: " + e.message;
     }
+    var answeredAt = nowMs();
+    var roundTrip = answeredAt - press.at;
+    var sinceRelease = typeof releasedAt === "number" ? answeredAt - releasedAt : null;
+    var d = null;
+    var line = null;
+    if (r.ok) {
+      try { d = await r.json(); } catch (e) { d = null; }
+      if (!d || typeof d !== "object") d = null;
+      line = stopLine(wire, d, roundTrip, sinceRelease);
+      if (window.console && console.log) console.log(line);
+    }
     if (inIframe()) {
-      try { window.parent.postMessage({ type: "vara-stopped", source: source }, location.origin); } catch (e) { /* ignore */ }
+      try {
+        window.parent.postMessage({
+          type: "vara-stopped",
+          source: source,
+          latency_ms: d ? num(d.latency_ms) : null,
+          press_to_freeze_ms: d ? num(d.press_to_freeze_ms) : null,
+          round_trip_ms: r.ok ? roundTrip : null,
+          release_to_response_ms: r.ok ? sinceRelease : null
+        }, location.origin);
+      } catch (e) { /* ignore */ }
     }
     setStatus("STOPPED", "stopped");
-    log("sys", "STOP sent (" + source + ")");
+    log("sys", "STOP sent (" + source + ")" + (line ? ": " + line : ""));
     return r.ok ? "stopped" : "error: POST /stop returned HTTP " + r.status;
   }
 
@@ -687,6 +779,7 @@
 
   function stopTalking(silent) {
     if (!capturing) return;
+    var releasedAt = nowMs();
     capturing = false;
     if (pendingCount > 0 && !silent) sendChunk(pendingCount);
     try { if (processor) { processor.disconnect(); processor.onaudioprocess = null; } } catch (e) { /* ignore */ }
@@ -703,7 +796,7 @@
       log("sys", "press too short, nothing sent");
       return;
     }
-    send({ type: "input_audio_buffer.commit" });
+    if (send({ type: "input_audio_buffer.commit" })) lastRelease = releasedAt;
     send({ type: "response.create" });
     setStatus("thinking", "on");
     log("sys", "sent " + (capturedSamples / SAMPLE_RATE).toFixed(1) + " s of audio");
@@ -718,7 +811,7 @@
   function bind() {
     $("btn-connect").addEventListener("click", connect);
     $("btn-disconnect").addEventListener("click", disconnect);
-    $("btn-voice-stop").addEventListener("click", function () { doStop("button"); });
+    $("btn-voice-stop").addEventListener("click", function (ev) { doStop("button", pressStamp(ev)); });
     var talk = $("btn-talk");
     talk.addEventListener("pointerdown", function (ev) { ev.preventDefault(); try { talk.setPointerCapture(ev.pointerId); } catch (e) { /* ignore */ } startTalking(); });
     talk.addEventListener("pointerup", function () { stopTalking(); });
@@ -726,7 +819,7 @@
     talk.addEventListener("lostpointercapture", function () { stopTalking(); });
     talk.addEventListener("contextmenu", function (ev) { ev.preventDefault(); });
     window.addEventListener("keydown", function (ev) {
-      if (ev.key === "Escape" || ev.key === "Esc") { ev.preventDefault(); doStop("Esc"); return; }
+      if (ev.key === "Escape" || ev.key === "Esc") { ev.preventDefault(); doStop("Esc", pressStamp(ev)); return; }
       // Ctrl/Alt/Meta+T is a browser shortcut (a new tab), not a push to talk.
       if (ev.key !== "t" && ev.key !== "T") return;
       if (ev.repeat || ev.ctrlKey || ev.altKey || ev.metaKey || isTyping(ev)) return;

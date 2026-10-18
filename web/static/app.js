@@ -2,7 +2,12 @@
  *
  * Talks only to the orchestrator contract (docs/interfaces.md, "Orchestrator API"):
  *   POST /command {text} -> {task_id} | 409 busy
- *   POST /stop, POST /resume, POST /calibrate -> {error_cm}
+ *   POST /stop {source, t_client_ms: the wall clock at the press} -> {state, task_id, source,
+ *     latency_ms, press_to_freeze_ms}: the STOP latency measurement, whose source, latency_ms and
+ *     press_to_freeze_ms also arrive in that stop's `stopped` event detail (an older server ignores
+ *     the body and reports none)
+ *   POST /resume
+ *   POST /calibrate -> {error_cm, check_points: null | {n, mean_cm, max_cm, ok, file}}
  *   POST /reset_demo, POST /load_backup
  *   GET  /state -> {state, mode, skills, queue, carry}
  *   WS   /events -> replay of the last 200 events, then live (schemas/event.json)
@@ -25,6 +30,9 @@
   var SPEC_ENGLISH_MAX = 300; // the banner sentence; the full spec JSON sits right below it
   var STOP_TIMEOUT_MS = 3000; // the server freezes within 0.2 s; silence this long means the request is hung or lost
   var STOP_RETRIES = 3; // automatic re-sends after a silent /stop; after that the button and Esc re-send
+  var PRESS_MAX_AGE_MS = 60000; // an input event's timeStamp further back than this is not taken as the press
+  var STOP_PAIR_MS = 60000; // a measured STOP line whose timeline entry has not arrived by then is dropped
+  var VOICE_PRESS_SLACK_MS = 250; // the voice page's press time is known here only to within its message's delivery
   var STATE_TIMEOUT_MS = 8000; // one /state poll in flight at a time, so a hung server cannot pile them up
   var API_TIMEOUT_MS = 30000; // every other request (/resume answers after the arm reaches home)
   var RL_RETRY_MS = 2000; // quick re-checks while the deferred Chart.js script has not landed
@@ -68,6 +76,46 @@
   function count(v) { var n = num(v); return n === null ? "?" : String(n); }
 
   function isObject(v) { return !!v && typeof v === "object" && !Array.isArray(v); }
+
+  // Milliseconds for latency measurements: the browser's monotonic clock, or Date.now() without one.
+  function nowMs() {
+    return (typeof performance === "object" && performance !== null && typeof performance.now === "function") ? performance.now() : Date.now();
+  }
+
+  // When a STOP was pressed: `at` on the nowMs() clock (the round trip measured here) and `wall` on the
+  // wall clock (the body's t_client_ms, which the server compares with its own on the same laptop).
+  // The key or click event's timeStamp is when the browser took the input, so it is the press when it
+  // is a plausible reading of that clock: time this page spent busy before the handler ran (a chart
+  // redraw, say) then counts against the latency instead of hiding from it. Otherwise it is now.
+  function pressStamp(ev) {
+    var now = nowMs();
+    var wall = Date.now();
+    var ts = ev && typeof ev.timeStamp === "number" ? ev.timeStamp : NaN;
+    if (isFinite(ts) && ts > 0 && ts <= now && now - ts <= PRESS_MAX_AGE_MS) return { at: ts, wall: wall - (now - ts) };
+    return { at: now, wall: wall };
+  }
+
+  // A duration in ms with at most one decimal ("2.5", "37"), never negative.
+  function fmtMs(v) { return String(Math.max(0, Math.round(v * 10) / 10)); }
+
+  // The one console line per answered STOP, "stop esc: server 2.5 ms, round trip 37 ms, press to
+  // freeze 20 ms": the server's request-to-freeze time from the /stop reply (an older server reports
+  // none), the key press to response round trip measured here, and the server's press-to-freeze
+  // time (our wall-clock stamp against its own), shown only when it fits inside the round trip, which
+  // is what two agreeing clocks give; a skewed one is left to the server log rather than shown wrong.
+  // A spoken stop the voice page timed from the end of the turn (releaseMs: push to talk released to
+  // the /stop reply) adds ", talk release to response <ms> ms". The same line goes on the timeline
+  // entry of the stop.
+  function stopLine(source, reply, roundTripMs, attempt, releaseMs) {
+    var d = isObject(reply) ? reply : {};
+    var latency = num(d.latency_ms);
+    var press = num(d.press_to_freeze_ms);
+    var line = "stop " + source + ": " + (latency === null ? "server latency not reported" : "server " + fmtMs(latency) + " ms")
+      + ", round trip " + fmtMs(roundTripMs) + " ms";
+    if (press !== null && press >= 0 && press <= roundTripMs + 5) line += ", press to freeze " + fmtMs(press) + " ms";
+    if (typeof releaseMs === "number" && isFinite(releaseMs) && releaseMs >= 0) line += ", talk release to response " + fmtMs(releaseMs) + " ms";
+    return attempt ? line + " (re-send " + attempt + ")" : line;
+  }
 
   function isTyping(ev) {
     var t = ev.target;
@@ -456,6 +504,59 @@
     return "";
   }
 
+  // The measured latency of a STOP goes on the timeline entry of its own `stopped` event. The HTTP
+  // reply and the WS event race over two connections, so whichever arrives second completes the pair.
+  // The server puts the same source, latency_ms and press_to_freeze_ms in a /stop reply and in that
+  // stop's event detail, so a line goes only to the entry with its own key (stopKey): a console or
+  // API stop landing in between never takes it, nor does another client's stop of the same source
+  // unless all three numbers match. An older server reports none (both keys null), and then a reply
+  // takes the newest entry added since the press, or else the next entry to arrive. Lines and entries
+  // still unpaired after STOP_PAIR_MS are dropped; the console keeps the line.
+  var stopNotes = []; // measured lines waiting for their entry, oldest first: {text, key, at}
+  var stopEntries = []; // `stopped` entries waiting for their line, oldest first: {body, key, at}
+
+  // "<source>|<latency_ms>|<press_to_freeze_ms>" of a /stop reply or a `stopped` detail; null without a
+  // latency (an older server, or a stop that did not come through /stop). latency_ms alone is a weak
+  // fingerprint where the server's clock is coarse (Python 3.12's time.monotonic() ticks every 15.6 ms
+  // on Windows, so it mostly reads 0), while press_to_freeze_ms comes from the press's own t_client_ms
+  // and so tells two stops of the same source apart whenever the server measured it.
+  function stopKey(source, latency, press) {
+    if (latency === null) return null;
+    return String(source === undefined || source === null ? "" : source).trim().toLowerCase() + "|" + latency + "|" + press;
+  }
+
+  function dropStale(list, now) {
+    while (list.length && now - list[0].at > STOP_PAIR_MS) list.shift();
+  }
+
+  function noteStop(body, text) {
+    body.appendChild(document.createTextNode(" - " + text));
+    if (body.title) body.title += " - " + text;
+  }
+
+  // A measured STOP's line: onto its entry when that arrived first, else it waits for the entry.
+  function showStopLatency(text, key, pressedAt) {
+    var now = nowMs();
+    dropStale(stopEntries, now);
+    for (var i = stopEntries.length - 1; i >= 0; i--) {
+      if (stopEntries[i].key === key && stopEntries[i].at >= pressedAt) { noteStop(stopEntries.splice(i, 1)[0].body, text); return; }
+    }
+    stopNotes.push({ text: text, key: key, at: now });
+    if (stopNotes.length > 10) stopNotes.shift();
+  }
+
+  // A new `stopped` entry takes the oldest line waiting with its key, or waits for one.
+  function pairStopEntry(body, d) {
+    var now = nowMs();
+    var key = stopKey(d.source, num(d.latency_ms), num(d.press_to_freeze_ms));
+    dropStale(stopNotes, now);
+    for (var i = 0; i < stopNotes.length; i++) {
+      if (stopNotes[i].key === key) { noteStop(body, stopNotes.splice(i, 1)[0].text); return; }
+    }
+    stopEntries.push({ body: body, key: key, at: now });
+    if (stopEntries.length > 10) stopEntries.shift();
+  }
+
   function addTimeline(ev, d) {
     var list = $("timeline");
     var nearBottom = list.scrollHeight - list.scrollTop - list.clientHeight < 60;
@@ -469,6 +570,7 @@
     body.appendChild(document.createTextNode(text));
     if (full !== text) body.title = full;
     li.appendChild(body);
+    if (ev.stage === "stopped") pairStopEntry(body, d);
     var prev = list.querySelector("li.latest");
     if (prev) prev.classList.remove("latest");
     li.classList.add("latest");
@@ -891,19 +993,33 @@
   // hold the button and Esc for ever with the headline stuck on "freezing". Past the deadline the
   // human is told to pull the plug, the request is re-sent STOP_RETRIES times (freeze is idempotent)
   // and the button and Esc stay live throughout.
-  async function stop(source, attempt) {
+  // The request body {source, t_client_ms} and the reply's latency_ms and press_to_freeze_ms are the
+  // STOP latency measurement: `source` is "esc" or "button" on the wire, and `press` (pressStamp of
+  // the key or click event) holds the press on the wall clock for the server (press_to_freeze_ms on
+  // the same laptop) and on the monotonic clock for the round trip measured here. Both stay fixed
+  // across re-sends.
+  async function stop(source, attempt, press) {
     if (stopInFlight) return;
     stopInFlight = true;
     attempt = attempt || 0;
+    if (!press) press = pressStamp(null);
+    var wire = String(source).toLowerCase();
+    var body = { source: wire, t_client_ms: press.wall };
     showStopped(true);
     setHeadline(task.id, attempt
       ? "STOP (" + source + ") sent again, " + attempt + " of " + STOP_RETRIES + ": no answer from the orchestrator yet." + PLUG
       : "STOP (" + source + "): freezing the arm in place", "stopped");
     var retry = false;
     try {
-      var r = await api("POST", "/stop", undefined, STOP_TIMEOUT_MS);
+      // Nothing is awaited ahead of this request: it must leave as fast as it always has.
+      var r = await api("POST", "/stop", body, STOP_TIMEOUT_MS);
+      var roundTrip = nowMs() - press.at;
       if (!r.ok) throw new Error(errText(r));
       setHeadline(task.id, "STOPPED - arm frozen in place with torque on. Press Resume to send it home.", "stopped");
+      var d = isObject(r.data) ? r.data : {};
+      var line = stopLine(wire, d, roundTrip, attempt);
+      if (window.console && console.log) console.log(line);
+      showStopLatency(line, stopKey(typeof d.source === "string" ? d.source : wire, num(d.latency_ms), num(d.press_to_freeze_ms)), press.at);
     } catch (e) {
       if (e && e.name === "TimeoutError") {
         retry = attempt < STOP_RETRIES;
@@ -914,7 +1030,7 @@
       }
     } finally {
       stopInFlight = false;
-      if (retry) setTimeout(function () { stop(source, attempt + 1); }, 250);
+      if (retry) setTimeout(function () { stop(source, attempt + 1, press); }, 250);
       else pollState();
     }
   }
@@ -936,6 +1052,37 @@
     }
   }
 
+  // The base name of a server path ("/" and "\" both separate); the full path goes in the title.
+  function baseName(p) { var parts = String(p).split(/[\\/]/); return parts[parts.length - 1] || String(p); }
+
+  function fmtCm(v) { return v === null ? "?" : v.toFixed(2); }
+
+  function resultLine(text, cls) { return el("span", "line" + (cls ? " " + cls : ""), text); }
+
+  // The /calibrate reply: the marker-consistency mean as before, then the independent check points
+  // when the server has a recorded file for them ({n, mean_cm, max_cm, ok, file}, the tape-measured
+  // spots of docs/table-calibration.md). null, or an older server that does not report them, says
+  // so in the second line instead of hiding it.
+  function renderCalibration(data) {
+    var cm = num(data.error_cm);
+    if (cm === null) throw new Error("no error_cm in the reply");
+    var node = $("calib-result");
+    node.innerHTML = "";
+    node.className = "result";
+    node.appendChild(resultLine("marker check " + cm.toFixed(2) + " cm mean" + (cm > 1.0 ? " - recalibrate" : ""), cm > 1.0 ? "bad" : "ok"));
+    var cp = data.check_points;
+    if (!isObject(cp)) { node.appendChild(resultLine("no independent check points recorded", "")); return; }
+    var ok = cp.ok === true;
+    var line = resultLine(count(cp.n) + "-point check: mean " + fmtCm(num(cp.mean_cm)) + " cm, max " + fmtCm(num(cp.max_cm)) + " cm (" + (ok ? "ok" : "FAIL") + ")", ok ? "ok" : "bad");
+    if (cp.file) {
+      var file = el("span", "file", short(baseName(cp.file), 60));
+      file.title = String(cp.file);
+      line.appendChild(document.createTextNode(" "));
+      line.appendChild(file);
+    }
+    node.appendChild(line);
+  }
+
   async function calibrate() {
     var btn = $("btn-calibrate");
     btn.disabled = true;
@@ -943,9 +1090,7 @@
     try {
       var r = await api("POST", "/calibrate");
       if (!r.ok) throw new Error(errText(r));
-      var cm = num(r.data && r.data.error_cm);
-      if (cm === null) throw new Error("no error_cm in the reply");
-      setResult("calib-result", "marker check " + cm.toFixed(2) + " cm mean" + (cm > 1.0 ? " - recalibrate" : ""), cm > 1.0 ? "bad" : "ok");
+      renderCalibration(isObject(r.data) ? r.data : {});
     } catch (e) {
       setResult("calib-result", "calibration check failed: " + e.message, "bad");
     } finally {
@@ -1039,7 +1184,7 @@
   }
 
   function bind() {
-    $("btn-stop").addEventListener("click", function () { stop("button"); });
+    $("btn-stop").addEventListener("click", function (ev) { stop("button", 0, pressStamp(ev)); });
     $("btn-resume").addEventListener("click", resume);
     $("btn-calibrate").addEventListener("click", calibrate);
     $("btn-torque-off").addEventListener("click", torqueOff);
@@ -1048,7 +1193,7 @@
     $("btn-load-backup").addEventListener("click", function () { libraryAction("/load_backup", "load backup", "btn-load-backup"); });
     // Esc anywhere on the page freezes the arm. Capture phase so no widget can swallow it.
     window.addEventListener("keydown", function (ev) {
-      if (ev.key === "Escape" || ev.key === "Esc") { ev.preventDefault(); stop("Esc"); }
+      if (ev.key === "Escape" || ev.key === "Esc") { ev.preventDefault(); stop("Esc", 0, pressStamp(ev)); }
     }, true);
     // Push to talk from anywhere on the dashboard: T keydown/keyup are forwarded to the embedded
     // voice page, which handles the message exactly like its own key events. A keydown while
@@ -1082,11 +1227,23 @@
       talkKeyDown = false;
       postTalk("blur", false);
     });
-    // The embedded /voice page posts its own STOP and tells us so we show it at once.
+    // The embedded /voice page posts its own STOP and tells us so we show it at once; its measured
+    // round_trip_ms with the reply's latency_ms and press_to_freeze_ms (when its /stop was answered),
+    // and for a spoken stop release_to_response_ms, go on the timeline entry like ours. Its press is
+    // known here only as the round trip before this message, so the pairing allows a little slack.
     window.addEventListener("message", function (ev) {
       if (ev.origin !== location.origin) return;
       var m = ev.data;
-      if (m && m.type === "vara-stopped") { showStopped(true); setHeadline(task.id, "STOPPED from the voice page (" + (m.source || "voice") + ")", "stopped"); pollState(); }
+      if (!m || m.type !== "vara-stopped") return;
+      var source = String(m.source || "voice");
+      showStopped(true);
+      setHeadline(task.id, "STOPPED from the voice page (" + short(source, 40) + ")", "stopped");
+      var roundTrip = num(m.round_trip_ms);
+      if (roundTrip !== null) {
+        showStopLatency(stopLine(short(source, 40).toLowerCase(), m, roundTrip, 0, num(m.release_to_response_ms)) + " (voice page)",
+          stopKey(source, num(m.latency_ms), num(m.press_to_freeze_ms)), nowMs() - roundTrip - VOICE_PRESS_SLACK_MS);
+      }
+      pollState();
     });
   }
 

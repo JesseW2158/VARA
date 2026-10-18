@@ -6,9 +6,15 @@
 // Chart.js arriving late; a 5 MB curves.json; a hung and a failing /stop; a hung /state; 5000-character
 // texts; trial rows, the LOCAL badge row and the "rejected:" label; non-integer candidate indices; the
 // DEMO countdown under clock skew; junk /state entries and a throwing render; T forwarding to the voice
-// iframe; and on the voice page: the realtime handshake, tool calls (no call_id, non-JSON arguments,
-// 409), end-of-task announcements with prototype-named task ids, junk audio deltas and raw frames, and
-// the forwarded key and blur messages.
+// iframe; the STOP latency measurement (the {source, t_client_ms} body, the console line and the
+// timeline entry in both orders of reply and event, an older reply shape, no performance.now, a
+// re-send, the voice page's numbers reaching the dashboard, a line pairing only with its own stop's
+// entry while other stops land in between, also when the server's latency_ms is quantized to 0, and
+// the press taken from the event's timeStamp); the
+// calibration result with and without check_points; and on the voice page: the realtime handshake,
+// tool calls (no call_id, non-JSON arguments, 409), end-of-task announcements with prototype-named
+// task ids, junk audio deltas and raw frames, the forwarded key and blur messages, and the stop
+// tool's latency line, timed from the push-to-talk release for a spoken stop.
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -585,6 +591,362 @@ const JUNK_CURVES = { body: { variants: [
   await hung.timers.flush();
   await hung.timers.tick(8001);
   check("unavailable runtime labels do not delay Esc or claim a physical run", hung.net.count("POST /stop") === 1 && /Runtime mode unavailable/.test(hung.text("runtime-banner")) && clean(hung), hung.text("runtime-banner"));
+}
+
+// ------------------------------------------------------------ 17. STOP latency: the body, the console line, the timeline entry in both orders
+{
+  // Each /stop takes 37 ms of virtual time (skipped by the route, so the page's performance.now()
+  // round trip is exact) and the reply carries the server's own request-to-freeze latency and its
+  // press-to-freeze time (the body's wall-clock stamp against the server's clock); the stop's
+  // `stopped` event carries the same source, latency_ms and press_to_freeze_ms in its detail, as
+  // agents/orchestrator.py sends them. A gate holds the second reply back so the event comes first.
+  let h;
+  const bodies = [];
+  let gate = null;
+  let latency = 2.5;
+  let pressToFreeze = 20; // fits inside the 37 ms round trip: the clocks agree
+  const stopRoute = async (opts) => {
+    bodies.push({ headers: opts.headers, body: JSON.parse(opts.body) });
+    if (gate) await gate;
+    h.timers.skip(37);
+    return { body: { state: "stopped", task_id: "t-0001", latency_ms: latency, press_to_freeze_ms: pressToFreeze, source: JSON.parse(opts.body).source } };
+  };
+  const stoppedEvent = (t, source, ms, press) => ({ t, task_id: "t-0001", stage: "stopped", detail: { reason: "stop requested", source, latency_ms: ms, press_to_freeze_ms: press } });
+  h = dashboard({ "POST /stop": stopRoute });
+  await h.timers.flush();
+  const ws = eventsSocket(h);
+  await h.timers.tick(5000);
+  const before = Date.now();
+  h.fire("keydown", { key: "Escape" });
+  const immediate = h.net.count("POST /stop"); // counted before any await ran: nothing is awaited ahead of the request
+  await h.timers.flush();
+  const after = Date.now();
+  const entries = () => h.doc.getElementById("timeline").querySelectorAll("li.stopped .body").map((b) => b.textContent);
+  const stopLines = () => h.logs.filter((l) => /^stop /.test(l));
+  const e0 = entries();
+  ws.receive(stoppedEvent(1700000100.5, "esc", 2.5, 20));
+  const e1 = entries();
+  check("Esc sends POST /stop at once with the JSON body {source: 'esc', t_client_ms: Date.now() at the key press}",
+    immediate === 1 && bodies.length === 1 && bodies[0].body.source === "esc" && bodies[0].body.t_client_ms >= before && bodies[0].body.t_client_ms <= after && bodies[0].headers["Content-Type"] === "application/json",
+    { immediate, bodies, before, after });
+  check("one console line 'stop esc: server 2.5 ms, round trip 37 ms, press to freeze 20 ms'; the stopped entry arriving after the reply carries it",
+    stopLines().join("|") === "stop esc: server 2.5 ms, round trip 37 ms, press to freeze 20 ms" && e0.length === 0 && e1.length === 1 && /\(stop requested\) - stop esc: server 2\.5 ms, round trip 37 ms, press to freeze 20 ms$/.test(e1[0]),
+    { logs: h.logs, e0, e1 });
+  let release;
+  gate = new Promise((r) => { release = r; });
+  latency = 3.75;
+  pressToFreeze = 412; // a skewed clock: more than the round trip, so it is left out rather than shown wrong
+  h.doc.getElementById("btn-stop").click();
+  await h.timers.flush();
+  ws.receive(stoppedEvent(1700000101.5, "button", 3.75, 412));
+  const e2before = entries();
+  release();
+  await h.timers.flush();
+  const e2 = entries();
+  check("the STOP button sends source 'button'; a stopped entry that arrived before the reply is completed when the reply lands (the earlier entry untouched); a press-to-freeze time beyond the round trip is left out",
+    bodies.length === 2 && bodies[1].body.source === "button" && e2before.length === 2 && !/round trip/.test(e2before[1]) && /\(stop requested\) - stop button: server 3\.8 ms, round trip 37 ms$/.test(e2[1]) && e2[0] === e1[0] && stopLines().length === 2 && clean(h),
+    { bodies: bodies.map((b) => b.body), e2before, e2, logs: h.logs, errors: h.errors });
+  ws.receive(stoppedEvent(1700000102.5, "api", null, null));
+  const e3 = entries();
+  check("a stopped event with no measured stop pending (an API or console stop: latency_ms null) gets no latency line",
+    e3.length === 3 && /\(stop requested\)$/.test(e3[2]) && clean(h), { e3 });
+}
+
+// ------------------------------------------------------------ 18. STOP latency against an older server, without performance.now, and across a re-send
+{
+  const bodies = [];
+  const h = dashboard({ "POST /stop": (opts) => { bodies.push(JSON.parse(opts.body)); return { body: { state: "stopped", task_id: null } }; } }, (sb) => { delete sb.performance; });
+  await h.timers.flush();
+  const before = Date.now();
+  h.fire("keydown", { key: "Escape" });
+  await h.timers.flush();
+  const after = Date.now();
+  const ws = eventsSocket(h);
+  ws.receive({ t: 1700000200, task_id: null, stage: "stopped", detail: { reason: "Esc pressed" } });
+  const entry = h.doc.getElementById("timeline").querySelectorAll("li.stopped .body").map((b) => b.textContent);
+  const line = h.logs.filter((l) => /^stop /.test(l));
+  check("without performance.now the body's t_client_ms is Date.now() at the press; an older reply without latency_ms logs 'server latency not reported' with the round trip, on the entry too",
+    bodies.length === 1 && bodies[0].source === "esc" && bodies[0].t_client_ms >= before && bodies[0].t_client_ms <= after && line.length === 1 && /^stop esc: server latency not reported, round trip \d+(\.\d)? ms$/.test(line[0]) && entry.length === 1 && entry[0].endsWith(" - " + line[0]) && /STOPPED - arm frozen/.test(h.text("headline")) && clean(h),
+    { bodies, before, after, line, entry, headline: h.text("headline"), errors: h.errors });
+}
+{
+  const bodies = [];
+  let calls = 0;
+  const h = dashboard({ "POST /stop": (opts) => { calls += 1; bodies.push(JSON.parse(opts.body)); return calls === 1 ? "hang" : { body: { state: "stopped", task_id: null, latency_ms: 1.25, press_to_freeze_ms: -3, source: "esc" } }; } });
+  await h.timers.flush();
+  await h.timers.tick(1000);
+  const before = Date.now();
+  h.fire("keydown", { key: "Escape" });
+  const after = Date.now();
+  await h.timers.tick(3000); // the deadline: the first request is abandoned
+  await h.timers.tick(250); // the automatic re-send, answered at once
+  await h.timers.flush();
+  const line = h.logs.filter((l) => /^stop /.test(l));
+  check("a re-send after a silent /stop keeps the press time: both bodies carry the original t_client_ms and the line reads 'round trip 3250 ms (re-send 1)'; a negative press-to-freeze time is left out",
+    bodies.length === 2 && bodies.every((b) => b.source === "esc" && b.t_client_ms === bodies[0].t_client_ms && b.t_client_ms >= before && b.t_client_ms <= after) && line.join("|") === "stop esc: server 1.3 ms, round trip 3250 ms (re-send 1)" && clean(h),
+    { bodies, before, after, line, errors: h.errors, unhandled });
+}
+
+// ------------------------------------------------------------ 19. the dashboard shows the voice page's STOP numbers (vara-stopped message)
+{
+  const h = dashboard({});
+  await h.timers.flush();
+  const ws = eventsSocket(h);
+  const entries = () => h.doc.getElementById("timeline").querySelectorAll("li.stopped .body").map((b) => b.textContent);
+  // The server's event detail carries the same latency_ms and press_to_freeze_ms as the reply the voice page relays.
+  const stoppedEvent = (t, source, ms, press = ms === null ? null : 20) => ({ t, task_id: "t-0001", stage: "stopped", detail: { reason: "stop requested", source, latency_ms: ms, press_to_freeze_ms: press } });
+  h.fire("message", { origin: ORIGIN, data: { type: "vara-stopped", source: "voice", latency_ms: 2.5, press_to_freeze_ms: 20, round_trip_ms: 37, release_to_response_ms: 1240 } });
+  const head1 = h.text("headline"); // before the stopped event, which sets the generic STOPPED headline as it always did
+  ws.receive(stoppedEvent(1700000300, "voice", 2.5));
+  const e1 = entries();
+  h.fire("message", { origin: ORIGIN, data: { type: "vara-stopped", source: "Esc", latency_ms: null, press_to_freeze_ms: null, round_trip_ms: null, release_to_response_ms: null } });
+  ws.receive(stoppedEvent(1700000301, "esc", 1.1));
+  const e2 = entries();
+  h.fire("message", { origin: "http://evil.example", data: { type: "vara-stopped", source: "voice", latency_ms: 2.5, press_to_freeze_ms: 20, round_trip_ms: 37 } });
+  ws.receive(stoppedEvent(1700000302, "voice", 2.5));
+  const e3 = entries();
+  // The entry first, then the message: the voice page's reply and the WS event race as ours do.
+  ws.receive(stoppedEvent(1700000303, "button", 4.25, 9));
+  h.fire("message", { origin: ORIGIN, data: { type: "vara-stopped", source: "button", latency_ms: 4.25, press_to_freeze_ms: 9, round_trip_ms: 12, release_to_response_ms: null } });
+  const e4 = entries();
+  check("a vara-stopped message with the voice page's numbers puts 'stop voice: server 2.5 ms, round trip 37 ms, press to freeze 20 ms, talk release to response 1240 ms (voice page)' on the stopped entry; the dashboard logs no line of its own",
+    e1.length === 1 && /\(stop requested\) - stop voice: server 2\.5 ms, round trip 37 ms, press to freeze 20 ms, talk release to response 1240 ms \(voice page\)$/.test(e1[0]) && /STOPPED from the voice page \(voice\)/.test(head1) && h.logs.filter((l) => /^stop /.test(l)).length === 0,
+    { e1, head1, logs: h.logs });
+  check("a voice-page stop whose /stop was not answered (round_trip_ms null), or a message from another origin, adds nothing to the entry",
+    e2.length === 2 && /\(stop requested\)$/.test(e2[1]) && e3.length === 3 && /\(stop requested\)$/.test(e3[2]) && clean(h), { e2, e3, errors: h.errors });
+  check("a message landing after its stopped entry completes that entry ('stop button: server 4.3 ms, round trip 12 ms, press to freeze 9 ms (voice page)'), not the earlier unpaired ones",
+    e4.length === 4 && /\(stop requested\) - stop button: server 4\.3 ms, round trip 12 ms, press to freeze 9 ms \(voice page\)$/.test(e4[3]) && e4[2] === e3[2] && e4[1] === e2[1] && clean(h), { e4, errors: h.errors });
+}
+
+// ------------------------------------------------------------ 20. voice page: the stop tool measures its latency and hands the numbers to the dashboard
+{
+  let h;
+  const bodies = [];
+  h = voicePage({ "POST /stop": (opts) => { bodies.push({ headers: opts.headers, body: JSON.parse(opts.body) }); h.timers.skip(37); return { body: { state: "stopped", task_id: "t-0001", latency_ms: 2.5, press_to_freeze_ms: 20, source: JSON.parse(opts.body).source } }; } });
+  await h.timers.flush();
+  const rt = await connectVoice(h);
+  await h.timers.tick(5000);
+  const before = Date.now();
+  rt.receive({ type: "response.function_call_arguments.done", name: "stop", call_id: "s1", arguments: "{}" });
+  const immediate = h.net.count("POST /stop");
+  await h.timers.flush();
+  const after = Date.now();
+  const stopped = () => h.posted.filter((p) => p.m && p.m.type === "vara-stopped");
+  const s1 = stopped();
+  check("the voice stop tool posts {source: 'voice', t_client_ms: Date.now()} at once, answers 'stopped', logs 'stop voice: server 2.5 ms, round trip 37 ms, press to freeze 20 ms' and shows the line in the voice log",
+    immediate === 1 && bodies.length === 1 && bodies[0].body.source === "voice" && bodies[0].body.t_client_ms >= before && bodies[0].body.t_client_ms <= after && bodies[0].headers["Content-Type"] === "application/json" && rt.outputs().s1 === "stopped" && h.logs.filter((l) => /^stop /.test(l)).join("|") === "stop voice: server 2.5 ms, round trip 37 ms, press to freeze 20 ms" && h.logLines("sys", /^.{8}sysSTOP sent \(voice\): stop voice: server 2\.5 ms, round trip 37 ms, press to freeze 20 ms$/).length === 1,
+    { immediate, bodies, before, after, output: rt.outputs().s1, logs: h.logs, sys: h.logLines("sys", /STOP sent/).map((li) => li.textContent) });
+  check("the parent dashboard gets vara-stopped with source 'voice', latency_ms 2.5, press_to_freeze_ms 20 and round_trip_ms 37 on our origin",
+    s1.length === 1 && s1[0].m.source === "voice" && s1[0].m.latency_ms === 2.5 && s1[0].m.press_to_freeze_ms === 20 && s1[0].m.round_trip_ms === 37 && s1[0].origin === ORIGIN, { s1 });
+  h.fire("keydown", { key: "Escape" });
+  await h.timers.flush();
+  h.doc.getElementById("btn-voice-stop").click();
+  await h.timers.flush();
+  const s2 = stopped();
+  check("Esc and the voice page's button send 'esc' and 'button' on the wire and keep the 'Esc' and 'button' labels in their messages to the dashboard",
+    bodies.length === 3 && bodies[1].body.source === "esc" && bodies[2].body.source === "button" && s2.length === 3 && s2[1].m.source === "Esc" && s2[1].m.round_trip_ms === 37 && s2[2].m.source === "button" && clean(h),
+    { bodies: bodies.map((b) => b.body), s2: s2.map((p) => p.m), errors: h.errors });
+}
+
+// ------------------------------------------------------------ 20b. voice page: a spoken stop is timed from the push-to-talk release
+{
+  let h;
+  h = voicePage({
+    "POST /stop": () => { h.timers.skip(37); return { body: { state: "stopped", task_id: "t-0001", latency_ms: 2.5, press_to_freeze_ms: 20, source: "voice" } }; },
+    "POST /command": { body: { task_id: "t-0002" } },
+  });
+  await h.timers.flush();
+  const rt = await connectVoice(h);
+  // Hold T, speak for 0.2 s (4800 samples at 24 kHz through the microphone processor) and release:
+  // the audio is committed at the release, which ends the spoken turn.
+  const speak = async () => {
+    h.fire("keydown", { key: "t" });
+    await h.timers.flush();
+    const ctx = h.audio[h.audio.length - 1];
+    ctx.processors[ctx.processors.length - 1].onaudioprocess({ inputBuffer: { getChannelData: () => new Float32Array(4800).fill(0.1) } });
+    h.fire("keyup", { key: "t" });
+    await h.timers.flush();
+  };
+  const call = (callId, name, args) => rt.receive({ type: "response.function_call_arguments.done", name, call_id: callId, arguments: args });
+  const stopLines = () => h.logs.filter((l) => /^stop /.test(l));
+  const stopped = () => h.posted.filter((p) => p.m && p.m.type === "vara-stopped").map((p) => p.m);
+  await h.timers.tick(5000);
+  await speak();
+  const commits = rt.msgs("input_audio_buffer.commit").length;
+  await h.timers.tick(1200); // the model hears "stop" and calls the tool 1.2 s after the release
+  call("v1", "stop", "{}");
+  await h.timers.flush();
+  const l1 = stopLines();
+  const m1 = stopped();
+  check("a stop tool call answering a spoken turn logs 'stop voice: server 2.5 ms, round trip 37 ms, press to freeze 20 ms, talk release to response 1237 ms' and hands release_to_response_ms 1237 to the dashboard",
+    commits === 1 && l1.join("|") === "stop voice: server 2.5 ms, round trip 37 ms, press to freeze 20 ms, talk release to response 1237 ms" && m1.length === 1 && m1[0].release_to_response_ms === 1237 && m1[0].round_trip_ms === 37 && rt.outputs().v1 === "stopped" && h.logLines("sys", /STOP sent \(voice\): .*talk release to response 1237 ms$/).length === 1,
+    { commits, l1, m1, outputs: rt.outputs() });
+  // The release belongs to the first tool call after it: a second stop call, a stop after do_task
+  // answered the turn, and Esc after another turn carry none.
+  call("v2", "stop", "{}");
+  await h.timers.flush();
+  await speak();
+  call("v3", "do_task", "{\"text\": \"put the juice box in the tray\"}");
+  await h.timers.flush();
+  call("v4", "stop", "{}");
+  await h.timers.flush();
+  await speak();
+  h.fire("keydown", { key: "Escape" });
+  await h.timers.flush();
+  const l2 = stopLines().slice(1);
+  const m2 = stopped().slice(1);
+  check("the release goes to the first tool call after it only: a second stop call, a stop after do_task answered the turn, and Esc report no release time",
+    l2.length === 3 && l2.every((l) => !/talk release/.test(l)) && /^stop voice: /.test(l2[0]) && /^stop voice: /.test(l2[1]) && /^stop esc: /.test(l2[2]) && m2.length === 3 && m2.every((m) => m.release_to_response_ms === null) && rt.outputs().v3 === "On it" && clean(h),
+    { l2, m2, outputs: rt.outputs(), errors: h.errors, unhandled });
+}
+
+// ------------------------------------------------------------ 20c. voice page: an older server's /stop reply, and a /stop answering 500
+{
+  let h;
+  let reply = { body: { state: "stopped", task_id: null } }; // an older server: no source, latency_ms or press_to_freeze_ms
+  h = voicePage({ "POST /stop": () => { h.timers.skip(21); return reply; } });
+  await h.timers.flush();
+  const rt = await connectVoice(h);
+  const stopLines = () => h.logs.filter((l) => /^stop /.test(l));
+  const stopped = () => h.posted.filter((p) => p.m && p.m.type === "vara-stopped").map((p) => p.m);
+  rt.receive({ type: "response.function_call_arguments.done", name: "stop", call_id: "o1", arguments: "{}" });
+  await h.timers.flush();
+  const l1 = stopLines();
+  const m1 = stopped();
+  check("against an older server the voice stop tool logs 'stop voice: server latency not reported, round trip 21 ms' and hands latency_ms null and round_trip_ms 21 to the dashboard",
+    l1.join("|") === "stop voice: server latency not reported, round trip 21 ms" && m1.length === 1 && m1[0].latency_ms === null && m1[0].press_to_freeze_ms === null && m1[0].round_trip_ms === 21 && rt.outputs().o1 === "stopped",
+    { l1, m1, outputs: rt.outputs() });
+  reply = { status: 500, body: { detail: "boom" } };
+  rt.receive({ type: "response.function_call_arguments.done", name: "stop", call_id: "o2", arguments: "{}" });
+  await h.timers.flush();
+  const m2 = stopped();
+  check("a voice /stop answering 500 logs no latency line, answers the tool with the HTTP error and tells the dashboard with round_trip_ms null, so its timeline gets no line",
+    stopLines().length === 1 && m2.length === 2 && m2[1].round_trip_ms === null && m2[1].latency_ms === null && rt.outputs().o2 === "error: POST /stop returned HTTP 500" && h.logLines("sys", /^.{8}sysSTOP sent \(voice\)$/).length === 1 && h.status() === "STOPPED" && clean(h),
+    { logs: h.logs, m2, outputs: rt.outputs(), status: h.status(), errors: h.errors });
+}
+
+// ------------------------------------------------------------ 21. Check calibration: the marker line and the independent check points
+{
+  let reply = null;
+  const h = dashboard({ "POST /calibrate": () => reply });
+  await h.timers.flush();
+  const node = h.doc.getElementById("calib-result");
+  const lines = () => node.querySelectorAll(".line").map((l) => ({ text: l.textContent, cls: l.className, file: l.querySelector(".file") ? l.querySelector(".file").title : null }));
+  const run = async (r) => { reply = r; h.doc.getElementById("btn-calibrate").click(); await h.timers.flush(); return lines(); };
+  const good = await run({ body: { error_cm: 0.8, check_points: { n: 5, mean_cm: 0.31, max_cm: 0.62, ok: true, file: "measurements/check-points-20261017T120000.json" } } });
+  const nul = await run({ body: { error_cm: 0.8, check_points: null } });
+  const old = await run({ body: { error_cm: 0.8 } });
+  const bad = await run({ body: { error_cm: 1.4, check_points: { n: 5, mean_cm: 1.2, max_cm: 3.05, ok: false, file: "C:\\Users\\jesse\\GitHub\\VARA\\measurements\\check-points.json" } } });
+  const junk = await run({ body: { error_cm: 0.5, check_points: {} } });
+  const err = await run({ status: 400, body: { detail: "calibration marker check failed: mean 1.2 cm" } });
+  const errText = h.text("calib-result");
+  const errClass = node.className;
+  const noCm = await run({ body: { check_points: null } });
+  check("check_points present: 'marker check 0.80 cm mean' (ok), then '5-point check: mean 0.31 cm, max 0.62 cm (ok)' with the file's base name and its full path in the title",
+    good.length === 2 && good[0].text === "marker check 0.80 cm mean" && good[0].cls === "line ok" && good[1].text === "5-point check: mean 0.31 cm, max 0.62 cm (ok) check-points-20261017T120000.json" && good[1].cls === "line ok" && good[1].file === "measurements/check-points-20261017T120000.json",
+    { good });
+  check("check_points null, and an older reply without the key: the second line says 'no independent check points recorded'",
+    nul.length === 2 && nul[0].text === "marker check 0.80 cm mean" && nul[1].text === "no independent check points recorded" && nul[1].cls === "line" && JSON.stringify(old) === JSON.stringify(nul),
+    { nul, old });
+  check("a failed check: 'marker check 1.40 cm mean - recalibrate' (bad) and '5-point check: mean 1.20 cm, max 3.05 cm (FAIL)' (bad) with a Windows path's base name",
+    bad.length === 2 && bad[0].text === "marker check 1.40 cm mean - recalibrate" && bad[0].cls === "line bad" && bad[1].text === "5-point check: mean 1.20 cm, max 3.05 cm (FAIL) check-points.json" && bad[1].cls === "line bad" && bad[1].file === "C:\\Users\\jesse\\GitHub\\VARA\\measurements\\check-points.json",
+    { bad });
+  check("an empty check_points object reads '?-point check: mean ? cm, max ? cm (FAIL)'; a 400 reply and a reply without error_cm show the failure line as before",
+    junk.length === 2 && junk[1].text === "?-point check: mean ? cm, max ? cm (FAIL)" && junk[1].cls === "line bad" && err.length === 0 && errText === "calibration check failed: calibration marker check failed: mean 1.2 cm" && errClass === "result bad" && noCm.length === 0 && h.text("calib-result") === "calibration check failed: no error_cm in the reply" && clean(h),
+    { junk, err, errText, errClass, noCm, last: h.text("calib-result"), errors: h.errors });
+}
+
+// ------------------------------------------------------------ 22. STOP lines pair with their own entry; the press comes from the event's timeStamp
+{
+  let h;
+  const bodies = [];
+  let gate = null;
+  let latency = 2.5;
+  let press = 30;
+  const stopRoute = async (opts) => {
+    const body = JSON.parse(opts.body);
+    bodies.push(body);
+    if (gate) await gate;
+    h.timers.skip(37);
+    return { body: { state: "stopped", task_id: "t-0001", latency_ms: latency, press_to_freeze_ms: press, source: body.source } };
+  };
+  // A /stop's event as the server sends it, with the reply's latency_ms and press_to_freeze_ms in its
+  // detail; the console Esc watcher's stop has reason "Esc pressed" and no latency.
+  const stoppedEvent = (t, source, ms, pressMs = ms === null ? null : 30) => ({ t, task_id: "t-0001", stage: "stopped", detail: { reason: source === "keyboard" ? "Esc pressed" : "stop requested", source, latency_ms: ms, press_to_freeze_ms: pressMs } });
+  h = dashboard({ "POST /stop": stopRoute });
+  await h.timers.flush();
+  const ws = eventsSocket(h);
+  await h.timers.tick(5000);
+  const entries = () => h.doc.getElementById("timeline").querySelectorAll("li.stopped .body").map((b) => b.textContent);
+  const stopLines = () => h.logs.filter((l) => /^stop /.test(l));
+  ws.receive(stoppedEvent(1700000400, "esc", 2.5)); // an older stop with the very same key (source and both numbers), before the press
+  await h.timers.tick(1000);
+  h.fire("keydown", { key: "Escape" });
+  await h.timers.flush();
+  ws.receive(stoppedEvent(1700000401, "keyboard", null)); // the console Esc watcher
+  ws.receive(stoppedEvent(1700000402, "esc", 0.9)); // another tab's Esc
+  ws.receive(stoppedEvent(1700000403, "esc", 2.5)); // ours
+  const a = entries();
+  check("a reply waits for its own stopped entry (same source, latency_ms and press_to_freeze_ms): an older entry with the same key, the console watcher's stop and another tab's Esc landing in between get no line",
+    a.length === 4 && /\(stop requested\)$/.test(a[0]) && /\(Esc pressed\)$/.test(a[1]) && /\(stop requested\)$/.test(a[2]) && /\(stop requested\) - stop esc: server 2\.5 ms, round trip 37 ms, press to freeze 30 ms$/.test(a[3]),
+    { a });
+  let release;
+  gate = new Promise((r) => { release = r; });
+  latency = 1.75;
+  h.doc.getElementById("btn-stop").click();
+  await h.timers.flush();
+  ws.receive(stoppedEvent(1700000404, "button", 1.75)); // ours, before the reply
+  ws.receive(stoppedEvent(1700000405, "api", null)); // a typed "stop" routed to stop, after ours
+  release();
+  await h.timers.flush();
+  const b = entries();
+  check("an entry that came before its reply gets the line even when another stop's entry landed after it (the newest entry is not assumed to be ours)",
+    b.length === 6 && /\(stop requested\) - stop button: server 1\.8 ms, round trip 37 ms, press to freeze 30 ms$/.test(b[4]) && /\(stop requested\)$/.test(b[5]) && clean(h), { b, errors: h.errors });
+  // Python 3.12's time.monotonic() ticks every 15.6 ms on Windows, so the server's latency_ms reads 0
+  // for nearly every stop; press_to_freeze_ms comes from each press's own t_client_ms, so it still
+  // tells two Esc stops apart. Another tab's Esc lands after ours and before our reply.
+  gate = new Promise((r) => { release = r; });
+  latency = 0;
+  press = 6.3;
+  h.fire("keydown", { key: "Escape" });
+  await h.timers.flush();
+  ws.receive(stoppedEvent(1700000406, "esc", 0, 6.3)); // ours
+  ws.receive(stoppedEvent(1700000407, "esc", 0, 11.9)); // another tab's Esc: same source, same quantized latency
+  release();
+  await h.timers.flush();
+  const c = entries();
+  check("with latency_ms quantized to 0 for every stop, press_to_freeze_ms tells ours from another tab's Esc that landed after it: ours gets 'server 0 ms, round trip 37 ms, press to freeze 6.3 ms', theirs stays bare",
+    c.length === 8 && /\(stop requested\) - stop esc: server 0 ms, round trip 37 ms, press to freeze 6\.3 ms$/.test(c[6]) && /\(stop requested\)$/.test(c[7]) && clean(h), { c, errors: h.errors });
+  // The browser took the key 40 ms before the handler ran (the page was busy): the round trip and
+  // t_client_ms count from the event's timeStamp, and the request still leaves inside the handler.
+  gate = null;
+  latency = 2;
+  press = 30;
+  const n0 = bodies.length;
+  const before = Date.now();
+  h.fire("keydown", { key: "Escape", timeStamp: h.timers.now() - 40 });
+  const immediate = h.net.count("POST /stop") - n0;
+  const after = Date.now();
+  await h.timers.flush();
+  h.doc.getElementById("btn-stop").dispatchEvent({ type: "click", bubbles: true, timeStamp: h.timers.now() - 15 });
+  await h.timers.flush();
+  const l1 = stopLines().slice(-2);
+  check("the press is the key or click event's timeStamp: 40 ms before the Esc handler gives 'round trip 77 ms' and t_client_ms 40 ms back; 15 ms before the click gives 'round trip 52 ms'",
+    immediate === 1 && bodies.length === n0 + 2 && bodies[n0].t_client_ms >= before - 40 && bodies[n0].t_client_ms <= after - 40 && l1.join("|") === "stop esc: server 2 ms, round trip 77 ms, press to freeze 30 ms|stop button: server 2 ms, round trip 52 ms, press to freeze 30 ms",
+    { immediate, bodies: bodies.slice(n0), before, after, l1 });
+  await h.timers.tick(61000);
+  const odd = [0, -5, "12", NaN, h.timers.now() + 1000, Date.now(), h.timers.now() - 60001];
+  const n1 = bodies.length;
+  const before2 = Date.now();
+  for (const ts of odd) {
+    h.fire("keydown", { key: "Escape", timeStamp: ts });
+    await h.timers.flush();
+  }
+  const after2 = Date.now();
+  const l2 = stopLines().slice(-odd.length);
+  check("a timeStamp that is not a plausible reading of the page clock (0, negative, a string, NaN, in the future, epoch milliseconds, over 60 s old) is ignored: the press is the handler's own moment",
+    bodies.length === n1 + odd.length && bodies.slice(n1).every((x) => x.t_client_ms >= before2 && x.t_client_ms <= after2) && l2.length === odd.length && l2.every((l) => l === "stop esc: server 2 ms, round trip 37 ms, press to freeze 30 ms") && clean(h),
+    { bodies: bodies.slice(n1), before2, after2, l2, errors: h.errors, unhandled });
 }
 
 const failed = results.filter((r) => !r.ok);

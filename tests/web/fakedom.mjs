@@ -1,8 +1,10 @@
 // Minimal DOM, timer and network fakes so web/static/app.js and voice.js can run under node for
 // tests/test_web_pages.py. Only what those two scripts touch is modelled; nothing here is a browser.
-// Timers are virtual (tick() advances a clock), fetch is a route table, WebSocket records instances,
-// Web Audio records the buffers it is asked to play, and a sandbox can be given a parent window so
-// voice.js believes it is inside the dashboard iframe.
+// Timers are virtual (tick() advances a clock, skip() moves it without running them), fetch is a
+// route table, WebSocket records instances, Web Audio records the buffers it is asked to play and the
+// microphone processors it creates, performance.now() follows the virtual clock (an event's timeStamp
+// is whatever a check passes in), console.log lines are recorded, and a sandbox can be given a parent
+// window so voice.js believes it is inside the dashboard iframe.
 import vm from "node:vm";
 
 const VOID = new Set(["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"]);
@@ -223,6 +225,9 @@ function makeTimers() {
     now = end;
     await flush();
   };
+  // skip(ms) moves the clock without running timers: the time one network round trip takes, as seen
+  // by a route handler, so a latency the page measures with performance.now() is exact.
+  const skip = (ms) => { now += Math.max(0, Number(ms) || 0); };
   return {
     setTimeout: (fn, ms) => add(fn, ms, 0),
     clearTimeout: del,
@@ -230,6 +235,7 @@ function makeTimers() {
     clearInterval: del,
     tick,
     flush,
+    skip,
     now: () => now,
   };
 }
@@ -260,9 +266,12 @@ export function makeFetch(routes) {
 // The global object the page script runs against. `run(src)` evaluates a script with it as `window`.
 // Options: fetchImpl (from makeFetch); parent, an object with postMessage() that becomes window.parent
 // so voice.js sees itself inside the dashboard iframe; mic, whether navigator.mediaDevices exists.
+// The handle records console.error calls in `errors` and console.log/info/warn lines in `logs`;
+// performance.now() reads the virtual clock (delete sandbox.performance to test a page without it).
 export function makeSandbox(doc, { fetchImpl, parent = null, mic = false } = {}) {
   const timers = makeTimers();
   const errors = [];
+  const logs = [];
   const sockets = [];
   const audio = [];
   const winListeners = new Map();
@@ -282,14 +291,16 @@ export function makeSandbox(doc, { fetchImpl, parent = null, mic = false } = {})
   }
   FakeWebSocket.CONNECTING = 0; FakeWebSocket.OPEN = 1; FakeWebSocket.CLOSING = 2; FakeWebSocket.CLOSED = 3;
   // Web Audio, just enough for voice.js: buffers, buffer sources (recorded in `sources` with the time
-  // they were started at), gain, microphone and processor nodes. currentTime follows the virtual
-  // clock, so a reply "finishes playing" when a check advances the timers.
+  // they were started at), gain, microphone and processor nodes (recorded in `processors`, so a check
+  // can feed microphone samples through onaudioprocess). currentTime follows the virtual clock, so a
+  // reply "finishes playing" when a check advances the timers.
   class FakeAudioContext {
     constructor(opts) {
       this.sampleRate = opts && opts.sampleRate ? opts.sampleRate : 48000;
       this.state = "running";
       this.destination = { connect() {}, disconnect() {} };
       this.sources = [];
+      this.processors = [];
       audio.push(this);
     }
     get currentTime() { return timers.now() / 1000; }
@@ -305,13 +316,19 @@ export function makeSandbox(doc, { fetchImpl, parent = null, mic = false } = {})
     }
     createGain() { return { gain: { value: 1 }, connect() {}, disconnect() {} }; }
     createMediaStreamSource() { return { connect() {}, disconnect() {} }; }
-    createScriptProcessor() { return { onaudioprocess: null, connect() {}, disconnect() {} }; }
+    createScriptProcessor() { const p = { onaudioprocess: null, connect() {}, disconnect() {} }; this.processors.push(p); return p; }
   }
   const sandbox = {
     document: doc,
     location: { protocol: "http:", host: "127.0.0.1:8000", origin: "http://127.0.0.1:8000", href: "http://127.0.0.1:8000/" },
     navigator: mic ? { mediaDevices: { getUserMedia: async () => ({ id: "fake-mic" }) } } : {},
-    console: { log() {}, info() {}, warn() {}, error(...a) { errors.push(a.map(String).join(" ")); } },
+    console: {
+      log(...a) { logs.push(a.map(String).join(" ")); },
+      info(...a) { logs.push(a.map(String).join(" ")); },
+      warn(...a) { logs.push(a.map(String).join(" ")); },
+      error(...a) { errors.push(a.map(String).join(" ")); },
+    },
+    performance: { now: () => timers.now() },
     fetch: fetchImpl,
     WebSocket: FakeWebSocket,
     AudioContext: FakeAudioContext,
@@ -343,6 +360,7 @@ export function makeSandbox(doc, { fetchImpl, parent = null, mic = false } = {})
     doc,
     timers,
     errors,
+    logs,
     sockets,
     audio,
     fire,

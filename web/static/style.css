@@ -94,6 +94,12 @@ pre {
 .result { color: var(--muted); font-size: 16px; }
 .result.ok { color: var(--good); }
 .result.bad { color: var(--serious); }
+/* A two-line result (the calibration check: the markers, then the independent check points) colours
+   each line on its own; the check-points file name sits beside its line in the muted mono face. */
+.result .line { display: block; }
+.result .line.ok { color: var(--good); }
+.result .line.bad { color: var(--serious); }
+.result .line .file { color: var(--muted); font-family: var(--mono); font-size: 13px; }
 
 /* Text from the server or the user can be one unbroken token: a 600-character routing text with no
    spaces widened the headline, and so the page, to 7871 px. Such text wraps inside its own box. */
