@@ -139,8 +139,13 @@ def test_mirrored_marker_is_not_detected():
 
 
 def test_marker_table_and_sides(table):
+    import yaml
+
+    scene_cfg = yaml.safe_load((Path(__file__).resolve().parents[1] / "config" / "scene.yaml").read_text())
     assert set(CALIB_IDS) <= set(table)
-    assert table[0]["kind"] == "calib" and table[0]["xy"] == [0.08, 0.34] and table[0]["side"] == 0.06
+    # the table carries config/scene.yaml's tape-measured position (re-measured from the axis 2026-10-18)
+    assert table[0]["kind"] == "calib" and table[0]["xy"] == list(scene_cfg["calib_markers"][0])
+    assert table[0]["side"] == 0.06
     assert table[10]["name"] == "pill_bottle" and table[10]["kind"] == "object"
     assert table[30]["name"] == "cereal_box" and table[30]["kind"] == "obstacle"
     assert table[HAND_ID]["kind"] == "hand" and table[HAND_ID]["h"] == 0.03
