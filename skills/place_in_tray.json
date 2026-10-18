@@ -15,7 +15,7 @@
     },
     "english": "The object ends inside the tray."
   },
-  "code": "import math\n\ndef run(robot, args):\n    scene = robot.scene()\n    tallest = max([o[\"h\"] for o in scene[\"obstacles\"].values()] + [0.0])\n    if not robot.pick(args[\"object\"], transit_z=tallest + 0.08):\n        return False\n    if not robot.place_in_zone(\"tray\", transit_z=tallest + 0.08):\n        return False\n    robot.home()\n    return True\n",
+  "code": "import math\n\ndef run(robot, args):\n    scene = robot.scene()\n    tallest = max([o[\"h\"] for o in [*scene[\"obstacles\"].values(), *scene[\"objects\"].values()]] + [0.0])\n    if not robot.pick(args[\"object\"], transit_z=tallest + 0.08):\n        return False\n    if not robot.place_in_zone(\"tray\", transit_z=tallest + 0.08):\n        return False\n    robot.home()\n    return True\n",
   "sim": {
     "successes": 5,
     "trials": 5

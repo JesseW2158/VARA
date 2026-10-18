@@ -201,6 +201,9 @@ DIVE_TOL_M = 0.01  # a cycle never takes the grasp center lower than the start o
 CARRY_CLEARANCE_M = 0.02  # the held object's lowest point clears the tallest thing on the table by this
 CEILING_MARGIN_M = 0.01  # the carry height stays this far under the top of the workspace box
 RISE_DONE_M = 0.005  # a grasp center this close under the carry height needs no rise (the sim's 5 mm)
+RISE_SETTLE_S = 2.0  # how long the soft, loaded real arm may take to arrive after a carry rise command
+RISE_POLL_S = 0.1  # reading interval while waiting for that arrival
+RISE_TOPUPS = 2  # extra rise commands when the loaded arm settles short of the carry height
 # IK's 5 mm position tolerance plus 1 mm: how far the rise may stray from its vertical line and how far
 # the travel may sink under the carry height.
 CARRY_LINE_TOL_M = 0.006
@@ -714,11 +717,69 @@ def _carry_high(session: Session, obj: str | None, target: _Target) -> None:
             _hold_error(session, f"carry rise to {height:.2f} m refused ({why})")
         session.emit(f"carry: rising {(height - z) * 100:.1f} cm at ({x:.2f}, {y:.2f}), {len(path)} steps")
         session.stream(path, where="carry rise")
-        session.refresh()
-        reached = ik.fk_grasp(session.q)[0]
-        if reached[2] < height - RISE_DONE_M or math.hypot(reached[0] - x, reached[1] - y) > CARRY_LINE_TOL_M:
-            _hold_error(session, f"carry rise did not reach its clearance height {height:.2f} m")
+        reached = _await_rise(session, height, x, y)
+        if reached is not None:
+            rz, off = reached
+            _hold_error(
+                session,
+                f"carry rise did not reach its clearance height {height:.2f} m (measured {rz:.3f} m, "
+                f"{off * 1000:.0f} mm off the vertical line)",
+            )
     _travel(session, height, target)
+
+
+def _rise_shortfall(session: Session, height: float, x: float, y: float) -> tuple[float, float] | None:
+    """Read the arm: None when the measured grasp center is at the carry height (within RISE_DONE_M) on the
+    vertical line (within CARRY_LINE_TOL_M), else its measured (z, distance off the line)."""
+    session.refresh()
+    (rx, ry, rz), _ = ik.fk_grasp(session.q)
+    off = math.hypot(rx - x, ry - y)
+    if rz >= height - RISE_DONE_M and off <= CARRY_LINE_TOL_M:
+        return None
+    return rz, off
+
+
+def _await_rise(session: Session, height: float, x: float, y: float) -> tuple[float, float] | None:
+    """Wait for the measured arm to arrive at the carry height; None once it has.
+
+    The real arm's soft servos lag the last command and sag under the held object (2026-10-18: a held
+    box read short right after the rise and the carry stopped), so the reading is polled for up to
+    RISE_SETTLE_S. When it settles short, the shortfall is commanded again on top of the last command
+    (never from the sagged reading, so the object does not dip first), at most RISE_TOPUPS times and never
+    above the ceiling cap. Returns the last measured (z, distance off the line) when it never arrives, so
+    a stalled or blocked arm still ends the carry holding the object."""
+    cap = float(session.box["z"][1]) - CEILING_MARGIN_M
+    commanded = height
+    short: tuple[float, float] | None = None
+    for attempt in range(RISE_TOPUPS + 1):
+        waited = 0.0
+        while True:
+            short = _rise_shortfall(session, height, x, y)
+            if short is None:
+                return None
+            if waited >= RISE_SETTLE_S - 1e-9:
+                break
+            session.check_stopped()
+            session.pacer.wait(RISE_POLL_S)
+            waited += RISE_POLL_S
+        rz, off = short
+        if attempt == RISE_TOPUPS or rz >= height - RISE_DONE_M or off > CARRY_LINE_TOL_M:
+            break  # out of top-ups, or the miss is off the line, which a higher command does not fix
+        next_target = min(cap, commanded + (height - rz))
+        if next_target <= commanded + 1e-4:
+            break  # already at the ceiling cap
+        session.resync_to_last_command()
+        path, why = _plan_rise(session, next_target)
+        if path is None:
+            session.emit(f"carry: top-up rise refused ({why})")
+            break
+        session.emit(
+            f"carry: settled {(height - rz) * 100:.1f} cm short of {height:.2f} m under the load; "
+            f"commanding {(next_target - commanded) * 100:.1f} cm more"
+        )
+        session.stream(path, where="carry rise top-up")
+        commanded = next_target
+    return short
 
 
 def _plan_rise(session: Session, height: float) -> tuple[list[list[float]] | None, str]:

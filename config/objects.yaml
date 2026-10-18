@@ -7,11 +7,10 @@
 #   juice_box   = power bank, 2.5 x 1.25 in footprint, 3.5 in tall, gripped across the 1.25 in side
 #   tea_tin     = box, 2.76 x 1.75 in footprint, 4 in tall, gripped across the 1.75 in side
 #   cereal_box  = tape measure, the obstacle, standing on its edge: 2.75 x 0.75 in, 2.25 tall
-# held_min: juice_box keeps A11's 7.4 from 2026-10-17 (runs/calibration/gripper-20261018T030005Z.json, a
-# 3.2 cm grasp like the power bank's); pill_bottle and tea_tin use the 5.0 default until A11 re-measures
-# the new props (their old values were measured on a squeezable cup and a 6 cm tin).
-10: {name: pill_bottle, kind: object, shape: cylinder, size: [0.0445, 0.0445], h: 0.0826, held_min: 5.0}
-11: {name: juice_box, kind: object, shape: box, size: [0.0635, 0.0318], h: 0.0889, held_min: 7.4}
-12: {name: tea_tin, kind: object, shape: box, size: [0.0701, 0.0445], h: 0.1016, held_min: 5.0}
+# held_min: A11 on the real props, 2026-10-18 02:48 (runs/calibration/gripper-20261018T064828Z.json, 5 grasps
+# each, empty close 1.9): pill bottle closes at 21-23, power bank at 16.3-16.5, box at 16.7-19.0 (it squeezes).
+10: {name: pill_bottle, kind: object, shape: cylinder, size: [0.0445, 0.0445], h: 0.0826, held_min: 9.6}
+11: {name: juice_box, kind: object, shape: box, size: [0.0635, 0.0318], h: 0.0889, held_min: 7.2}
+12: {name: tea_tin, kind: object, shape: box, size: [0.0701, 0.0445], h: 0.1016, held_min: 7.4}
 30: {name: cereal_box, kind: obstacle, shape: box, size: [0.0699, 0.0191], h: 0.0572}
 40: {name: hand, kind: hand, h: 0.03}

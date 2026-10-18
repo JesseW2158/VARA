@@ -167,6 +167,13 @@ def test_carry_to_hand_and_home_honor_the_caps_near_the_hand():
     assert "handoff_done" in result["events"]
 
 
+def _jaws_commanded_open(d: FakeDriver) -> None:
+    """The jaws were commanded open before this replay (gripper0=1.0), so the replay does not open them first;
+    the reading override only stands in for the close's contact reading."""
+    d.command(d.read()[0], 1.0)
+    d.commands.clear()
+
+
 def test_close_near_the_hand_is_refused():
     pick = solve((0.24, -0.04, 0.0525))
     hand = (0.24, 0.02, 0.03)
@@ -181,6 +188,7 @@ def test_close_near_the_hand_is_refused():
     # 12 cm away the close goes ahead
     d = FakeDriver(q0=pick, gripper0=1.0)
     d.gripper_reading_override = 0.3
+    _jaws_commanded_open(d)
     result = replay.replay(traj(close), driver=d, realtime=False, scene=scene_with_hand(0.24, 0.08, 0.03))
     assert result["ok"], result["events"]
     assert d.commands[0][1] == 0.0  # the close
@@ -628,6 +636,7 @@ def test_close_refusal_boundary_is_exactly_10_cm():
     for dist, refused in ((0.0999, True), (0.1001, False)):
         d = FakeDriver(q0=pick, gripper0=1.0)
         d.gripper_reading_override = 0.3
+        _jaws_commanded_open(d)
         calls = []
         original = d.close_gripper_hold
 

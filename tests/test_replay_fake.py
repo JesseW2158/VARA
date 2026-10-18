@@ -192,9 +192,17 @@ def test_stopped_driver_at_start_moves_nothing(poses):
     assert result["reason"] == "stopped" and d.commands == []
 
 
+def _jaws_commanded_open(d: FakeDriver) -> None:
+    """The jaws were commanded open before this replay (gripper0=1.0), so the replay does not open them first;
+    the reading override only stands in for the close's contact reading."""
+    d.command(d.read()[0], 1.0)
+    d.commands.clear()
+
+
 def test_missed_grasp_rises_goes_home_and_returns_grasp_missed(poses):
     d = FakeDriver(q0=poses["pick"], gripper0=1.0)
     d.gripper_reading_override = 0.0  # nothing between the jaws
+    _jaws_commanded_open(d)
     t = traj(
         path([poses["pick"]]), {"kind": "grip", "action": "close", "object": "juice_box", "expect_held": True}
     )

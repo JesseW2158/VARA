@@ -196,6 +196,7 @@ TIP_SPEED_MAX = 0.2  # m/s, always
 TIP_SPEED_NEAR_HAND = 0.1  # m/s
 GRIP_SETTLE_S = 0.4  # a grip close waits at least this long, then until the jaws stop (driver timeout)
 OPEN_SETTLE_S = 0.3
+OPEN_START_MIN = 0.98  # a replay whose first grip is a close opens first when the gripper is below this
 RISE_M = 0.05  # the rise after a missed grasp
 CEILING_CLEARANCE_M = 0.005  # a rise stops this far under the box's top
 MAX_COMMANDS_PER_WAYPOINT = 1000  # a waypoint that needs more ticks than this is a bug, not a slow move
@@ -976,6 +977,15 @@ class Session:
         problems.append(f"straight line: {how}")
         return None, problems, ""
 
+    def resync_to_last_command(self) -> None:
+        """Take the driver's last command (when there is one) as the reference pose: the driver clips every
+        tick to 2 degrees from it, so a command built on a sagged reading would walk the goal toward the
+        sag. After a fresh connect there is none and the reading is the goal."""
+        last = self.driver.last_command
+        if last is not None:
+            self.q = [float(v) for v in last[0]]
+            self.tip = self._tip_of(self.q)
+
     def bridge_to(self, q_target: Sequence[float], *, where: str = "bridge") -> None:
         """Move to `q_target` at <= BRIDGE_STEP_RAD per tick along `plan_path` (sweep, else straight line).
 
@@ -988,10 +998,7 @@ class Session:
         clips every tick to 2 degrees from that command, so planning from a sagged reading would first walk
         the goal back toward the sag, out of the box and unchecked (review, 2026-10-18). Only a fresh
         connect (no last command; the goal is the reading) can start outside the box."""
-        last = self.driver.last_command
-        if last is not None:
-            self.q = [float(v) for v in last[0]]
-            self.tip = self._tip_of(self.q)
+        self.resync_to_last_command()
         box = self.box
         if not inside_box(self.tip, self.box, BOX_GATE_M):
             x, y, z = self.tip
@@ -1152,6 +1159,12 @@ def replay(
         segments = traj["segments"]
         session.emit(f"validated: {len(segments)} segments")
         session.require_ready()
+        if _first_grip_is_a_close(segments) and session.g < OPEN_START_MIN:
+            # every plan is simulated from an open gripper (SimRobot starts open and nothing held), so its
+            # pick has no open step: without this the real jaws approach closed (2026-10-18, grasp_missed)
+            session.resync_to_last_command()
+            session.emit(f"grip open first (gripper at {session.g:.2f}; the plan starts open)")
+            session.open_gripper(where="start: grip open")
         for index, segment in enumerate(segments):
             kind = segment["kind"]
             if kind == "path":
@@ -1169,6 +1182,14 @@ def replay(
         session.emit(f"error: {type(exc).__name__}: {exc}")
         log.exception("replay failed; arm frozen")
         return {"ok": False, "reason": "error", "events": events}
+
+
+def _first_grip_is_a_close(segments: Sequence[dict]) -> bool:
+    """True when the trajectory's first `grip` segment is a close: the plan grasps from an open gripper."""
+    for segment in segments:
+        if segment.get("kind") == "grip":
+            return segment.get("action") == "close"
+    return False
 
 
 def setup_failure(
