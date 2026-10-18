@@ -11,9 +11,11 @@
 # way as the model) and offsets solved from one reference pose, the model's zero pose (arm straight forward,
 # forearm and gripper level, moving jaw on top), report runs/calibration/reference-zero-pose.json, solve
 # record runs/calibration/solve-20261018-013942-662672.json, encoder calibration sha256 5494adfa...bbe6c.
-# The five-pose accuracy check (A6 step 4) is still to run. The gripper line is A11's default (0 to 100)
-# until A11 measures it. Redo A6 after any recalibration: LeRobot's 0 is the midpoint of each joint's
-# calibrated range, so the offsets depend on the calibration file.
+# The five-pose check (A6 step 4) ran at 22:20 and did not formally pass: mean 2.2 cm, max 3.1 cm
+# (runs/calibration/a6-check/check-01.json). The gripper's empty_closed_pct is A11's
+# measured close on nothing (runs/calibration/gripper-20261018T030005Z.json, 2026-10-17 23:00). Redo A6
+# after any recalibration: LeRobot's 0 is the midpoint of each joint's calibrated range, so the offsets
+# depend on the calibration file.
 #
 # lerobot_robot_type is the registry name for `--robot.type`. The demo laptop's LeRobot 0.6.2 (Seeed fork,
 # module lerobot.robots.so_follower) registers SOFollowerRobotConfig under both "so101_follower" and
@@ -25,4 +27,4 @@ shoulder_lift: {sign: 1, offset_deg: -1.582}
 elbow_flex: {sign: 1, offset_deg: -8.044}
 wrist_flex: {sign: 1, offset_deg: -1.055}
 wrist_roll: {sign: 1, offset_deg: 3.473}
-gripper: {closed_pct: 0, open_pct: 100}
+gripper: {closed_pct: 0, open_pct: 100, empty_closed_pct: 1.9}

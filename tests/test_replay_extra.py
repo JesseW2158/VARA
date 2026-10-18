@@ -107,10 +107,33 @@ def test_load_box_reads_the_workspace_and_rejects_bad_files(tmp_path):
         replay.load_box(f)
 
 
+KIT_OBJECTS = (
+    "10: {name: pill_bottle, kind: object, shape: cylinder, size: [0.035, 0.035], h: 0.07, held_min: 8}\n"
+    "11: {name: juice_box, kind: object, shape: box, size: [0.063, 0.04], h: 0.105, held_min: 8}\n"
+    "12: {name: tea_tin, kind: object, shape: cylinder, size: [0.04, 0.04], h: 0.09, held_min: 8}\n"
+    "30: {name: cereal_box, kind: obstacle, shape: box, size: [0.19, 0.06], h: 0.2}\n"
+    "40: {name: hand, kind: hand, h: 0.03}\n"
+)
+
+
+def pin_kit_gripper_config(monkeypatch, tmp_path):
+    """The kit's placeholder gripper values (empty close 0, held_min 8 on every object), so a test of the
+    holding rule does not depend on what A11 measured on this arm (config/joint_map.yaml, objects.yaml)."""
+    from arm import driver as driver_mod
+
+    jm = tmp_path / "kit_joint_map.yaml"
+    jm.write_text("gripper: {closed_pct: 0, open_pct: 100}\n", encoding="utf-8")
+    ob = tmp_path / "kit_objects.yaml"
+    ob.write_text(KIT_OBJECTS, encoding="utf-8")
+    monkeypatch.setattr(driver_mod, "JOINT_MAP_PATH", jm)
+    monkeypatch.setattr(driver_mod, "OBJECTS_PATH", ob)
+    monkeypatch.setattr(replay, "OBJECTS_PATH", ob)
+
+
 def test_load_objects_by_name(tmp_path):
     objects = replay.load_objects()
     assert {"pill_bottle", "juice_box", "tea_tin", "cereal_box"} <= set(objects)
-    assert objects["juice_box"]["held_min"] == 8
+    assert isinstance(objects["juice_box"]["held_min"], int | float)  # A11's measured value, whatever it is
     assert replay.load_objects(tmp_path / "missing.yaml") == {}
     f = tmp_path / "objects.yaml"
     f.write_text("10: {name: thing, kind: object, held_min: 12}\n11: {kind: object}\n", encoding="utf-8")
@@ -260,6 +283,7 @@ def test_session_hand_parsing():
 def test_held_threshold_and_empty_closed_use_the_joint_map(monkeypatch, tmp_path):
     from arm import driver as driver_mod
 
+    pin_kit_gripper_config(monkeypatch, tmp_path)
     d = FakeDriver()
     s = replay.Session(d, None, replay.Pacer(False))
     assert s.held_threshold("juice_box") == pytest.approx(0.08)  # 8 of 100

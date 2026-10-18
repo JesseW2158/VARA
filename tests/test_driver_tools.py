@@ -127,7 +127,11 @@ def test_measure_grip_fake_session_readings_and_report():
     assert grippers[first_zero + 1] == 1.0  # the empty close is re-opened at once
     assert grippers[-1] == 1.0 and d.read()[1] == 1.0
     assert d.contact_gripper is None
-    assert report["mode"] == "fake" and report["stopped"] is False and report["problems"] == []
+    assert report["mode"] == "fake" and report["stopped"] is False
+    assert report["problems"] == [
+        "pill_bottle: held 1 of 2 grasps (A11 needs every grasp held); "
+        "the slipped grasps are left out of held_min"
+    ]
     assert report["jaw_open_mm"] == 62.0
     assert report["open_reading_pct"] == pytest.approx(100.0)
     assert report["empty_closed_pct"] == pytest.approx(0.0)
@@ -138,6 +142,32 @@ def test_measure_grip_fake_session_readings_and_report():
     assert entry["held_min"] == pytest.approx(12.5)
     assert report["lerobot_id"] == "my_awesome_follower_arm" and report["calibration_sha256"] is None
     datetime.fromisoformat(report["captured_at"])
+
+
+def test_measure_grip_leaves_slipped_grasps_out_of_held_min():
+    """Measured 2026-10-17: the juice box slipped once (reading 5.4, answered "n") and held four times at
+    about 16.8; with the slip counted, held_min came out 1.8, so a later slip would have read as holding."""
+    d = FakeDriver(q0=Q0, gripper0=1.0)
+    contacts = iter([5.4, 16.9, 16.8, 16.7, 16.7])
+    original = d.close_gripper_hold
+
+    def close_on_the_next_contact(*args, **kwargs):
+        d.contact_gripper = driver._pct_to_gripper(next(contacts), driver.joint_map())
+        return original(*args, **kwargs)
+
+    d.close_gripper_hold = close_on_the_next_contact  # type: ignore[method-assign]
+    answers = ["62"] + ["", "n"] + ["", "y"] * 4
+    report = driver.measure_grip(d, objects=["juice_box"], grasps=5, ask=scripted(answers))
+    entry = report["objects"]["juice_box"]
+    assert entry["held"] == [False, True, True, True, True]
+    assert entry["held_min"] == pytest.approx((16.7 - 0.0) / 2)  # from the held grasps only
+    assert any("held 4 of 5 grasps" in p for p in report["problems"])
+    d = FakeDriver(q0=Q0, gripper0=1.0)
+    report = driver.measure_grip(
+        d, objects=["juice_box"], grasps=2, ask=scripted(["62", "", "n", "", "n"]), fake_contact_pct=25
+    )
+    assert report["objects"]["juice_box"]["held_min"] is None
+    assert "juice_box: no grasp held, so no held_min" in report["problems"]
 
 
 def test_measure_grip_blank_jaw_answer_and_misfits_become_problems():
@@ -289,11 +319,12 @@ def test_measure_grip_cli_esc_writes_the_partial_report_and_exits_1(monkeypatch,
     assert "no lines to paste" in text and "Paste into" not in text and "gripper: {" not in text
 
 
-def _esc_on_sleep(d: FakeDriver, seconds_wanted: float, jaws_at: float):
-    """A `_sleep` stand-in that, on the wait of `seconds_wanted`, leaves the jaws at `jaws_at` and freezes."""
+def _esc_after_command(d: FakeDriver, commands_sent: int, jaws_at: float):
+    """A `_sleep` stand-in: on the first wait after the `commands_sent`-th gripper command (1 is the open, 2
+    the close on nothing), leaves the jaws at `jaws_at` and freezes, as an Esc landing while they travel."""
 
     def sleep(seconds: float) -> None:
-        if seconds == seconds_wanted and not d.stopped:
+        if len(d.commands) == commands_sent and not d.stopped:
             d.gripper_reading_override = jaws_at  # the jaws are part-way when Esc lands
             d.freeze()
 
@@ -303,7 +334,7 @@ def _esc_on_sleep(d: FakeDriver, seconds_wanted: float, jaws_at: float):
 def test_measure_grip_esc_during_the_empty_close_discards_the_reading(capsys):
     """Review lead (c): a mid-travel reading after Esc is never stored or printed as empty_closed_pct."""
     d = FakeDriver(q0=Q0, gripper0=1.0)
-    d._sleep = _esc_on_sleep(d, 0.5, jaws_at=0.4)  # type: ignore[method-assign]
+    d._sleep = _esc_after_command(d, 2, jaws_at=0.4)  # type: ignore[method-assign]
     report = driver.measure_grip(d, objects=["pill_bottle"], grasps=1, ask=scripted(["62"]))
     assert report["stopped"] is True and d.stopped
     assert report["empty_closed_pct"] is None
@@ -317,7 +348,7 @@ def test_measure_grip_esc_during_the_empty_close_discards_the_reading(capsys):
 
 def test_measure_grip_esc_during_the_open_wait_discards_the_reading_and_skips_the_prompt():
     d = FakeDriver(q0=Q0, gripper0=0.0)
-    d._sleep = _esc_on_sleep(d, 1.0, jaws_at=0.5)  # type: ignore[method-assign]
+    d._sleep = _esc_after_command(d, 1, jaws_at=0.5)  # type: ignore[method-assign]
     report = driver.measure_grip(
         d, objects=["pill_bottle"], grasps=1, ask=lambda p: pytest.fail(f"prompted a frozen arm: {p}")
     )

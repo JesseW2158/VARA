@@ -19,8 +19,9 @@ as a problem rather than raised, and a waypoint value too large for a float is "
    <= 1 degree per tick when its tip stays inside the box, else a straight tip line solved with IK every
    LINE_SAMPLE_M, both validated against the limits and the box) when the arm is more than 1 degree away,
    then streams the waypoints at 30 Hz with `driver.command(q, current_gripper)`; a `grip` close uses
-   `driver.close_gripper_hold()`, waits GRIP_SETTLE_S and compares "holding" with `expect_held` (a mismatch
-   rises RISE_M, goes home and returns `grasp_missed`); a `grip` open commands gripper 1.0 and waits
+   `driver.close_gripper_hold()`, which waits until the jaws stop (at least GRIP_SETTLE_S; a close still
+   moving at the driver's timeout counts as not holding), and compares "holding" with `expect_held` (a
+   mismatch rises RISE_M, goes home and returns `grasp_missed`); a `grip` open commands gripper 1.0 and waits
    OPEN_SETTLE_S; a `live` segment runs `arm.real_robot.carry_to_hand` or `arm.real_robot.home`, and the
    next path bridges from wherever that left the arm. A sweep is planned from the present pose clamped into
    the limits minus 3 degrees, so an arm resting against a joint stop (its reading inside the margin) still
@@ -189,7 +190,7 @@ HAND_FREEZE_M = 0.10  # a seen wristband this close to the tip freezes the arm (
 HAND_SLOW_M = 0.15  # within this distance the tip speed is capped at TIP_SPEED_NEAR_HAND
 TIP_SPEED_MAX = 0.2  # m/s, always
 TIP_SPEED_NEAR_HAND = 0.1  # m/s
-GRIP_SETTLE_S = 0.4  # a grip close waits this long before reading the gripper
+GRIP_SETTLE_S = 0.4  # a grip close waits at least this long, then until the jaws stop (driver timeout)
 OPEN_SETTLE_S = 0.3
 RISE_M = 0.05  # the rise after a missed grasp
 CEILING_CLEARANCE_M = 0.005  # a rise stops this far under the box's top
@@ -1000,13 +1001,23 @@ class Session:
             if distance <= HAND_FREEZE_M:
                 self.emit(f"grip close refused: hand {distance:.3f} m from the tip")
                 raise CloseRefused()
-        reading = float(self.driver.close_gripper_hold(settle=GRIP_SETTLE_S))
+
+        def per_poll() -> None:  # the per-tick checks keep running while the jaws travel
+            self.check_stopped()
+            self.check_hand(self.tip, "grip close")
+
+        reading = float(self.driver.close_gripper_hold(settle=GRIP_SETTLE_S, on_poll=per_poll))
         self.settle(GRIP_SETTLE_S)
         self.check_stopped()
         last = self.driver.last_command
         self.g = float(last[1]) if last is not None else reading
         override = getattr(self.driver, "gripper_reading_override", None)
-        if getattr(self.driver, "is_fake", False) and override is None:
+        if getattr(self.driver, "grip_status", "still") == "timeout":
+            # The jaws were still moving when the driver gave up waiting: the reading is mid-travel and says
+            # nothing about an object, so the grasp is unconfirmed and treated as a miss.
+            self.emit("grip close: the jaws were still moving after the wait; treated as not holding")
+            holding = False
+        elif getattr(self.driver, "is_fake", False) and override is None:
             holding = True if expect_held is None else bool(expect_held)
         else:
             # "above the empty-closed reading by at least held_min": the threshold itself counts as holding

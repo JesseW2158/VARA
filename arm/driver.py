@@ -110,6 +110,17 @@ TICK = 1 / 30
 MAX_STEP_RAD = math.radians(2.0)
 MARGIN_RAD = math.radians(3.0)
 HOLD_BACKOFF_PCT = 3.0  # hold a grasped object at the contact reading minus this, on LeRobot's 0-100 scale
+# A gripper close or open is read only once the jaws have stopped (at the object, at the closed stop, or
+# open):
+# LeRobot drives the gripper with position gain 16 and a 50 % torque cap, so a full close takes a noticeable
+# part of a second, and a fixed short wait read (and then held) the jaws mid-travel, short of a small object.
+# Stopped means the reading moved at most GRIP_STILL_PCT (0-100 scale) over GRIP_STILL_POLLS polls taken
+# GRIP_POLL_S apart. A gripper still moving after GRIP_TIMEOUT_S is reported unsettled ("timeout") and held at
+# its last reading minus 3, so it never keeps pushing; callers treat that grasp as unconfirmed.
+GRIP_POLL_S = 0.05
+GRIP_STILL_PCT = 0.5
+GRIP_STILL_POLLS = 4
+GRIP_TIMEOUT_S = 3.0
 DEFAULT_HELD_MIN_PCT = 5.0  # held_threshold() when config/objects.yaml names no held_min at all (0-100 scale)
 STRAIN_TICKS = 15  # ~1.3 degrees; same tolerance as the verified lerobot-tools/sync_goals.py
 DEFAULT_FOLLOWER_ID = "my_awesome_follower_arm"
@@ -528,6 +539,9 @@ class _DriverBase:
         self.last_command: tuple[list[float], float] | None = None
         self.goal_syncs = 0  # how many times Goal_Position = Present_Position was written
         self.frozen_at: float | None = None  # time.monotonic() of the last freeze, for the Esc latency check
+        # How the last `close_gripper_hold` / `wait_gripper_still` ended: "still" (the jaws stopped),
+        # "stopped" (STOP or torque off landed first) or "timeout" (still moving after the timeout).
+        self.grip_status: str | None = None
         # Set by freeze() before it takes the lock, cleared when the freeze is applied. Whoever holds the lock
         # meanwhile (connect(), command(), resume()) applies the STOP itself: see `_freeze_locked`.
         self._freeze_requested = threading.Event()
@@ -697,21 +711,79 @@ class _DriverBase:
             self.torque = True
             self.last_command = None
 
-    def close_gripper_hold(self, target: float = 0.0, settle: float = 0.5) -> float:
-        """Close toward `target`, wait `settle` s, then hold at the reading minus 3 (0-100 scale).
+    def wait_gripper_still(
+        self,
+        *,
+        settle: float = 0.0,
+        timeout: float = GRIP_TIMEOUT_S,
+        on_poll: Callable[[], None] | None = None,
+    ) -> float:
+        """Wait at least `settle` s, then until the jaws stop moving; returns the gripper reading (0.0-1.0).
 
-        Returns the gripper reading after settling (0.0 closed to 1.0 open). Holding a few units past the
-        contact reading keeps the servo's position error small, so it is not stalled at full torque.
+        Polls every GRIP_POLL_S and counts polls rather than clock time, so the FakeDriver (whose `_sleep`
+        returns at once) runs it instantly; on the real bus each read adds its own time, so the wait can run
+        somewhat past `timeout`. The jaws count as stopped when the reading moved at most GRIP_STILL_PCT
+        (0-100 scale) over the last GRIP_STILL_POLLS polls. `on_poll()` runs after every read, outside the
+        lock: the replay passes its STOP and wristband checks, which freeze the arm and raise, so the
+        per-tick safety checks keep running while the jaws travel. `grip_status` records the end: "still",
+        "stopped" (STOP or torque off landed during the wait, or `on_poll` raised; the reading is then
+        wherever the freeze held the jaws) or "timeout" (still moving after `timeout` s).
+        """
+        if not (math.isfinite(settle) and settle >= 0 and math.isfinite(timeout) and timeout > 0):
+            raise ValueError(f"settle must be >= 0 and timeout > 0 seconds, got {settle}, {timeout}")
+        g = joint_map()["gripper"]
+        tolerance = GRIP_STILL_PCT / abs(g["open_pct"] - g["closed_pct"])
+        min_polls = math.ceil(settle / GRIP_POLL_S - 1e-9)
+        max_polls = max(min_polls, math.ceil(timeout / GRIP_POLL_S - 1e-9))
+        history: list[float] = []
+        for n in range(1, max_polls + 1):
+            self._sleep(GRIP_POLL_S)
+            reading = self.read()[1]
+            if self.stopped or not self.torque:
+                self.grip_status = "stopped"
+                return reading
+            if on_poll is not None:
+                try:
+                    on_poll()
+                except BaseException:
+                    self.grip_status = "stopped"
+                    raise
+            history.append(reading)
+            recent = history[-(GRIP_STILL_POLLS + 1) :]
+            if n >= min_polls and len(recent) > GRIP_STILL_POLLS and max(recent) - min(recent) <= tolerance:
+                self.grip_status = "still"
+                return reading
+        self.grip_status = "timeout"
+        log.warning("gripper still moving after %.1f s (last reading %.3f)", timeout, history[-1])
+        return history[-1]
+
+    def close_gripper_hold(
+        self,
+        target: float = 0.0,
+        settle: float = 0.5,
+        timeout: float = GRIP_TIMEOUT_S,
+        on_poll: Callable[[], None] | None = None,
+    ) -> float:
+        """Close toward `target`, wait until the jaws stop (at least `settle` s; `on_poll` as in
+        `wait_gripper_still`), then hold at the reading minus 3 (0-100 scale).
+
+        Returns the gripper reading the hold was set from (0.0 closed to 1.0 open). Holding a few units past
+        the contact reading keeps the servo's position error small, so it is never left pushing at its torque
+        cap. `grip_status` says how the wait ended. A "timeout" close (the jaws still creeping, e.g. into a
+        squeezable object) is held too, at a fresh reading minus 3, so the gripper never keeps pushing toward
+        `target`; callers must still treat that grasp as unconfirmed. On "stopped" the freeze already holds.
         """
         with self.lock:
             q = list(self.last_command[0]) if self.last_command is not None else self.read()[0]
             if not self.command(q, target):
+                self.grip_status = "stopped"
                 return self.read()[1]
-        self._sleep(settle)
+        reading = self.wait_gripper_still(settle=settle, timeout=timeout, on_poll=on_poll)
         with self.lock:
-            reading = self.read()[1]
-            if self.stopped or not self.torque:
+            if self.grip_status not in ("still", "timeout") or self.stopped or not self.torque:
                 return reading
+            if self.grip_status == "timeout":
+                reading = self.read()[1]  # the jaws were still creeping: hold from where they are now
             g = joint_map()["gripper"]
             # 3 on LeRobot's 0-100 scale, expressed in our 0-1 units and applied toward closed (0.0), so
             # the direction does not depend on which way closed_pct/open_pct run in config/joint_map.yaml.
@@ -1574,14 +1646,16 @@ def measure_grip(
     """A11's gripper session on a connected driver; returns the report, partial when the driver stopped.
 
     The five joints are read once and that same q goes with every gripper command. Sequence: open to 1.0,
-    wait 1 s, read, ask for the jaw opening in mm; close on nothing (0.0), read after 0.5 s, re-open at
-    once (an empty close is never left stalled); then per object `grasps` times: open, wait for Enter with
-    the object between the jaws, `close_gripper_hold()` (settled reading, held at the contact minus 3),
-    ask whether it held, re-open. Readings are recorded on LeRobot's 0-100 scale (`gripper_to_pct`) and
-    each object's `held_min` comes from `held_min_from_readings`; the jaw opening is checked against every
-    object on file with `objects_fit`. `ask(prompt) -> str` replaces `input()` (EOF reads as blank, so a
-    redirected stdin never blocks). On the FakeDriver `fake_contact_pct` (0-100) stands in for each
-    object's contact reading through `FakeDriver.contact_gripper`; it is refused on a real driver. When
+    read once the jaws stop (`wait_gripper_still`, at least 1 s), ask for the jaw opening in mm; close on
+    nothing (0.0), read once they stop (at least 0.5 s), re-open at once (an empty close is never left
+    stalled); then per object `grasps` times: open, wait for Enter with the object between the jaws,
+    `close_gripper_hold()` (the reading once the jaws stopped, held at the contact minus 3), ask whether it
+    held, re-open. A reading whose jaws were still moving at the timeout is discarded with a problem entry.
+    Readings are recorded on LeRobot's 0-100 scale (`gripper_to_pct`) and each object's `held_min` comes
+    from `held_min_from_readings` over its grasps not answered "not held"; the jaw opening is checked
+    against every object on file with `objects_fit`. `ask(prompt) -> str` replaces `input()` (EOF reads as
+    blank, so a redirected stdin never blocks). On the FakeDriver `fake_contact_pct` (0-100) stands in for
+    each object's contact reading through `FakeDriver.contact_gripper`; it is refused on a real driver. When
     the driver stops accepting commands (Esc froze it, torque off) the report gets `stopped: True`, a
     problem entry saying where, and everything measured before it; a reading taken after the stop (the
     jaws frozen part-way) is discarded, never recorded as a measurement. ValueError before anything moves
@@ -1634,11 +1708,17 @@ def measure_grip(
     def session() -> None:
         if not send(1.0, "while opening the jaws"):
             return
-        driver._sleep(1.0)
+        opened = driver.wait_gripper_still(settle=1.0)
         if driver.stopped or not driver.torque:
             interrupted("while the jaws were opening (open reading discarded)")
             return
-        report["open_reading_pct"] = _gripper_to_pct(driver.read()[1], jm)
+        if driver.grip_status == "timeout":
+            problems.append(
+                f"the jaws were still moving {GRIP_TIMEOUT_S:g} s after the open command; "
+                "open reading discarded"
+            )
+        else:
+            report["open_reading_pct"] = _gripper_to_pct(opened, jm)
         answer = prompt("jaw opening at gripper 1.0 in mm: ")
         if driver.stopped:
             interrupted("at the jaw opening prompt")
@@ -1654,11 +1734,17 @@ def measure_grip(
                 problems.extend(rule_problems)
         if not send(0.0, "while closing on nothing"):
             return
-        driver._sleep(0.5)
+        closed = driver.wait_gripper_still(settle=0.5)
         if driver.stopped or not driver.torque:
             interrupted("during the empty close (the jaws stopped part-way; reading discarded)")
             return
-        report["empty_closed_pct"] = _gripper_to_pct(driver.read()[1], jm)
+        if driver.grip_status == "timeout":
+            problems.append(
+                f"empty close: the jaws were still moving {GRIP_TIMEOUT_S:g} s after the close command; "
+                "reading discarded, so no held_min can be computed"
+            )
+        else:
+            report["empty_closed_pct"] = _gripper_to_pct(closed, jm)
         if not send(1.0, "while re-opening after the empty close"):
             return
         for name in names:
@@ -1678,6 +1764,14 @@ def measure_grip(
                 if driver.stopped or not driver.torque:
                     interrupted(f"during the close of {where}")
                     return
+                if driver.grip_status == "timeout":
+                    problems.append(
+                        f"{where}: the jaws were still moving {GRIP_TIMEOUT_S:g} s after the close command; "
+                        "reading discarded"
+                    )
+                    if not send(1.0, f"while re-opening after {where}"):
+                        return
+                    continue
                 entry["closed_pct"].append(_gripper_to_pct(reading, jm))
                 entry["held"].append(_yes_no(prompt("held? y/n: ")))
                 if driver.stopped:
@@ -1694,15 +1788,27 @@ def measure_grip(
         if fake_contact_pct is not None:
             driver.contact_gripper = None
     for name, entry in report["objects"].items():
-        if entry["closed_pct"] and report["empty_closed_pct"] is not None:
+        answers = list(zip(entry["closed_pct"], entry["held"], strict=True))
+        slipped = sum(1 for _, held in answers if held is False)
+        if slipped:
+            problems.append(
+                f"{name}: held {len(answers) - slipped} of {len(answers)} grasps (A11 needs every grasp "
+                "held); the slipped grasps are left out of held_min"
+            )
+        # held_min separates holding from not holding, so a grasp answered "not held" never sets it: its
+        # reading is what a miss looks like. Unanswered grasps (blank or EOF) still count.
+        readings = [reading for reading, held in answers if held is not False]
+        if readings and report["empty_closed_pct"] is not None:
             try:
                 entry["held_min"] = held_min_from_readings(
-                    entry["closed_pct"], report["empty_closed_pct"], open_pct=jm["gripper"]["open_pct"]
+                    readings, report["empty_closed_pct"], open_pct=jm["gripper"]["open_pct"]
                 )
             except ValueError as exc:
                 problems.append(f"{name}: {exc}")
         elif not entry["closed_pct"]:
             problems.append(f"{name}: no closed reading recorded")
+        elif not readings:
+            problems.append(f"{name}: no grasp held, so no held_min")
     return report
 
 
@@ -1954,13 +2060,16 @@ def _print_grip_summary(report: dict[str, Any], path: Path) -> None:
         )
         print("Nothing under config/ was written.")
         return
-    print("Paste into config/joint_map.yaml (replaces its gripper line; the loader ignores jaw_open_mm):")
-    fields = [f"closed_pct: {g['closed_pct']:g}", f"open_pct: {g['open_pct']:g}"]
-    if empty is not None:
+    if empty is None:
+        # A gripper line without empty_closed_pct would drop the one already recorded in the file.
+        print("config/joint_map.yaml: keep its gripper line (the empty close was not measured this time)")
+    else:
+        print("Paste into config/joint_map.yaml (replaces its gripper line; the loader ignores jaw_open_mm):")
+        fields = [f"closed_pct: {g['closed_pct']:g}", f"open_pct: {g['open_pct']:g}"]
         fields.append(f"empty_closed_pct: {empty:.1f}")
-    if jaw is not None:
-        fields.append(f"jaw_open_mm: {jaw:g}")
-    print("gripper: {" + ", ".join(fields) + "}")
+        if jaw is not None:
+            fields.append(f"jaw_open_mm: {jaw:g}")
+        print("gripper: {" + ", ".join(fields) + "}")
     print("Paste into config/objects.yaml (held_min on each object's entry):")
     for name, entry in report["objects"].items():
         if entry["held_min"] is None:

@@ -486,7 +486,17 @@ def test_config_failure_is_an_error_without_a_freeze(monkeypatch, tmp_path, pose
     assert d.commands == []
 
 
-def test_holding_threshold_is_inclusive(poses):
+def test_holding_threshold_is_inclusive(poses, monkeypatch, tmp_path):
+    # The kit's placeholder gripper values (empty close 0, held_min 8), whatever A11 measured on this arm.
+    jm = tmp_path / "kit_joint_map.yaml"
+    jm.write_text("gripper: {closed_pct: 0, open_pct: 100}\n", encoding="utf-8")
+    ob = tmp_path / "kit_objects.yaml"
+    ob.write_text(
+        "11: {name: juice_box, kind: object, shape: box, h: 0.105, held_min: 8}\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(driver_mod, "JOINT_MAP_PATH", jm)
+    monkeypatch.setattr(driver_mod, "OBJECTS_PATH", ob)
+    monkeypatch.setattr(replay, "OBJECTS_PATH", ob)
     close = {"kind": "grip", "action": "close", "object": "juice_box", "expect_held": True}
     d = FakeDriver(q0=poses["pick"], gripper0=1.0)
     d.gripper_reading_override = 0.08  # exactly empty-closed (0) + held_min (8 of 100): holding
