@@ -129,8 +129,11 @@ def test_measure_grip_fake_session_readings_and_report():
     assert d.contact_gripper is None
     assert report["mode"] == "fake" and report["stopped"] is False
     assert report["problems"] == [
-        "pill_bottle: held 1 of 2 grasps (A11 needs every grasp held); "
-        "the slipped grasps are left out of held_min"
+        "pill_bottle: 1 of 2 grasps slipped (A11 needs every grasp held); "
+        "the slipped grasps are left out of held_min",
+        # the "n" grasp read the same 25 as the held one: a replay could not tell them apart
+        "pill_bottle: a slipped grasp read 25.0, at or beyond the threshold 12.5; "
+        "a replay would count such a slip as holding",
     ]
     assert report["jaw_open_mm"] == 62.0
     assert report["open_reading_pct"] == pytest.approx(100.0)
@@ -161,7 +164,7 @@ def test_measure_grip_leaves_slipped_grasps_out_of_held_min():
     entry = report["objects"]["juice_box"]
     assert entry["held"] == [False, True, True, True, True]
     assert entry["held_min"] == pytest.approx((16.7 - 0.0) / 2)  # from the held grasps only
-    assert any("held 4 of 5 grasps" in p for p in report["problems"])
+    assert any("1 of 5 grasps slipped" in p for p in report["problems"])
     d = FakeDriver(q0=Q0, gripper0=1.0)
     report = driver.measure_grip(
         d, objects=["juice_box"], grasps=2, ask=scripted(["62", "", "n", "", "n"]), fake_contact_pct=25

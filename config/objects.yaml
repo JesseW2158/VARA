@@ -2,7 +2,9 @@
 # kind: object (skills may move it) | obstacle (never moved; a sim collision body) | hand (the wristband)
 # size: footprint [length along yaw, width across] in meters; the gripper closes across the width.
 # h: height in meters. held_min: gripper reading above empty-closed that means "holding" (0-100 scale).
-# The values below are proposals until A11 replaces them with measurements.
+# held_min is A11's measurement of 2026-10-17 23:00 (runs/calibration/gripper-20261018T030005Z.json, empty
+# close 1.9 on the 0-100 scale); juice_box leaves its one slipped grasp (5.4) out, as measure_grip now does.
+# The sizes and heights are still the kit's proposals: the real props are being chosen (A11 step 3).
 10: {name: pill_bottle, kind: object, shape: cylinder, size: [0.035, 0.035], h: 0.07, held_min: 0.7}
 11: {name: juice_box, kind: object, shape: box, size: [0.063, 0.04], h: 0.105, held_min: 7.4}
 12: {name: tea_tin, kind: object, shape: cylinder, size: [0.04, 0.04], h: 0.09, held_min: 16.1}

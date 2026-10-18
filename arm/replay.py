@@ -20,12 +20,12 @@ as a problem rather than raised, and a waypoint value too large for a float is "
    LINE_SAMPLE_M, both validated against the limits and the box) when the arm is more than 1 degree away,
    then streams the waypoints at 30 Hz with `driver.command(q, current_gripper)`; a `grip` close uses
    `driver.close_gripper_hold()`, which waits until the jaws stop (at least GRIP_SETTLE_S; a close still
-   moving at the driver's timeout counts as not holding), and compares "holding" with `expect_held` (a
-   mismatch rises RISE_M, goes home and returns `grasp_missed`); a `grip` open commands gripper 1.0 and waits
-   OPEN_SETTLE_S; a `live` segment runs `arm.real_robot.carry_to_hand` or `arm.real_robot.home`, and the
-   next path bridges from wherever that left the arm. A sweep is planned from the present pose clamped into
-   the limits minus 3 degrees, so an arm resting against a joint stop (its reading inside the margin) still
-   moves back into the band at the driver's 2 degrees per tick.
+   moving at the driver's timeout counts as a miss whenever `expect_held` is given), and compares "holding"
+   with `expect_held` (a mismatch rises RISE_M, goes home and returns `grasp_missed`); a `grip` open
+   commands gripper 1.0 and waits OPEN_SETTLE_S; a `live` segment runs `arm.real_robot.carry_to_hand` or
+   `arm.real_robot.home`, and the next path bridges from wherever that left the arm. A sweep is planned
+   from the present pose clamped into the limits minus 3 degrees, so an arm resting against a joint stop
+   (its reading inside the margin) still moves back into the band at the driver's 2 degrees per tick.
 4. Every command checks the STOP flag (`driver.stopped`, set by `freeze()`; the arm is already holding),
    the hand and the box: outside `carry_to_hand`, a wristband seen within HAND_FREEZE_M of the tip freezes
    the arm (`hand_too_close`); within HAND_SLOW_M the tip moves at most TIP_SPEED_NEAR_HAND, elsewhere at
@@ -1133,7 +1133,10 @@ def _run_grip(session: Session, index: int, segment: dict) -> None:
     except CloseRefused as refused:
         _abort_grasp(session, refused.reason)
     session.emit(f"{label}: reading {reading:.2f}, holding={holding}")
-    if expect is not None and holding != bool(expect):
+    # A close whose jaws were still moving at the driver's timeout confirms nothing either way: with any
+    # expectation (held or empty) it ends as a missed grasp.
+    timed_out = getattr(session.driver, "grip_status", None) == "timeout"
+    if expect is not None and (timed_out or holding != bool(expect)):
         _abort_grasp(session, "grasp_missed")
 
 

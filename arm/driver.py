@@ -121,6 +121,14 @@ GRIP_POLL_S = 0.05
 GRIP_STILL_PCT = 0.5
 GRIP_STILL_POLLS = 4
 GRIP_TIMEOUT_S = 3.0
+
+
+def _check_grip_wait(settle: float, timeout: float) -> None:
+    """ValueError unless `settle` >= 0 and `timeout` > 0 are finite seconds (a gripper wait's arguments)."""
+    if not (math.isfinite(settle) and settle >= 0 and math.isfinite(timeout) and timeout > 0):
+        raise ValueError(f"settle must be >= 0 and timeout > 0 seconds, got {settle}, {timeout}")
+
+
 DEFAULT_HELD_MIN_PCT = 5.0  # held_threshold() when config/objects.yaml names no held_min at all (0-100 scale)
 STRAIN_TICKS = 15  # ~1.3 degrees; same tolerance as the verified lerobot-tools/sync_goals.py
 DEFAULT_FOLLOWER_ID = "my_awesome_follower_arm"
@@ -729,12 +737,11 @@ class _DriverBase:
         "stopped" (STOP or torque off landed during the wait, or `on_poll` raised; the reading is then
         wherever the freeze held the jaws) or "timeout" (still moving after `timeout` s).
         """
-        if not (math.isfinite(settle) and settle >= 0 and math.isfinite(timeout) and timeout > 0):
-            raise ValueError(f"settle must be >= 0 and timeout > 0 seconds, got {settle}, {timeout}")
+        _check_grip_wait(settle, timeout)
         g = joint_map()["gripper"]
         tolerance = GRIP_STILL_PCT / abs(g["open_pct"] - g["closed_pct"])
         min_polls = math.ceil(settle / GRIP_POLL_S - 1e-9)
-        max_polls = max(min_polls, math.ceil(timeout / GRIP_POLL_S - 1e-9))
+        max_polls = max(1, min_polls, math.ceil(timeout / GRIP_POLL_S - 1e-9))
         history: list[float] = []
         for n in range(1, max_polls + 1):
             self._sleep(GRIP_POLL_S)
@@ -773,12 +780,21 @@ class _DriverBase:
         squeezable object) is held too, at a fresh reading minus 3, so the gripper never keeps pushing toward
         `target`; callers must still treat that grasp as unconfirmed. On "stopped" the freeze already holds.
         """
+        _check_grip_wait(settle, timeout)  # before the close goes out, so bad arguments move nothing
         with self.lock:
             q = list(self.last_command[0]) if self.last_command is not None else self.read()[0]
             if not self.command(q, target):
                 self.grip_status = "stopped"
                 return self.read()[1]
-        reading = self.wait_gripper_still(settle=settle, timeout=timeout, on_poll=on_poll)
+        try:
+            reading = self.wait_gripper_still(settle=settle, timeout=timeout, on_poll=on_poll)
+        except BaseException:
+            # Ctrl+C, a bus error or a hook error mid-close: the close is still commanded and would keep
+            # pushing, so hold the jaws where they are. A STOP or a hand check already froze the arm; a second
+            # freeze would re-stamp frozen_at and distort the Esc latency record.
+            if not self.stopped:
+                self.freeze()
+            raise
         with self.lock:
             if self.grip_status not in ("still", "timeout") or self.stopped or not self.torque:
                 return reading
@@ -1225,7 +1241,7 @@ class Driver(_DriverBase):
         jm = joint_map()
         # The five joints go through send_action so LeRobot's max_relative_target (5 degrees from the
         # present position) stays in place as the second layer. The gripper is written directly: that
-        # cap would turn a close into 20 ticks of 5 % steps and the 0.4 s grip check would read it half open.
+        # cap would turn a close into 20 ticks of 5 % steps and the grip check would read it half open.
         self._robot.send_action(
             {f"{j}.pos": _rad_to_lerobot(j, v, jm) for j, v in zip(JOINTS, q, strict=True)}
         )
@@ -1784,6 +1800,10 @@ def measure_grip(
 
     try:
         session()
+    except BaseException:
+        if not driver.stopped:  # a crash mid-session must not leave a close pushing
+            driver.freeze()
+        raise
     finally:
         if fake_contact_pct is not None:
             driver.contact_gripper = None
@@ -1792,8 +1812,8 @@ def measure_grip(
         slipped = sum(1 for _, held in answers if held is False)
         if slipped:
             problems.append(
-                f"{name}: held {len(answers) - slipped} of {len(answers)} grasps (A11 needs every grasp "
-                "held); the slipped grasps are left out of held_min"
+                f"{name}: {slipped} of {len(answers)} grasps slipped (A11 needs every grasp held); "
+                "the slipped grasps are left out of held_min"
             )
         # held_min separates holding from not holding, so a grasp answered "not held" never sets it: its
         # reading is what a miss looks like. Unanswered grasps (blank or EOF) still count.
@@ -1805,6 +1825,17 @@ def measure_grip(
                 )
             except ValueError as exc:
                 problems.append(f"{name}: {exc}")
+            else:
+                # A slip that reads at or beyond the threshold would count as holding during a replay.
+                empty = report["empty_closed_pct"]
+                toward_open = 1.0 if jm["gripper"]["open_pct"] >= empty else -1.0
+                for reading, held in answers:
+                    if held is False and toward_open * (reading - empty) >= entry["held_min"] - 1e-9:
+                        problems.append(
+                            f"{name}: a slipped grasp read {reading:.1f}, at or beyond the threshold "
+                            f"{empty + toward_open * entry['held_min']:.1f}; a replay would count such a "
+                            "slip as holding"
+                        )
         elif not entry["closed_pct"]:
             problems.append(f"{name}: no closed reading recorded")
         elif not readings:

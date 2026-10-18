@@ -19,7 +19,22 @@ HOME = list(ik.home_q())
 
 @pytest.fixture(autouse=True)
 def fresh(monkeypatch, tmp_path):
+    """Evidence under tmp_path and the kit's placeholder gripper config (empty close 0, held_min 8), so these
+    tests do not depend on what A11 measured on this arm."""
     monkeypatch.setenv("VARA_RUNS_DIR", str(tmp_path / "runs"))
+    joint_map = tmp_path / "kit_joint_map.yaml"
+    joint_map.write_text("gripper: {closed_pct: 0, open_pct: 100}\n", encoding="utf-8")
+    objects = tmp_path / "kit_objects.yaml"
+    objects.write_text(
+        "10: {name: pill_bottle, kind: object, shape: cylinder, size: [0.035, 0.035], h: 0.07, held_min: 8}\n"
+        "11: {name: juice_box, kind: object, shape: box, size: [0.063, 0.04], h: 0.105, held_min: 8}\n"
+        "12: {name: tea_tin, kind: object, shape: cylinder, size: [0.04, 0.04], h: 0.09, held_min: 8}\n"
+        "30: {name: cereal_box, kind: obstacle, shape: box, size: [0.19, 0.06], h: 0.2}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(driver, "JOINT_MAP_PATH", joint_map)
+    monkeypatch.setattr(driver, "OBJECTS_PATH", objects)
+    monkeypatch.setattr(replay, "OBJECTS_PATH", objects)
     reset_driver()
     yield
     reset_driver()
@@ -207,3 +222,96 @@ def _close_traj() -> dict:
             {"kind": "grip", "action": "close", "object": "juice_box", "expect_held": True},
         ],
     }
+
+
+# -- second review round (2026-10-17) ------------------------------------------------------------------------
+
+
+class FlakyBus(SlowJaws):
+    """SlowJaws whose read raises a bus error on one poll, as a dead serial line would."""
+
+    def __init__(self, *args, fail_on_poll: int, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.fail_on_poll = fail_on_poll
+
+    def read(self):
+        if self.polls == self.fail_on_poll:
+            raise ConnectionError("Failed to sync read 'Present_Position'")
+        return super().read()
+
+
+def test_a_bus_error_mid_close_freezes_the_jaws_instead_of_leaving_the_close_pushing():
+    d = FlakyBus(q0=HOME, gripper0=1.0, step=0.02, fail_on_poll=5)
+    with pytest.raises(ConnectionError):
+        d.close_gripper_hold()
+    assert d.stopped and d.last_command is None  # frozen: goal = present, no close left commanded
+
+
+def test_ctrl_c_from_the_poll_hook_freezes_and_propagates():
+    d = SlowJaws(q0=HOME, gripper0=1.0, step=0.02)
+
+    def interrupt() -> None:
+        if d.polls == 4:
+            raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        d.close_gripper_hold(on_poll=interrupt)
+    assert d.stopped and d.grip_status == "stopped"
+
+
+def test_a_hook_that_already_froze_the_arm_is_not_frozen_twice():
+    d = SlowJaws(q0=HOME, gripper0=1.0, step=0.02)
+
+    class HandTooClose(Exception):
+        pass
+
+    def hand_check() -> None:
+        if d.polls == 3:
+            d.freeze()  # what Session.check_hand does before raising Abort
+            raise HandTooClose
+
+    with pytest.raises(HandTooClose):
+        d.close_gripper_hold(on_poll=hand_check)
+    frozen_at = d.frozen_at
+    assert d.stopped and frozen_at is not None
+    assert d.frozen_at == frozen_at  # no second freeze re-stamped it (the Esc latency record reads it)
+
+
+def test_bad_wait_arguments_are_refused_before_the_close_is_sent():
+    d = FakeDriver(q0=HOME, gripper0=1.0)
+    with pytest.raises(ValueError):
+        d.close_gripper_hold(timeout=float("nan"))
+    assert d.commands == []
+    d.close_gripper_hold(settle=0.0, timeout=1e-11)  # rounds to zero polls: still at least one, no IndexError
+    assert d.grip_status in ("still", "timeout")
+
+
+def test_a_timed_out_close_is_a_miss_even_when_an_empty_grip_was_expected():
+    d = SlowJaws(q0=HOME, gripper0=1.0, step=0.004)
+    traj = _close_traj()
+    traj["segments"][1]["expect_held"] = False
+    result = replay.replay(traj, driver=d, realtime=False)
+    assert result["reason"] == "grasp_missed"
+
+
+def test_a_crash_in_the_measurement_session_freezes_the_gripper():
+    d = FlakyBus(q0=HOME, gripper0=0.0, step=0.02, fail_on_poll=30)
+    with pytest.raises(ConnectionError):
+        driver.measure_grip(d, objects=["pill_bottle"], grasps=1, ask=lambda p: "62", fake_contact_pct=25)
+    assert d.stopped
+
+
+def test_a_slip_reading_at_or_beyond_the_threshold_is_flagged():
+    d = FakeDriver(q0=HOME, gripper0=1.0)
+    contacts = iter([20.0, 15.0, 20.0])  # held, slipped (but high), held: held_min 10, threshold 10
+    original = d.close_gripper_hold
+
+    def close_on_the_next_contact(*args, **kwargs):
+        d.contact_gripper = driver._pct_to_gripper(next(contacts), driver.joint_map())
+        return original(*args, **kwargs)
+
+    d.close_gripper_hold = close_on_the_next_contact  # type: ignore[method-assign]
+    answers = iter(["62", "", "y", "", "n", "", "y"])
+    report = driver.measure_grip(d, objects=["juice_box"], grasps=3, ask=lambda p: next(answers, ""))
+    assert report["objects"]["juice_box"]["held_min"] == pytest.approx(10.0)
+    assert any("a slipped grasp read 15.0, at or beyond the threshold 10.0" in p for p in report["problems"])
