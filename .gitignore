@@ -13,5 +13,5 @@ rl/runs/
 sim/model/*.part
 web/static/rl/*
 !web/static/rl/.gitkeep
-web/static/rl_sim.mp4
+!web/static/rl/curves.json
 MUJOCO_LOG.TXT

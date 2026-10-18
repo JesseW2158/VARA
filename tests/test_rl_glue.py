@@ -1,18 +1,28 @@
 """D3-D7 glue: the reward writer in FAKE_LLM (four checked variants, the saved prompt and reply, one retry
 per rejected variant, never an exec), the parallel trainer (local subprocesses with tiny step counts, and
 a fake Daytona client covering create/upload/exec/poll/download/delete, the cap of 4 and the delete in
-`finally`), the policy runner on the FakeDriver (success, timeout, STOP, the gripper, the ceiling, the
-scene handling) and the video renderer's exit codes."""
+`finally`), the snapshot check (one sandbox, the import line, the record, the delete on every path, the
+CLI's exit codes), the account-wide RL cap (a check or a training that would take the account's vara=rl
+and vara=rl-check sandboxes past 4 creates nothing), included runs (an already trained run joins the
+selection and the curves without retraining, compare-only mode, --no-copy, the validation before anything
+trains, result.json never overwritten), the deployed policy's provenance file kept true to the copy, the
+tracked curves.json and rl_sim.mp4 against the dashboard and the policy provenance, the policy runner on
+the FakeDriver (success, timeout, STOP, the gripper, the ceiling, the scene handling) and the video
+renderer's exit codes."""
 
 from __future__ import annotations
 
+import hashlib
 import inspect
 import io
 import json
+import logging
 import math
 import pathlib
+import signal
 import tarfile
 import time
+import types
 
 import numpy as np
 import pytest
@@ -406,6 +416,8 @@ class FakeSandbox:
             raise RuntimeError(f"exec failed: {command}")
         if self.client.interrupt_on and self.client.interrupt_on in command:
             raise KeyboardInterrupt
+        if "import torch" in command:  # the snapshot check
+            return FakeResponse(self.client.versions, self.client.check_exit)
         if "progress.csv" in command:
             self.polls += 1
             rows = self.client.progress_text(self).splitlines()
@@ -425,19 +437,56 @@ class FakeSandbox:
             raise FileNotFoundError(path)
         return files[name]
 
+    @property
+    def labels(self) -> dict[str, str]:  # what `Daytona.list()` reports, as on a real Sandbox
+        return dict(getattr(self.params, "labels", None) or {})
+
+    @property
+    def state(self) -> str:
+        return "destroyed" if self.deleted else "started"
+
     def delete(self, timeout: float | None = 60, wait: bool = False) -> None:
+        if self.client.delete_error is not None:
+            raise self.client.delete_error
         self.deleted = True
 
 
 class FakeDaytona:
-    def __init__(self, rates, means, *, dead=(), fail_on=None, interrupt_on=None, polls_until_done=3) -> None:
+    def __init__(
+        self,
+        rates,
+        means,
+        *,
+        dead=(),
+        fail_on=None,
+        interrupt_on=None,
+        polls_until_done=3,
+        check_exit=0,
+        versions="2.5.1 2.4.0 3.2.6",
+        account=(),
+        list_error=None,
+        delete_error=None,
+    ) -> None:
         self.rates = list(rates)
         self.means = list(means)
         self.dead = set(dead)
         self.fail_on = fail_on
         self.interrupt_on = interrupt_on
         self.polls_until_done = polls_until_done
+        self.check_exit = check_exit  # exit code of the snapshot check's import line
+        self.versions = versions  # its stdout
+        self.account = list(account)  # sandboxes other processes hold on the account
+        self.list_error = list_error  # raised by list() when set
+        self.delete_error = delete_error  # raised by every sandbox's delete() when set
+        self.list_calls = 0
         self.sandboxes: list[FakeSandbox] = []
+
+    def list(self, query=None, request_timeout=None):
+        """`Daytona.list()` (a generator in daytona 0.225): the account's other sandboxes, then ours."""
+        self.list_calls += 1
+        if self.list_error is not None:
+            raise self.list_error
+        yield from [*self.account, *self.sandboxes]
 
     def create(self, params, *, timeout: float = 60, on_snapshot_create_logs=None) -> FakeSandbox:
         assert len(self.sandboxes) < 4, "a fifth RL sandbox was requested"
@@ -671,6 +720,613 @@ def test_train_parallel_cli_reports_daytona_errors_without_a_traceback(
     monkeypatch.setattr(tp, "train_parallel", buggy_train)
     with pytest.raises(KeyError):
         tp.main(args)
+
+
+# ----------------------------------------------------------------------------------- snapshot check
+
+
+def test_check_rl_snapshot_runs_the_import_in_one_sandbox_and_deletes_it(tmp_path, monkeypatch):
+    fake = FakeDaytona([0.5], [40.0])
+    monkeypatch.setattr(tp, "_daytona_factory", lambda: fake)
+    lines: list[str] = []
+    record = tp.check_rl_snapshot("arm-rl-v1", report=lines.append, out_dir=tmp_path / "rl")
+    assert len(fake.sandboxes) == 1
+    sandbox = fake.sandboxes[0]
+    assert sandbox.deleted and sandbox.params.snapshot == "arm-rl-v1"
+    assert sandbox.params.auto_stop_interval == 0 and sandbox.params.labels == {"vara": "rl-check"}
+    assert len(sandbox.commands) == 1 and "import torch, stable_baselines3, mujoco" in sandbox.commands[0][0]
+    assert sandbox.commands[0][0] == tp.SNAPSHOT_CHECK_CMD and sandbox.uploads == {}
+    assert record["snapshot"] == "arm-rl-v1" and record["sandbox_id"] == "sb-1" and record["built"] is None
+    assert record["exit_code"] == 0 and record["output"] == fake.versions and record["error"] is None
+    assert record["deleted"] is True and record["ok"] is True and record["elapsed_s"] >= 0
+    assert "T" in record["created"] and record["command"] == tp.SNAPSHOT_CHECK_CMD
+    path = pathlib.Path(record["record"])
+    assert (
+        path.parent == tmp_path / "rl" and path.name.startswith("snapshot-check-") and path.suffix == ".json"
+    )
+    assert json.loads(path.read_text(encoding="utf-8")) == record
+    assert any("sb-1 created from arm-rl-v1" in line for line in lines)
+    assert any("sb-1 deleted" in line for line in lines)
+    again = tp.check_rl_snapshot("arm-rl-v1", report=lines.append, out_dir=tmp_path / "rl")
+    assert again["record"] != record["record"]  # a new file per check, never an overwrite
+    assert len(list((tmp_path / "rl").glob("snapshot-check-*.json"))) == 2
+    assert len(fake.sandboxes) == 2 and all(sb.deleted for sb in fake.sandboxes)
+
+
+def test_check_rl_snapshot_records_a_failure_and_still_deletes_the_sandbox(tmp_path, monkeypatch):
+    fake = FakeDaytona([0.5], [40.0], check_exit=1, versions="ModuleNotFoundError: No module named 'mujoco'")
+    monkeypatch.setattr(tp, "_daytona_factory", lambda: fake)
+    record = tp.check_rl_snapshot(out_dir=tmp_path)
+    assert record["snapshot"] == tp.SNAPSHOT_NAME and record["exit_code"] == 1
+    assert record["ok"] is False and record["deleted"] is True and "mujoco" in record["output"]
+    assert fake.sandboxes[0].deleted
+
+    fake = FakeDaytona([0.5], [40.0], fail_on="import torch")
+    monkeypatch.setattr(tp, "_daytona_factory", lambda: fake)
+    record = tp.check_rl_snapshot(out_dir=tmp_path)
+    assert record["exit_code"] is None and record["ok"] is False and record["deleted"] is True
+    assert record["error"].startswith("RuntimeError: exec failed") and fake.sandboxes[0].deleted
+
+    def broken_factory():
+        raise RuntimeError("no client")
+
+    monkeypatch.setattr(tp, "_daytona_factory", broken_factory)
+    record = tp.check_rl_snapshot(out_dir=tmp_path)
+    assert record["ok"] is False and record["sandbox_id"] is None and record["deleted"] is False
+    assert record["error"] == "RuntimeError: no client"
+
+    fake = FakeDaytona([0.5], [40.0], interrupt_on="import torch")
+    monkeypatch.setattr(tp, "_daytona_factory", lambda: fake)
+    with pytest.raises(KeyboardInterrupt):
+        tp.check_rl_snapshot(out_dir=tmp_path)
+    assert fake.sandboxes[0].deleted
+    records = sorted(tmp_path.glob("snapshot-check-*.json"))
+    assert len(records) == 4
+    assert all(json.loads(p.read_text(encoding="utf-8"))["ok"] is False for p in records)
+
+
+def test_verify_snapshot_cli_checks_without_training(tmp_path, monkeypatch, capsys):
+    from daytona.common.errors import DaytonaError
+
+    monkeypatch.setenv("VARA_RUNS_DIR", str(tmp_path / "runs"))
+
+    def never(*args, **kwargs):
+        raise AssertionError("must not be called")
+
+    monkeypatch.setattr(tp, "train_parallel", never)
+    monkeypatch.setattr(tp, "_run_local", never)
+    monkeypatch.setattr(tp, "_run_sandboxes", never)
+    monkeypatch.setattr(tp, "_daytona_factory", never)
+    monkeypatch.setattr(tp, "build_rl_snapshot", never)
+    monkeypatch.delenv("DAYTONA_API_KEY", raising=False)
+    assert tp.main(["--verify-snapshot"]) == 2
+    err = capsys.readouterr().err
+    assert "DAYTONA_API_KEY is not set" in err and "training locally" not in err
+    assert not (tmp_path / "runs").exists()
+
+    monkeypatch.setenv("DAYTONA_API_KEY", "dtn_not_a_real_key")
+    fake = FakeDaytona([0.5], [40.0])
+    monkeypatch.setattr(tp, "_daytona_factory", lambda: fake)
+    built: list[str] = []
+    monkeypatch.setattr(tp, "build_rl_snapshot", lambda name, **kwargs: built.append(name))
+    assert tp.main(["--build-snapshot", "--verify-snapshot", "--snapshot", "arm-rl-v2"]) == 0
+    captured = capsys.readouterr()
+    assert built == ["arm-rl-v2"] and len(fake.sandboxes) == 1 and fake.sandboxes[0].deleted
+    assert fake.sandboxes[0].params.snapshot == "arm-rl-v2"
+    last = json.loads(captured.out.strip().splitlines()[-1])
+    assert last["ok"] is True and last["exit_code"] == 0 and last["deleted"] is True
+    assert last["output"] == fake.versions and last["snapshot"] == "arm-rl-v2" and last["built"] is True
+    assert pathlib.Path(last["record"]).parent == tmp_path / "runs" / "rl"
+    assert json.loads(pathlib.Path(last["record"]).read_text(encoding="utf-8"))["built"] is True
+    assert "dtn_not_a_real_key" not in captured.out + captured.err
+
+    fake = FakeDaytona([0.5], [40.0], fail_on="import torch")  # the alias, a failing exec: exit 1
+    monkeypatch.setattr(tp, "_daytona_factory", lambda: fake)
+    assert tp.main(["--check-snapshot"]) == 1
+    assert fake.sandboxes[0].deleted and built == ["arm-rl-v2"]
+    last = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert last["ok"] is False and last["error"].startswith("RuntimeError") and last["built"] is None
+
+    assert tp.main(["--verify-snapshot", "--local"]) == 2  # no local mode for the check
+    assert "no --local mode" in capsys.readouterr().err and len(fake.sandboxes) == 1
+
+    def failing_build(name, **kwargs):
+        raise DaytonaError("snapshot build failed")
+
+    monkeypatch.setattr(tp, "build_rl_snapshot", failing_build)
+    assert tp.main(["--build-snapshot", "--verify-snapshot"]) == 1  # a failed build is a failed check
+    last = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert last["built"] is False and last["error"] == "DaytonaError: snapshot build failed"
+    assert last["ok"] is False and last["sandbox_id"] is None and last["deleted"] is False
+    assert len(fake.sandboxes) == 1  # no sandbox from a snapshot whose build failed
+    records = sorted((tmp_path / "runs" / "rl").glob("snapshot-check-*.json"))
+    assert len(records) == 3 and pathlib.Path(last["record"]) in records
+
+
+def test_train_parallel_help_lists_the_flags(capsys):
+    with pytest.raises(SystemExit) as info:
+        tp.main(["--help"])
+    assert info.value.code == 0
+    out = capsys.readouterr().out
+    for flag in ("--verify-snapshot", "--check-snapshot", "--include-run", "--no-copy", "--build-snapshot"):
+        assert flag in out, flag
+
+
+def test_verify_snapshot_cli_refuses_training_flags(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("DAYTONA_API_KEY", "dtn_not_a_real_key")
+
+    def never(*args, **kwargs):
+        raise AssertionError("must not be called")
+
+    monkeypatch.setattr(tp, "_daytona_factory", never)
+    monkeypatch.setattr(tp, "build_rl_snapshot", never)
+    monkeypatch.setattr(tp, "train_parallel", never)
+    for extra in (
+        ["--include-run", str(tmp_path)],
+        ["--rewards"],
+        ["--no-copy"],
+        ["--rewards", "a.py", "--no-copy"],
+    ):
+        assert tp.main(["--verify-snapshot", *extra]) == 2
+        err = capsys.readouterr().err
+        assert "never trains; drop" in err and "dtn_not_a_real_key" not in err
+    assert err.strip().endswith("drop --rewards, --no-copy")
+
+
+def test_check_rl_snapshot_records_a_failed_delete(tmp_path, monkeypatch, capsys):
+    fake = FakeDaytona([0.5], [40.0], delete_error=RuntimeError("delete timed out"))
+    monkeypatch.setattr(tp, "_daytona_factory", lambda: fake)
+    lines: list[str] = []
+    record = tp.check_rl_snapshot(out_dir=tmp_path, report=lines.append)
+    assert record["exit_code"] == 0 and record["output"] == fake.versions  # the import itself passed
+    assert record["deleted"] is False and record["ok"] is False
+    assert record["error"] == "delete failed: RuntimeError: delete timed out"
+    assert any("delete FAILED" in line for line in lines)
+    monkeypatch.setenv("DAYTONA_API_KEY", "dtn_not_a_real_key")
+    monkeypatch.setenv("VARA_RUNS_DIR", str(tmp_path / "runs"))
+    assert tp.main(["--check-snapshot"]) == 1  # a leaked sandbox is a failed check
+    assert json.loads(capsys.readouterr().out.strip().splitlines()[-1])["deleted"] is False
+
+
+def account_sandbox(label: str | None, state: object = "started", n: int = 0) -> types.SimpleNamespace:
+    """A sandbox another process holds on the account, shaped like what `Daytona.list()` yields."""
+    labels = {"vara": label} if label else {"project": "not-vara"}
+    return types.SimpleNamespace(id=f"other-{label}-{n}", labels=labels, state=state)
+
+
+def test_snapshot_check_counts_against_the_account_rl_cap(tmp_path, monkeypatch, capsys, caplog):
+    busy = [account_sandbox("rl", n=k) for k in range(3)] + [account_sandbox("rl-check")]
+    others = [
+        account_sandbox("pool"),  # the scoring pool has its own cap of 7
+        account_sandbox(None),
+        account_sandbox("rl", "destroying", 7),
+        account_sandbox("rl", types.SimpleNamespace(value="destroyed"), 8),  # a SandboxState-like enum
+    ]
+    fake = FakeDaytona([0.5], [40.0], account=busy + others)
+    monkeypatch.setattr(tp, "_daytona_factory", lambda: fake)
+    record = tp.check_rl_snapshot(out_dir=tmp_path)
+    assert fake.list_calls == 1 and fake.sandboxes == []  # four RL sandboxes on the account: none created
+    assert record["ok"] is False and record["sandbox_id"] is None and record["deleted"] is False
+    assert record["error"].startswith("RuntimeError: refusing to create 1 RL sandbox(es)")
+    assert "already holds 4" in record["error"] and record["exit_code"] is None
+    assert json.loads(pathlib.Path(record["record"]).read_text(encoding="utf-8")) == record
+
+    fake = FakeDaytona([0.5], [40.0], account=busy[1:] + others)  # three: the check fits under the cap
+    monkeypatch.setattr(tp, "_daytona_factory", lambda: fake)
+    record = tp.check_rl_snapshot(out_dir=tmp_path)
+    assert record["ok"] is True and len(fake.sandboxes) == 1 and fake.sandboxes[0].deleted
+
+    fake = FakeDaytona([0.5], [40.0], list_error=RuntimeError("listing is down"))
+    monkeypatch.setattr(tp, "_daytona_factory", lambda: fake)
+    with caplog.at_level(logging.WARNING, logger=tp.__name__):
+        record = tp.check_rl_snapshot(out_dir=tmp_path)  # a failed listing does not block the check
+    assert record["ok"] is True and fake.list_calls == 1 and fake.sandboxes[0].deleted
+    assert "the RL cap holds per process only" in caplog.text
+
+    monkeypatch.setenv("DAYTONA_API_KEY", "dtn_not_a_real_key")
+    monkeypatch.setenv("VARA_RUNS_DIR", str(tmp_path / "runs"))
+    fake = FakeDaytona([0.5], [40.0], account=busy)
+    monkeypatch.setattr(tp, "_daytona_factory", lambda: fake)
+    assert tp.main(["--verify-snapshot"]) == 1  # refused and recorded, nothing created
+    last = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert last["ok"] is False and "refusing" in last["error"] and fake.sandboxes == []
+    assert len(list((tmp_path / "runs" / "rl").glob("snapshot-check-*.json"))) == 1
+
+
+def test_training_refuses_when_the_account_would_exceed_the_rl_cap(
+    tmp_path, monkeypatch, fixture_rewards, capsys
+):
+    monkeypatch.setattr(tp, "sleep", lambda seconds: None)
+    before = signal.getsignal(signal.SIGTERM)
+    fake = FakeDaytona([0.5] * 4, [40.0] * 4, account=[account_sandbox("rl-check")])  # a check in flight
+    monkeypatch.setattr(tp, "_daytona_factory", lambda: fake)
+    with pytest.raises(RuntimeError, match=r"refusing to create 4 RL sandbox\(es\).*already holds 1"):
+        tp.train_parallel(
+            fixture_rewards,
+            steps=10,
+            out_dir=tmp_path / "p",
+            curves_path=tmp_path / "c.json",
+            policy_dest=tmp_path / "best.zip",
+        )
+    assert fake.sandboxes == [] and fake.list_calls == 1
+    assert signal.getsignal(signal.SIGTERM) is before  # refused before the handler went in
+    assert not (tmp_path / "c.json").exists() and not (tmp_path / "best.zip").exists()
+    assert not (tmp_path / "p" / "result.json").exists()
+
+    monkeypatch.setenv("DAYTONA_API_KEY", "dtn_not_a_real_key")
+    args = ["--rewards", *map(str, fixture_rewards), "--steps", "10", "--out", str(tmp_path / "cli")]
+    args += ["--curves", str(tmp_path / "c.json"), "--policy-dest", str(tmp_path / "best.zip")]
+    assert tp.main(args) == 2
+    err = capsys.readouterr().err
+    assert err.strip().startswith("error: RuntimeError: refusing to create 4") and fake.sandboxes == []
+
+    others = [account_sandbox("rl-check"), account_sandbox("pool"), account_sandbox("rl", "destroying")]
+    fake = FakeDaytona([0.5, 0.6, 0.7], [40.0] * 3, account=others)
+    monkeypatch.setattr(tp, "_daytona_factory", lambda: fake)
+    result = tp.train_parallel(  # one RL sandbox on the account plus three new ones is exactly the cap
+        fixture_rewards[:3],
+        steps=10,
+        out_dir=tmp_path / "q",
+        poll_s=1.0,
+        curves_path=tmp_path / "d.json",
+        policy_dest=tmp_path / "best.zip",
+    )
+    assert len(fake.sandboxes) == 3 and all(sb.deleted for sb in fake.sandboxes)
+    assert result["chosen"] == "variant_3" and (tmp_path / "best.zip").read_bytes() == b"PK-policy-3"
+
+
+# ------------------------------------------------------------------------------------ included runs
+
+
+def existing_run(
+    directory: pathlib.Path,
+    *,
+    rate: float | None,
+    mean: float | None,
+    policy: bytes,
+    steps: int = 507_904,
+    reward: str = "rl/rewards/baseline.py",
+    progress: bool = True,
+    extra: dict | None = None,
+) -> pathlib.Path:
+    """A run directory shaped like rl/train.py's output (policy.zip, summary.json, optional progress.csv);
+    `extra` adds summary keys (requested_steps, seed, eval_seed, mean_final_dist...)."""
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "policy.zip").write_bytes(policy)
+    summary = {
+        "episodes": 100 if rate is not None else 0,
+        "successes": int(round(100 * rate)) if rate is not None else None,
+        "success_rate": rate,
+        "mean_steps_to_success": mean,
+        "falls": 0,
+        "steps": steps,
+        "reward": reward,
+        **(extra or {}),
+    }
+    (directory / "summary.json").write_text(json.dumps(summary), encoding="utf-8")
+    if progress:
+        last = rate if rate is not None else "nan"
+        rows = f"step,mean_reward,success_rate\n20000,-1.0,0.1\n40000,2.0,0.5\n{steps},3.0,{last}\n"
+        (directory / "progress.csv").write_text(rows, encoding="utf-8")
+    return directory
+
+
+def test_train_parallel_includes_an_existing_run_in_the_selection(tmp_path, monkeypatch, fixture_rewards):
+    def never(*args, **kwargs):
+        raise AssertionError("local mode must not touch Daytona")
+
+    monkeypatch.setattr(tp, "_daytona_factory", never)
+    baseline = existing_run(tmp_path / "runs" / "baseline", rate=1.0, mean=5.0, policy=b"PK-baseline")
+    before = (baseline / "summary.json").read_bytes()
+    out = tmp_path / "parallel"
+    curves = tmp_path / "static" / "rl" / "curves.json"
+    dest = tmp_path / "policies" / "handoff_best.zip"
+    lines: list[str] = []
+    result = tp.train_parallel(
+        fixture_rewards[:2],
+        steps=512,
+        out_dir=out,
+        local=True,
+        n_envs=1,
+        eval_episodes=2,
+        poll_s=0.2,
+        include_runs={"baseline": baseline},
+        policy_dest=dest,
+        curves_path=curves,
+        report=lines.append,
+    )
+    assert result["candidates"] == ["variant_1", "variant_2", "baseline"] and result["included"] == [
+        "baseline"
+    ]
+    assert result["chosen"] == "baseline" and result["runner"] == "local" and result["steps"] == 512
+    trained = result["variants"][:2]
+    assert all(v["included"] is False and v["runner"] == "local" and not v["chosen"] for v in trained)
+    assert all((out / v["name"] / "policy.zip").is_file() for v in trained)
+    extra = result["variants"][2]
+    assert extra["runner"] == "existing" and extra["included"] is True and extra["chosen"] is True
+    assert extra["hint"] == "existing run (not retrained): baseline, 507,904 steps"
+    assert extra["reward"] == "rl/rewards/baseline.py" and extra["out_dir"] == str(baseline)
+    assert extra["success_rate"] == 1.0 and extra["mean_steps_to_success"] == 5.0 and extra["error"] is None
+    assert [row["step"] for row in extra["progress"]] == [20000, 40000, 507904]
+    digest = hashlib.sha256(b"PK-baseline").hexdigest()
+    assert extra["policy_sha256"] == digest == result["policy_sha256"]
+    assert pathlib.Path(result["source_policy"]) == (baseline / "policy.zip").resolve()
+    assert dest.read_bytes() == b"PK-baseline" and result["policy"] == str(dest)
+    provenance = tmp_path / "policies" / "handoff_best.json"  # written next to the copy
+    assert result["provenance"] == str(provenance)
+    record = json.loads(provenance.read_text(encoding="utf-8"))
+    assert record["sha256"] == digest and record["source_policy"] == result["source_policy"]
+    assert record["policy"] == "handoff_best.zip" and record["steps"] == 507_904
+    assert (baseline / "summary.json").read_bytes() == before and not (baseline / "train.log").exists()
+    data = json.loads(curves.read_text(encoding="utf-8"))
+    assert [v["name"] for v in data["variants"]] == result["candidates"] and data["chosen"] == "baseline"
+    assert [v["chosen"] for v in data["variants"]] == [False, False, True]
+    assert data["variants"][2]["steps"] == [20000, 40000, 507904]
+    assert data["variants"][2]["success"] == [0.1, 0.5, 1.0] and data["variants"][2]["hint"] == extra["hint"]
+    saved = json.loads((out / "result.json").read_text(encoding="utf-8"))
+    assert saved["chosen"] == data["chosen"] == "baseline" and saved["candidates"] == result["candidates"]
+    assert saved["policy_sha256"] == digest and saved["source_policy"] == result["source_policy"]
+    assert any(line.startswith("chosen: baseline (existing run") for line in lines)
+
+
+def test_train_parallel_compares_existing_runs_without_training(tmp_path, monkeypatch):
+    def never(*args, **kwargs):
+        raise AssertionError("nothing must train")
+
+    monkeypatch.setattr(tp, "_daytona_factory", never)
+    monkeypatch.setattr(tp, "_run_local", never)
+    monkeypatch.setattr(tp, "_run_sandboxes", never)
+    runs = tmp_path / "runs"
+    existing_run(runs / "baseline", rate=0.94, mean=43.6, policy=b"PK-a")
+    existing_run(
+        runs / "variant_1", rate=0.94, mean=30.0, policy=b"PK-b", steps=151_552, reward="variant_1.py"
+    )
+    existing_run(runs / "variant_2", rate=0.41, mean=54.4, policy=b"PK-c", progress=False)
+    existing_run(runs / "unevaluated", rate=None, mean=None, policy=b"PK-d")
+    lines: list[str] = []
+    result = tp.train_parallel(
+        [],
+        include_runs=[runs / "baseline", runs / "variant_1", runs / "variant_2", runs / "unevaluated"],
+        out_dir=tmp_path / "compare",
+        policy_dest=None,
+        curves_path=tmp_path / "curves.json",
+        report=lines.append,
+    )
+    assert result["candidates"] == ["baseline", "variant_1", "variant_2", "unevaluated"]
+    assert result["included"] == result["candidates"] and result["runner"] == "existing"
+    assert result["steps"] is None and result["chosen"] == "variant_1"  # 0.94 in 30 steps beats 0.94 in 43.6
+    assert result["policy"] is None and not (tmp_path / "policies").exists()
+    assert result["policy_sha256"] == hashlib.sha256(b"PK-b").hexdigest()
+    assert pathlib.Path(result["source_policy"]) == (runs / "variant_1" / "policy.zip").resolve()
+    assert (
+        result["variants"][1]["hint"] == "existing run (not retrained): exponential distance, 151,552 steps"
+    )
+    unevaluated = result["variants"][3]
+    assert unevaluated["success_rate"] is None and unevaluated["error"] is None and not unevaluated["chosen"]
+    assert result["variants"][2]["progress"] == []
+    data = json.loads((tmp_path / "curves.json").read_text(encoding="utf-8"))
+    assert data["chosen"] == "variant_1" and data["variants"][2]["steps"] == []
+    assert data["variants"][3]["success"] == [0.1, 0.5, None]
+    assert (
+        json.loads((tmp_path / "compare" / "result.json").read_text(encoding="utf-8"))["chosen"]
+        == "variant_1"
+    )
+    assert any("nothing to train" in line for line in lines)
+    assert any("policy not copied" in line for line in lines)
+
+
+def test_included_runs_are_validated_before_anything_trains(tmp_path, monkeypatch, fixture_rewards):
+    def never(*args, **kwargs):
+        raise AssertionError("nothing must train")
+
+    monkeypatch.setattr(tp, "_daytona_factory", never)
+    monkeypatch.setattr(tp, "_run_local", never)
+    monkeypatch.setattr(tp, "_run_sandboxes", never)
+    good = existing_run(tmp_path / "good", rate=0.5, mean=20.0, policy=b"PK")
+    out = tmp_path / "o"
+    with pytest.raises(FileNotFoundError, match="not found"):
+        tp.train_parallel(
+            fixture_rewards, steps=10, out_dir=out, local=True, include_runs=[tmp_path / "nope"]
+        )
+    no_policy = tmp_path / "no_policy"
+    no_policy.mkdir()
+    (no_policy / "summary.json").write_text("{}", encoding="utf-8")
+    with pytest.raises(FileNotFoundError, match="policy.zip"):
+        tp.train_parallel(fixture_rewards, steps=10, out_dir=out, local=True, include_runs=[no_policy])
+    with pytest.raises(ValueError, match="collides"):
+        tp.train_parallel(
+            fixture_rewards, steps=10, out_dir=out, local=True, include_runs={"variant_1": good}
+        )
+    with pytest.raises(ValueError, match="collides"):
+        tp.train_parallel([], out_dir=out, include_runs=[good, tmp_path / "good"])
+    with pytest.raises(ValueError, match="needs a name"):
+        tp.train_parallel([], out_dir=out, include_runs={"": good})
+    bad = existing_run(tmp_path / "bad", rate=0.5, mean=20.0, policy=b"PK")
+    (bad / "summary.json").write_text("[1, 2]", encoding="utf-8")
+    with pytest.raises(ValueError, match="unreadable summary.json"):
+        tp.train_parallel([], out_dir=out, include_runs=[bad])
+    with pytest.raises(ValueError, match="at least one"):
+        tp.train_parallel([], out_dir=out, include_runs=[])
+    assert not out.exists() and not (tmp_path / "curves.json").exists()  # a refusal leaves no directory
+    assert tp.included_runs(None) == [] and tp.included_runs([]) == []
+    weird = existing_run(tmp_path / "my run (v2)", rate=0.5, mean=20.0, policy=b"PK")
+    names = [run["name"] for run in tp.included_runs([good, weird], taken=["variant_1"])]
+    assert names == ["good", "my_run_v2_"]
+    args = ["--local", "--rewards", str(fixture_rewards[0]), "--include-run", str(tmp_path / "nope")]
+    assert tp.main(args + ["--out", str(tmp_path / "cli")]) == 2  # exit 2 before any subprocess starts
+    assert not (tmp_path / "cli").exists()
+
+
+def test_train_parallel_cli_compares_existing_runs_only(tmp_path, monkeypatch, capsys):
+    monkeypatch.delenv("DAYTONA_API_KEY", raising=False)
+
+    def never(*args, **kwargs):
+        raise AssertionError("nothing must train")
+
+    monkeypatch.setattr(tp, "_daytona_factory", never)
+    monkeypatch.setattr(tp, "_run_local", never)
+    monkeypatch.setattr(tp, "_run_sandboxes", never)
+    monkeypatch.setattr(tp, "build_rl_snapshot", never)
+    a = existing_run(tmp_path / "baseline", rate=0.94, mean=43.6, policy=b"PK-a")
+    b = existing_run(tmp_path / "variant_1", rate=0.41, mean=54.0, policy=b"PK-b", steps=151_552)
+    dest = tmp_path / "policies" / "best.zip"
+    curves = tmp_path / "curves.json"
+    args = ["--rewards", "--include-run", str(a), "--include-run", str(b)]
+    args += ["--curves", str(curves), "--policy-dest", str(dest), "--build-snapshot"]
+    assert tp.main(args + ["--no-copy", "--out", str(tmp_path / "compare")]) == 0
+    captured = capsys.readouterr()
+    assert "DAYTONA_API_KEY is not set" not in captured.err  # nothing trains, so no fallback line
+    assert "baseline" in captured.out and "CHOSEN" in captured.out and "existing run" in captured.out
+    last = json.loads(captured.out.strip().splitlines()[-1])
+    assert last["chosen"] == "baseline" and last["policy"] is None
+    assert last["policy_sha256"] == hashlib.sha256(b"PK-a").hexdigest()
+    assert pathlib.Path(last["source_policy"]) == (a / "policy.zip").resolve()
+    assert not dest.exists() and json.loads(curves.read_text(encoding="utf-8"))["chosen"] == "baseline"
+
+    assert not (tmp_path / "policies" / "best.json").exists()  # --no-copy leaves the provenance alone too
+    assert tp.main(args + ["--out", str(tmp_path / "compare2")]) == 0  # without --no-copy the policy lands
+    assert dest.read_bytes() == b"PK-a"
+    last = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert last["policy"] == str(dest) and last["provenance"] == str(tmp_path / "policies" / "best.json")
+    written = json.loads((tmp_path / "policies" / "best.json").read_text(encoding="utf-8"))
+    assert written["sha256"] == last["policy_sha256"] == hashlib.sha256(b"PK-a").hexdigest()
+    assert tp.main(args + ["--out", str(tmp_path / "compare2")]) == 2  # a used --out is refused
+    assert "already exists; choose a fresh output directory" in capsys.readouterr().err
+
+    assert tp.main(["--rewards", "--out", str(tmp_path / "x")]) == 2  # nothing to train, nothing to compare
+    assert "no reward files" in capsys.readouterr().err
+
+
+def test_train_parallel_keeps_the_deployed_policy_provenance_true(tmp_path, monkeypatch):
+    def never(*args, **kwargs):
+        raise AssertionError("nothing must train")
+
+    monkeypatch.setattr(tp, "_daytona_factory", never)
+    monkeypatch.setattr(tp, "_run_local", never)
+    monkeypatch.setattr(tp, "_run_sandboxes", never)
+    runs = tmp_path / "runs"
+    extra = {"requested_steps": 500_000, "seed": 1, "eval_seed": 10001, "mean_final_dist": 0.019}
+    baseline = existing_run(
+        runs / "baseline",
+        rate=0.94,
+        mean=43.6,
+        policy=b"PK-a",
+        reward="rl\\rewards\\baseline.py",
+        extra=extra,
+    )
+    variant = existing_run(
+        runs / "variant_1", rate=0.41, mean=54.5, policy=b"PK-b", steps=151_552, reward="variant_1.py"
+    )
+    dest = tmp_path / "policies" / "handoff_best.zip"
+    provenance = tmp_path / "policies" / "handoff_best.json"
+    sha = hashlib.sha256(b"PK-a").hexdigest()
+
+    def compare(out: str, policy_dest: pathlib.Path | None = dest) -> tuple[dict, list[str]]:
+        lines: list[str] = []
+        result = tp.train_parallel(
+            [],
+            include_runs=[baseline, variant],
+            out_dir=tmp_path / out,
+            policy_dest=policy_dest,
+            curves_path=tmp_path / "curves.json",
+            report=lines.append,
+        )
+        return result, lines
+
+    first, lines = compare("c1")  # no provenance yet: written from the winner's summary
+    data = json.loads(provenance.read_text(encoding="utf-8"))
+    assert first["chosen"] == "baseline" and first["provenance"] == str(provenance)
+    assert data["policy"] == "handoff_best.zip" and data["sha256"] == sha == tp._sha256(dest)
+    assert data["source_policy"] == first["source_policy"] == tp._repo_relative(baseline / "policy.zip")
+    assert data["reward"] == "rl/rewards/baseline.py"  # the summary's Windows separators normalised
+    assert first["variants"][0]["reward"] == "rl/rewards/baseline.py"
+    assert data["steps"] == 507_904 and data["requested_steps"] == 500_000 and data["training_seed"] == 1
+    evaluation = data["evaluation"]
+    assert evaluation["success_rate"] == 0.94 and evaluation["mean_steps_to_success"] == 43.6
+    assert evaluation["episodes"] == 100 and evaluation["successes"] == 94 and evaluation["seed"] == 10001
+    assert evaluation["falls"] == 0 and evaluation["mean_final_dist"] == 0.019
+    assert evaluation["evaluated_on"] == first["created"][:10] and "summary.json" in evaluation["source"]
+    assert (
+        data["selected_by"] == "rl.train_parallel" and "from baseline, variant_1" in data["selection_reason"]
+    )
+    assert data["result"] == tp._repo_relative(tmp_path / "c1" / "result.json") and "replaces" not in data
+    assert "M4" in data["deployment"] and data["created"] == first["created"]
+    saved = json.loads((tmp_path / "c1" / "result.json").read_text(encoding="utf-8"))
+    assert saved["provenance"] == str(provenance) and saved["policy_sha256"] == data["sha256"]
+    assert saved["source_policy"] == data["source_policy"] and saved["chosen"] == "baseline"
+    assert b"\r" not in (tmp_path / "c1" / "result.json").read_bytes() + provenance.read_bytes()
+    assert any(line.endswith("rewritten") for line in lines)
+
+    curated = {"policy": "handoff_best.zip", "sha256": sha, "evaluation": {"successes": 97}}
+    provenance.write_text(json.dumps(curated), encoding="utf-8")
+    before = provenance.read_bytes()
+    second, lines = compare("c2")  # the same policy wins again: the curated file stays as it is
+    assert provenance.read_bytes() == before and second["provenance"] == str(provenance)
+    assert any("unchanged" in line for line in lines) and dest.read_bytes() == b"PK-a"
+
+    stale = {"policy": "handoff_best.zip", "sha256": "0" * 64, "source_policy": "rl/runs/old/policy.zip"}
+    provenance.write_text(json.dumps(stale), encoding="utf-8")
+    third, _ = compare("c3")  # another policy was deployed: rewritten, and it says what it replaced
+    data = json.loads(provenance.read_text(encoding="utf-8"))
+    assert data["sha256"] == sha and third["provenance"] == str(provenance)
+    assert data["replaces"] == {"sha256": "0" * 64, "source_policy": "rl/runs/old/policy.zip"}
+
+    before = provenance.read_bytes()
+    fourth, _ = compare("c4", policy_dest=None)  # --no-copy: neither the policy nor its provenance changes
+    assert fourth["provenance"] is None and fourth["policy"] is None and provenance.read_bytes() == before
+
+    result_before = (tmp_path / "c1" / "result.json").read_bytes()
+    with pytest.raises(ValueError, match="already exists"):  # a selection's evidence is never overwritten
+        compare("c1")
+    assert (tmp_path / "c1" / "result.json").read_bytes() == result_before
+    with pytest.raises(ValueError, match="must be the policy file"):
+        compare("c5", policy_dest=provenance)
+    assert provenance.read_bytes() == before and not (tmp_path / "c5").exists()
+    with pytest.raises(ValueError, match="no policy"):
+        tp.write_provenance(
+            {"name": "x"}, dest, candidates=["x"], result_path=tmp_path / "r.json", created=""
+        )
+
+
+# ---------------------------------------------------------------------------------- tracked curves
+
+
+def test_tracked_curves_match_the_dashboard_shape_and_the_policy_provenance():
+    """web/static/rl/curves.json is tracked so a fresh clone shows the measured curves; app.js reads
+    {variants: [{name, steps, success}], chosen}, and the chosen series must be the deployed policy."""
+    data = json.loads((ROOT / "web" / "static" / "rl" / "curves.json").read_text(encoding="utf-8"))
+    variants = data["variants"]
+    assert isinstance(variants, list) and variants and all(isinstance(v, dict) for v in variants)
+    names = [v["name"] for v in variants]
+    assert len(set(names)) == len(names)
+    for variant in variants:
+        assert isinstance(variant["name"], str) and variant["name"]
+        assert isinstance(variant["steps"], list) and isinstance(variant["success"], list)
+        assert len(variant["steps"]) == len(variant["success"]) >= 1
+        assert all(isinstance(s, int) and s > 0 for s in variant["steps"])
+        assert variant["steps"] == sorted(variant["steps"])
+        assert all(y is None or (isinstance(y, (int, float)) and 0 <= y <= 1) for y in variant["success"])
+        assert variant["success"] == variant["success_rate"]
+    assert isinstance(data["chosen"], str) and data["chosen"] in names
+    assert [v["chosen"] for v in variants].count(True) == 1
+    chosen = next(v for v in variants if v["chosen"])
+    assert chosen["name"] == data["chosen"]
+    best = min(
+        variants,
+        key=lambda v: (
+            -(v["final_success_rate"] or 0.0),
+            v["mean_steps_to_success"] if v["mean_steps_to_success"] is not None else math.inf,
+        ),
+    )
+    assert best is chosen  # the rule train_parallel.select_best applies
+    provenance = json.loads((ROOT / "rl" / "policies" / "handoff_best.json").read_text(encoding="utf-8"))
+    assert pathlib.Path(provenance["source_policy"]).parent.name == data["chosen"]
+    assert tp._sha256(ROOT / "rl" / "policies" / provenance["policy"]) == provenance["sha256"]
+    ignore = (ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
+    assert "web/static/rl/*" in ignore and "!web/static/rl/curves.json" in ignore
+    assert "web/static/rl_sim.mp4" not in ignore
+    video = (ROOT / "web" / "static" / "rl_sim.mp4").read_bytes()  # tracked too: the dashboard's video
+    assert video[4:8] == b"ftyp" and b"avc1" in video  # an MP4 with H.264, which every browser plays
 
 
 # ------------------------------------------------------------------------------------ policy_runner
