@@ -435,6 +435,7 @@ class _StubWatcher:
     def __init__(self, callback=None, **kwargs):
         self.callback = callback
         self.pressed = False
+        self.pressed_at = None
         _StubWatcher.instances.append(self)
 
     def start(self):
@@ -459,6 +460,7 @@ class _StubDriver(FakeDriver):
     def connect(self):
         if _StubDriver.esc_during_connect:
             watcher = _StubWatcher.instances[-1]
+            watcher.pressed_at = time.monotonic()
             watcher.callback()
             watcher.pressed = True
         with self.lock:
@@ -490,6 +492,7 @@ def real_cli(monkeypatch, tmp_path):
 
     monkeypatch.setattr(dotenv, "load_dotenv", lambda *a, **k: None)
     monkeypatch.setattr(replay.time, "sleep", lambda s: None)
+    monkeypatch.setenv("VARA_RUNS_DIR", str(tmp_path / "runs"))  # the A13 Esc records land here
     _StubWatcher.instances.clear()
     _StubDriver.esc_during_connect = False
     home = list(ik.home_q())
@@ -518,6 +521,13 @@ def test_cli_esc_during_connect_freezes_and_moves_nothing(real_cli, capsys):
     d = drivers[-1]
     assert d.commands == [] and d.stopped and d.torque
     assert "Esc pressed while connecting" in capsys.readouterr().out
+    # A13: both CLIs recorded the press as connect-phase, under VARA_RUNS_DIR, with their command lines
+    log = f.parent / "runs" / "calibration" / "esc-latency.jsonl"
+    records = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+    assert [r["source"] for r in records] == ["arm.replay", "arm.real_robot"]
+    assert all(r["phase"] == "connect" and r["latency_ms"] is not None for r in records)
+    assert records[0]["extra"]["argv"][:2] == ["--real", "--traj"]
+    assert records[1]["extra"] == {"argv": ["--real", "--home"]}
 
 
 def test_cli_without_esc_runs_and_a_stale_cancel_flag_does_not_count(real_cli, capsys):

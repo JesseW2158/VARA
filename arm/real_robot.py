@@ -56,25 +56,43 @@ ceiling).
      of tracking, or a stalled clock aborts while holding the object, with torque on.
   Then it backs off 0.05 m up, goes home and emits `handoff_done`. With `use_policy: true` in
   config/rl.yaml the RL policy (`rl.policy_runner.run_policy`, imported lazily) does the reach after the
-  rise and travel, before the IK tracking; when it cannot be imported, IK is used with a warning. The 10
-  cm hand freeze is off inside this primitive (it approaches the hand on purpose); the speed cap near the
-  hand stays on in every leg.
+  rise and travel, before the IK tracking; when it cannot be imported, IK is used with a warning. The
+  keyword `policy` (`{"use_policy": bool, "policy": path}`, the `policy_config()` shape, checked by
+  `checked_policy`) overrides config/rl.yaml for that one call (the D7 staged bring-up); None keeps the
+  config. The 10 cm hand freeze is off inside this primitive (it approaches the hand on purpose); the
+  speed cap near the hand stays on in every leg. While the travel and the tracking re-aim at 10 Hz, every
+  cycle with a seen wristband emits its xy and its distance from the grasp center with the leg's clock
+  (`carry travel t=0.3 s: hand (x, y), d m from the grasp center`; one `hand unseen` line when it
+  disappears), so the hand speed of the A10 check (5 cm/s or slower) can be read from the log.
 
 Each primitive returns `{"ok": bool, "reason": None | "stopped" | "hand_too_close" | "error",
 "events": [...]}` and never raises for driver, IK or scene failures: an error while moving freezes the arm;
-a setup failure (config files, arm.ik, a bad argument, torque off) returns `error` without freezing,
-and a driver that is already stopped returns `stopped`. A carry whose clearance cannot be established
-freezes even before motion, preserving the grasp while the failed plan is reviewed.
+a setup failure (config files, arm.ik, a bad argument or policy override, torque off) returns `error`
+without freezing, and a driver that is already stopped returns `stopped`. A carry whose clearance cannot
+be established freezes even before motion, preserving the grasp while the failed plan is reviewed.
 
     python -m arm.real_robot --fake --carry-test             # in-memory arm, fake hand, no sleeping
-    python -m arm.real_robot --real --carry-test [--scene-file scene.json]
+    python -m arm.real_robot --fake --carry-test --tracker   # the same hand through the FakeSceneTracker
+    python -m arm.real_robot --real --carry-test [--scene-file scene.json | --tracker]
     python -m arm.real_robot --real --home
 
 `--real` loads .env, asks for confirmation, counts down 3 s, watches Esc (freeze) and connects the driver
 only then; an Esc that lands during `connect()` (which resets the driver's stopped flag) is caught right
 after it and freezes the arm before anything runs. A `--scene-file` that cannot be read stops the CLI
-before anything connects. Nothing here imports `agents/`, `vision/` or `web/`; `rl.policy_runner` is
-imported lazily and only when the config asks for the policy.
+before anything connects; with `--real` it goes through `arm.replay.open_scene_file` (the reader shared
+with arm.replay and rl.policy_runner, `scene_file_reader(..., require_live=True)`), so a file without the
+live provenance sidecar of a running `python -m vision.scene --out FILE` (FILE.source.json, `source:
+live`), or one that shows no fresh scene within 5 s, exits 2 with the reason and "nothing moved" before
+the confirmation prompt and before a Driver exists; during the run a stale scene reads as all unseen and
+a sidecar that disappears or changes freezes the arm. `--tracker` (exclusive with `--scene-file`) takes
+the hand from the live overhead SceneTracker (`arm.replay.tracker_scene`: `vision.scene.get_tracker()`,
+imported lazily, its `latest` as the scene callable, closed when the run ends); with `--real` a tracker
+whose `is_fake` is not False (FAKE_CAMERA=1 / FAKE=1 from .env) or whose camera is a fake, one that
+cannot be built (the camera does not open) or one whose camera delivers no new frame within 5 s exits 2
+before the confirmation prompt and before a Driver exists, and with `--fake` the FakeSceneTracker shows
+the hand of config/fake_scene.json (seen, so the carry test has a hand to follow). Nothing here imports
+`agents/` or `web/`, `vision/` only through `arm.replay.tracker_scene` for `--tracker`, and
+`rl.policy_runner` lazily and only when the config or the override asks for the policy.
 """
 
 from __future__ import annotations
@@ -106,11 +124,13 @@ from arm.replay import (
     Pacer,
     Session,
     bridge,
+    close_tracker,
     inside_box,
     load_objects,
-    scene_file_reader,
+    open_scene_file,
     setup_failure,
     shrunk_box,
+    tracker_scene,
     validate_path,
 )
 
@@ -135,6 +155,7 @@ __all__ = [
     "cancelled",
     "carry_height",
     "carry_to_hand",
+    "checked_policy",
     "clear_cancel",
     "confirm_arm_clear",
     "esc_during_connect",
@@ -249,6 +270,27 @@ def policy_config() -> dict[str, Any]:
         "use_policy": bool(cfg.get("use_policy", False)),
         "policy": str(cfg.get("policy") or "rl/policies/handoff_best.zip"),
     }
+
+
+def checked_policy(policy: Any) -> dict[str, Any]:
+    """A per-call policy override in the `policy_config()` shape, returned as a fresh dict: exactly the keys
+    `use_policy` (a bool) and `policy` (a non-empty path, a str or `os.PathLike`, returned as a str;
+    relative paths count from the repo root like config/rl.yaml's). ValueError for anything else, so a bad
+    override ends a carry before it moves."""
+    if not isinstance(policy, dict):
+        raise ValueError(f"policy must be a dict like policy_config(), got {type(policy).__name__}")
+    expected = {"use_policy", "policy"}
+    if set(policy) != expected:
+        raise ValueError(
+            f"policy must have exactly the keys {sorted(expected)}, got {sorted(policy, key=str)}"
+        )
+    if not isinstance(policy["use_policy"], bool):
+        raise ValueError(f"policy['use_policy'] must be a bool, got {policy['use_policy']!r}")
+    raw = policy["policy"]
+    path = os.fspath(raw) if isinstance(raw, (str, os.PathLike)) else None
+    if not isinstance(path, str) or not path.strip():
+        raise ValueError(f"policy['policy'] must be a non-empty path, got {raw!r}")
+    return {"use_policy": policy["use_policy"], "policy": path}
 
 
 def _home_target() -> list[float]:
@@ -414,15 +456,21 @@ def carry_to_hand(
     clock: Callable[[], float] | None = None,
     sleep: Callable[[float], None] | None = None,
     realtime: bool | None = None,
+    policy: dict | None = None,
 ) -> dict[str, Any]:
     """Hand the held `obj` to the tracked hand: rise to the carry height, travel above the target, then
     track and descend (see the module docstring). Ends at home with the event `handoff_done` (also sent
-    through `on_event`, so the orchestrator can count the run event)."""
+    through `on_event`, so the orchestrator can count the run event).
+
+    `policy=None` follows config/rl.yaml (`policy_config()`); a dict `{"use_policy": bool, "policy": path}`
+    overrides it for this call only (`checked_policy`; a malformed one is a setup failure: `error`,
+    nothing moved)."""
     drv = driver if driver is not None else driver_mod.get_driver()
     clear_cancel()
     events: list[str] = []
     try:
         seconds = _checked_timeout(timeout)
+        override = None if policy is None else checked_policy(policy)
         session = Session(
             drv,
             scene,
@@ -444,7 +492,11 @@ def carry_to_hand(
             seconds = TIMEOUT_MAX_S
         target = _Target(session)
         _carry_high(session, obj, target)
-        cfg = policy_config()
+        if override is None:
+            cfg = policy_config()
+        else:
+            cfg = override
+            session.emit(f"policy override: use_policy={cfg['use_policy']}, policy={cfg['policy']}")
         if cfg["use_policy"]:
             _run_policy(session, cfg, seconds, target)
         _track_hand(session, seconds, target)
@@ -478,7 +530,7 @@ def _run_policy(session: Session, cfg: dict[str, Any], timeout: float, target: _
     try:
         from rl.policy_runner import run_policy  # lazy: rl/ is Lane D's and absent from the sandbox bundle
     except ImportError as exc:
-        log.warning("config/rl.yaml asks for the policy but rl.policy_runner is unavailable (%s): IK", exc)
+        log.warning("the policy was asked for but rl.policy_runner is unavailable (%s): IK", exc)
         session.emit("policy unavailable: tracking with IK")
         return False
     policy_path = ROOT / cfg["policy"]
@@ -719,24 +771,51 @@ def _plan_rise(session: Session, height: float) -> tuple[list[list[float]] | Non
     return path, ""
 
 
+class _HandLog:
+    """The 10 Hz hand line of the travel and tracking legs: while the wristband is seen, every cycle emits
+    its xy and its distance from the grasp center with the leg's clock (`<where> t=1.2 s: hand (x, y),
+    d m from the grasp center`), so the hand speed of the A10 check (5 cm/s or slower) can be read from
+    the log; one `hand unseen` line when it disappears, nothing while there is no hand data."""
+
+    def __init__(self, session: Session, where: str) -> None:
+        self.session = session
+        self.where = where
+        self.seen = False
+
+    def __call__(self, hand: Vec3 | None, grasp: Sequence[float], t: float) -> None:
+        if hand is None:
+            if self.seen:
+                self.session.emit(f"{self.where} t={t:.1f} s: hand unseen")
+            self.seen = False
+            return
+        self.seen = True
+        self.session.emit(
+            f"{self.where} t={t:.1f} s: hand ({hand[0]:.3f}, {hand[1]:.3f}), "
+            f"{math.dist(grasp, hand):.3f} m from the grasp center"
+        )
+
+
 def _travel(session: Session, height: float, target: _Target) -> None:
     """Leg 2: straight lines of the grasp center toward the point `height` above the target, re-aimed at
     TRACK_HZ (the target follows the hand), each cycle's path from `_servo_path` with the floor `height -
     CARRY_LINE_TOL_M` and no joint-space sweep. Ends above the target (within ABOVE_XY_M), where no straight
     step at that height validates, after TRAVEL_MAX_S, or after STALL_CYCLES cycles with the same clock
-    reading; the tracking goes on from wherever it ended."""
+    reading; the tracking goes on from wherever it ended. Every cycle logs the seen hand (`_HandLog`)."""
     pacer = session.pacer
     t0 = pacer.now()
     last_now: float | None = None
     stalled = 0
     last_note = ""
+    hand_log = _HandLog(session, "carry travel")
     while True:
         session.check_stopped()
         now = pacer.now()
         stalled = stalled + 1 if now == last_now else 0
         last_now = now
-        goal = target.goal(session, session.hand(), fallback=False)
+        hand = session.hand()
+        goal = target.goal(session, hand, fallback=False)
         (x, y, z), _ = ik.fk_grasp(session.q)
+        hand_log(hand, (x, y, z), now - t0)
         if math.hypot(goal[0] - x, goal[1] - y) <= ABOVE_XY_M:
             session.emit(f"carry: above the target at {z:.2f} m")
             return
@@ -850,7 +929,8 @@ def _track_hand(session: Session, timeout: float, target: _Target | None = None)
     RELEASE_WITHIN_M of the grasp center for RELEASE_STEADY_S, or the handoff zone reached after the
     timeout, which counts from here). Invalid hand targets latch the zone fallback. Every release
     decision uses encoder feedback. A failed fallback, MAX_TRACK_S, or STALL_CYCLES with the same clock
-    reading aborts holding the object instead of releasing at an unverified position."""
+    reading aborts holding the object instead of releasing at an unverified position. Every cycle logs
+    the seen hand against the measured grasp center (`_HandLog`)."""
     pacer = session.pacer
     t0 = pacer.now()
     deadline = t0 + timeout
@@ -865,6 +945,7 @@ def _track_hand(session: Session, timeout: float, target: _Target | None = None)
     last_note = ""
     last_now: float | None = None
     stalled = 0
+    hand_log = _HandLog(session, "carry_to_hand")
     while True:
         session.check_stopped()
         now = pacer.now()
@@ -882,6 +963,7 @@ def _track_hand(session: Session, timeout: float, target: _Target | None = None)
             goal = target.zone
         session.refresh()  # release decisions use encoder feedback, never the last commanded pose
         grasp_center, _ = ik.fk_grasp(session.q)
+        hand_log(hand, grasp_center, now - t0)
         if not fallback and hand is not None:
             if math.dist(grasp_center, hand) <= RELEASE_WITHIN_M:
                 near_since = now if near_since is None else near_since
@@ -954,9 +1036,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--home", action="store_true", help="send the arm home at 30 deg/s")
     parser.add_argument("--object", default="pill_bottle", help="object name for --carry-test")
     parser.add_argument("--timeout", type=float, default=10.0, help="carry_to_hand timeout in seconds")
-    parser.add_argument("--scene-file", help="JSON scene file re-read every tick (hand position)")
+    hand = parser.add_mutually_exclusive_group()
+    hand.add_argument(
+        "--scene-file",
+        help="JSON scene file re-read every tick (hand position); with --real only the file of a running "
+        "`python -m vision.scene --out FILE` on the real camera (its FILE.source.json says live)",
+    )
+    hand.add_argument(
+        "--tracker",
+        action="store_true",
+        help="hand position from the live overhead SceneTracker (vision.scene.get_tracker(); refused with "
+        "--real when it is a fake or shows no frame in 5 s); with --fake the FakeSceneTracker",
+    )
     parser.add_argument("--port", help="serial port for --real; default FOLLOWER_PORT from .env")
     parser.add_argument("--id", dest="follower_id", help="LeRobot id for --real; default from config")
+    cli_args = list(sys.argv[1:] if argv is None else argv)  # the command line, for the Esc record
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, stream=sys.stderr, format="%(asctime)s %(levelname)s %(message)s")
     if not (args.carry_test or args.home):
@@ -970,64 +1064,89 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         return home(driver=drv, scene=scene, realtime=realtime)
 
-    try:
-        scene = scene_file_reader(args.scene_file)
-    except (OSError, ValueError) as exc:
-        print(f"cannot read --scene-file {args.scene_file}: {exc}; nothing moved", file=sys.stderr)
-        return 2
-    if args.fake or (not args.real and _fake("FAKE_ROBOT")):
-        drv = driver_mod.FakeDriver()
-        if args.carry_test:
-            drv.command(drv.read()[0], 0.2)  # pretend the object is held
-        result = run(drv, scene or _fake_scene(hand_seen=True), realtime=False)
-        print(json.dumps(result))
-        print(
-            f"fake {'carry' if args.carry_test else 'home'} {'ok' if result['ok'] else result['reason']}: "
-            f"{len(drv.commands)} commands"
-        )
-        return 0 if result["ok"] else 1
-    if not args.real:
+    fake_mode = args.fake or (not args.real and _fake("FAKE_ROBOT"))
+    if not fake_mode and not args.real:
         print("Refusing to touch the arm without --real (use --fake for the in-memory arm).", file=sys.stderr)
         return 2
+    scene: Callable[[], dict | None] | None = None
+    if not args.tracker:
+        # with --real only a live vision.scene writer's file (its provenance sidecar) is accepted
+        scene, refused = open_scene_file(args.scene_file, real=not fake_mode)
+        if refused:
+            return 2
+    if not fake_mode:
+        from dotenv import load_dotenv
 
-    from dotenv import load_dotenv
-
-    load_dotenv()
-    if scene is None:
-        print("WARNING: no --scene-file: no hand data; carry_to_hand releases at the handoff zone.")
-    clear_cancel()  # discard an earlier session's cancellation before watching this startup
-    drv = driver_mod.Driver(port=args.port, follower_id=args.follower_id)
-    watcher = driver_mod.EscWatcher(lambda: freeze(drv))
-    watcher.start()
-    try:
-        if not confirm_arm_clear(3, watcher):
-            return 1
-        if esc_during_connect(watcher, drv):
-            return 1
-        drv.connect()  # the only place this CLI powers the arm
+        load_dotenv()  # before the tracker: FAKE_CAMERA from .env makes it a fake, which --real refuses
+    tracker: Any = None
+    if args.tracker:
         try:
+            # the fake shows the hand, like the fake scene below: a carry test needs one to follow
+            tracker, scene = tracker_scene(fake_mode, hand_seen=True if fake_mode else None)
+        except Exception as exc:  # any failure to build or trust the tracker refuses before anything moves
+            print(f"cannot use --tracker: {type(exc).__name__}: {exc}; nothing moved", file=sys.stderr)
+            return 2
+    try:
+        if fake_mode:
+            drv = driver_mod.FakeDriver()
+            if args.carry_test:
+                drv.command(drv.read()[0], 0.2)  # pretend the object is held
+            result = run(drv, scene or _fake_scene(hand_seen=True), realtime=False)
+            print(json.dumps(result))
+            what = "carry" if args.carry_test else "home"
+            print(f"fake {what} {'ok' if result['ok'] else result['reason']}: {len(drv.commands)} commands")
+            return 0 if result["ok"] else 1
+
+        if scene is None:
+            print(
+                "WARNING: no --scene-file or --tracker: no hand data; carry_to_hand releases at the "
+                "handoff zone."
+            )
+        clear_cancel()  # discard an earlier session's cancellation before watching this startup
+        drv = driver_mod.Driver(port=args.port, follower_id=args.follower_id)
+        watcher = driver_mod.EscWatcher(lambda: freeze(drv))
+        watcher.start()
+        try:
+            if not confirm_arm_clear(3, watcher):
+                return 1
             if esc_during_connect(watcher, drv):
                 return 1
-            result = run(drv, scene, realtime=True)
-            print(json.dumps(result))
-            if drv.stopped:
-                print("Arm is FROZEN with torque on. Press Enter to release the port (torque stays on).")
-                try:
-                    input()
-                except EOFError:
-                    pass
-            return 0 if result["ok"] else 1
+            drv.connect()  # the only place this CLI powers the arm
+            connected_at = time.monotonic()  # Esc presses before this are connect-phase (A13)
+            try:
+                if esc_during_connect(watcher, drv):
+                    return 1
+                result = run(drv, scene, realtime=True)
+                print(json.dumps(result))
+                if drv.stopped:
+                    print("Arm is FROZEN with torque on. Press Enter to release the port (torque stays on).")
+                    try:
+                        input()
+                    except EOFError:
+                        pass
+                return 0 if result["ok"] else 1
+            finally:
+                driver_mod.report_esc_latency(
+                    watcher, drv, source="arm.real_robot", connected_at=connected_at, extra={"argv": cli_args}
+                )
+                drv.disconnect()  # torque stays on; the arm keeps holding its pose
         finally:
-            drv.disconnect()  # torque stays on; the arm keeps holding its pose
+            watcher.stop()
     finally:
-        watcher.stop()
+        if tracker is not None:
+            close_tracker(tracker)
 
 
 def esc_during_connect(watcher: Any, driver: Any) -> bool:
-    """Latch every STOP source before and after connecting; refuse motion while stopped."""
+    """Latch every STOP source before and after connecting; refuse motion while stopped.
+
+    A driver that is already stopped holds its pose, so it is not frozen a second time: that would
+    re-stamp `frozen_at` and the Esc record would measure to the wrong freeze."""
     if not (getattr(watcher, "pressed", False) or getattr(driver, "stopped", False) or cancelled()):
         return False
-    freeze(driver)
+    _CANCEL.set()
+    if not getattr(driver, "stopped", False):
+        freeze(driver)
     if getattr(driver, "connected", False):
         print("Esc pressed while connecting: arm frozen with torque on, nothing moved.")
     else:

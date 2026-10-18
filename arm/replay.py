@@ -48,25 +48,60 @@ tests run instantly and deterministically (inject `clock`/`sleep` to observe the
     python -m arm.replay --traj file.json            # validate only
     python -m arm.replay --fake --traj file.json     # replay on the in-memory arm, no sleeping
     python -m arm.replay --real --traj file.json     # the real arm: confirmation, 3 s countdown, Esc freezes
+    python -m arm.replay --real --traj file.json --tracker --record place_in_tray   # live hand, tallied
 
 `--scene-file scene.json` (a JSON scene re-read every tick) gives the hand check its data; a file that
-cannot be read or is not a JSON object stops the CLI before anything connects. An Esc that lands while
-`Driver.connect()` runs (which ends by clearing the driver's stopped flag) is caught right after it
-(`arm.real_robot.esc_during_connect`): the arm is frozen again and nothing is replayed.
+cannot be read or is not a JSON object stops the CLI before anything connects. With `--real` the file
+must come from a running `python -m vision.scene --out scene.json` on the real overhead camera
+(`open_scene_file` -> `scene_file_reader(..., require_live=True)`, shared with arm.real_robot and
+rl.policy_runner): the provenance sidecar scene.json.source.json that the writer puts down before its
+first scene must say `writer: vision.scene`, `source: live`, `is_fake: false` (`check_scene_source`), and
+the file must show a scene whose `t` is fresh (SCENE_SEEN_TIMEOUT_S plus one frame period) within
+TRACKER_FRAME_S; otherwise (no sidecar, unreadable, another writer, a FakeCamera or FakeSceneTracker
+writer, a leftover file) the CLI prints the reason and "nothing moved" and exits 2 before any
+confirmation prompt and before a Driver exists. During the run a scene older than that reads as all
+unseen (`unseen_copy`, as the live tracker reports a quiet camera), and a sidecar that disappears or
+changes (the writer stopped, restarted or was replaced) raises from the scene source, which freezes the
+arm (`error`). `--fake` needs no sidecar and reads the file as before. `--tracker` (exclusive
+with `--scene-file`) takes the hand from the live overhead SceneTracker instead (`tracker_scene`:
+`vision.scene.get_tracker()`, imported lazily, its `latest` as the scene callable, closed when the run
+ends); with `--real` a tracker whose `is_fake` is not False (FAKE_CAMERA=1 / FAKE=1) or whose camera is
+a fake, one that cannot be built (the camera does not open, no config/homography.npy) or one whose camera
+delivers no new frame within TRACKER_FRAME_S (a publication after a missed grab does not count) is
+refused with exit 2 before any confirmation prompt and before a Driver exists, and with `--fake` the
+FakeSceneTracker serves config/fake_scene.json. An Esc that lands while `Driver.connect()` runs (which
+ends by clearing the driver's stopped flag) is caught right after it (`arm.real_robot.esc_during_connect`):
+the arm is frozen again and nothing is replayed.
 
-Nothing here imports `agents/`, `vision/`, `rl/` or `web/`; the module imports without MuJoCo (arm.ik is
-imported when a replay starts).
+`--record NAME` (with `--fake` or `--real`; NAME a safe file stem, `checked_record_name`) keeps the
+evidence for the 4-of-5 real replay counts of A9 and A12 in `runs/calibration/replays-NAME.jsonl`
+(VARA_RUNS_DIR moves runs/; appended to, never overwritten). Before anything moves, `prepare_record`
+creates the folder and tallies the lines already there (exit 2 when the file is corrupt, is not a file
+or its folder cannot be created, so a real attempt is not spent on a tally that cannot be kept) and the
+CLI says which attempt this is. After each replay `record_attempt` appends one JSON line with the label,
+the trajectory path, sha256 and skill, mode (`fake` or `real`), ok, reason, event count, elapsed seconds
+and the local time, and the CLI prints the running tally `NAME: k of n ok` computed from that file
+(`tally`); a line that cannot be written after the replay is reported and exits 1. A validation
+failure, a declined confirmation or an Esc before connecting is not an attempt and leaves no line.
+
+Nothing here imports `agents/`, `rl/` or `web/`, and `vision/` only inside `tracker_scene` for
+`--tracker`; the module imports without MuJoCo (arm.ik is imported when a replay starts).
 """
 
 from __future__ import annotations
 
 import argparse
+import copy
+import hashlib
 import json
 import logging
 import math
+import os
+import re
 import sys
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -92,23 +127,41 @@ __all__ = [
     "OPEN_SETTLE_S",
     "PLAN_INSET_M",
     "REASONS",
+    "RECORD_NAME_RE",
     "RISE_M",
+    "SCENE_POLL_S",
+    "SCENE_SEEN_TIMEOUT_S",
+    "SCENE_SOURCE_SUFFIX",
+    "SCENE_SOURCE_WRITER",
     "STEP_TOL",
     "TICK",
     "TIP_SPEED_MAX",
     "TIP_SPEED_NEAR_HAND",
+    "TRACKER_FRAME_S",
     "Abort",
     "CloseRefused",
     "Pacer",
+    "SceneFileRefused",
     "Session",
     "bridge",
+    "check_scene_source",
+    "checked_record_name",
+    "close_tracker",
     "inside_box",
     "load_box",
     "load_limits",
     "load_objects",
+    "open_scene_file",
+    "prepare_record",
+    "record_attempt",
+    "record_path",
     "replay",
     "scene_file_reader",
+    "scene_source_path",
     "shrunk_box",
+    "tally",
+    "tracker_scene",
+    "unseen_copy",
     "validate",
     "validate_path",
 ]
@@ -150,6 +203,18 @@ LINE_SAMPLE_M = 0.005
 LINE_JUMP_RAD = math.radians(20.0)  # a bigger joint change between two line samples is a reconfiguration
 PLAN_INSET_M = 0.001  # planned lines keep the tip this far inside the box (sub-steps never cross a face)
 BOX_GATE_M = 0.001  # a tick whose tip is further outside the box than this is never commanded
+
+# CLI (--tracker, --record)
+TRACKER_FRAME_S = 5.0  # --real --tracker is refused when the overhead camera publishes no frame in this
+# (and a --real --scene-file when its file shows no fresh scene in this)
+# --real --scene-file: the provenance sidecar of `python -m vision.scene --out FILE`. These mirror
+# vision.scene's SOURCE_SUFFIX, SOURCE_WRITER and SEEN_TIMEOUT_S (tests/test_scene_provenance.py checks
+# that they agree); vision/ is not imported here because it needs cv2.
+SCENE_SOURCE_SUFFIX = ".source.json"
+SCENE_SOURCE_WRITER = "vision.scene"
+SCENE_SEEN_TIMEOUT_S = 0.5  # a scene older than this plus one frame period reads as all unseen
+SCENE_POLL_S = 0.05  # the --real startup re-reads a stale scene file this often while it waits
+RECORD_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")  # --record NAME: a safe file stem
 
 _SCHEMA = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
 _VALIDATOR = Draft202012Validator(_SCHEMA)
@@ -1114,16 +1179,124 @@ def _run_live(session: Session, index: int, segment: dict) -> None:
 
 
 def _fake(flag: str) -> bool:
-    import os
-
     return os.environ.get("FAKE") == "1" or os.environ.get(flag) == "1"
 
 
-def scene_file_reader(path: str | None) -> Callable[[], dict | None] | None:
+class SceneFileRefused(ValueError):
+    """A `--scene-file` that must not feed the real arm (`scene_file_reader(..., require_live=True)`): its
+    provenance sidecar is missing, unreadable, not vision.scene's or not "live", or the file is not being
+    refreshed. A ValueError, so a caller that only catches OSError/ValueError still refuses."""
+
+
+def scene_source_path(path: Path | str) -> Path:
+    """The provenance sidecar of a scene file: FILE + ".source.json" (`vision.scene.source_path`)."""
+    return Path(str(path) + SCENE_SOURCE_SUFFIX)
+
+
+def _source_signature(sidecar: Path) -> tuple[int, int, int]:
+    """What changes when the sidecar is rewritten (os.replace gives a new file): mtime, size and file id."""
+    st = sidecar.stat()
+    return (st.st_mtime_ns, st.st_size, st.st_ino)
+
+
+def check_scene_source(path: Path | str) -> dict[str, Any]:
+    """The provenance sidecar of scene file `path` (`scene_source_path`) when it proves a live writer:
+    a JSON object written by vision.scene (`writer`), with `source` "live", `is_fake` False, a str
+    `tracker` and `started_at`, an int `pid` and a positive `hz`. Anything else raises SceneFileRefused
+    naming the reason (missing, unreadable, not JSON, another writer, malformed, or "fake"). Reads only."""
+    sidecar = scene_source_path(path)
+    try:
+        text = sidecar.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        raise SceneFileRefused(
+            f"no provenance sidecar {sidecar.name}: only a running `python -m vision.scene --out "
+            f"{Path(path).name}` writes one (and removes it when it stops), so nothing proves this file "
+            "is live"
+        ) from None
+    except (OSError, UnicodeDecodeError) as exc:
+        raise SceneFileRefused(f"the provenance sidecar {sidecar} cannot be read ({exc})") from exc
+    try:
+        data = json.loads(text)
+    except ValueError as exc:
+        raise SceneFileRefused(f"the provenance sidecar {sidecar} is not JSON ({exc})") from exc
+    if not isinstance(data, dict):
+        raise SceneFileRefused(f"the provenance sidecar {sidecar} is not a JSON object: {_short(data)}")
+    if data.get("writer") != SCENE_SOURCE_WRITER:
+        raise SceneFileRefused(
+            f"the provenance sidecar {sidecar.name} was not written by {SCENE_SOURCE_WRITER} "
+            f"(writer {_short(data.get('writer'))})"
+        )
+    for key, kinds in (("source", str), ("tracker", str), ("started_at", str), ("is_fake", bool)):
+        if not isinstance(data.get(key), kinds):
+            raise SceneFileRefused(f"the provenance sidecar {sidecar.name} has no valid {key!r}")
+    pid, hz = data.get("pid"), data.get("hz")
+    if not isinstance(pid, int) or isinstance(pid, bool):
+        raise SceneFileRefused(f"the provenance sidecar {sidecar.name} has no valid 'pid'")
+    if not (_is_finite_number(hz) and hz > 0):
+        raise SceneFileRefused(f"the provenance sidecar {sidecar.name} has no valid 'hz'")
+    if data["source"] != "live" or data["is_fake"] is not False:
+        raise SceneFileRefused(
+            f"{sidecar.name} says the scene is {data['source'][:40]} ({data['tracker'][:40]} on camera "
+            f"{_short(data.get('camera'))}, is_fake {data['is_fake']}, pid {pid}): a fake scene never feeds "
+            "the real arm"
+        )
+    return data
+
+
+def _scene_age(scene: Mapping[str, Any], now: float) -> float | None:
+    """Seconds since the scene's `t` (wall clock), None when `t` is not a finite number."""
+    t = scene.get("t")
+    return float(now - t) if _is_finite_number(t) else None
+
+
+def _is_stale(age: float | None, stale_after: float) -> bool:
+    return age is None or not (-stale_after <= age <= stale_after)
+
+
+def unseen_copy(scene: Mapping[str, Any]) -> dict[str, Any]:
+    """A deep copy of `scene` with every object, obstacle and the hand `seen: false` (poses and `t` kept):
+    what the live tracker reports once nothing has been detected for its seen timeout."""
+    out = copy.deepcopy(dict(scene))
+    for group in ("objects", "obstacles"):
+        items = out.get(group)
+        for item in items.values() if isinstance(items, dict) else ():
+            if isinstance(item, dict):
+                item["seen"] = False
+    hand = out.get("hand")
+    if isinstance(hand, dict):
+        hand["seen"] = False
+    return out
+
+
+def scene_file_reader(
+    path: str | None,
+    *,
+    require_live: bool = False,
+    timeout: float | None = None,
+    clock: Callable[[], float] | None = None,
+    sleep: Callable[[float], None] | None = None,
+) -> Callable[[], dict | None] | None:
     """A scene callable that re-reads a JSON file on every call (a tracker can keep it fresh), or None
     without a path. The file is read once here: an unreadable file or one that is not a JSON object raises
     OSError/ValueError, so a CLI refuses to start instead of running with the hand check silently off.
-    Later read failures (a rewrite in progress) keep the last good scene."""
+    Later read failures (a rewrite in progress) keep the last good scene.
+
+    `require_live=True` is the `--real` reader (every real-arm consumer of `--scene-file` passes it), and
+    refuses with SceneFileRefused before returning, so before any prompt or Driver:
+    - unless `check_scene_source` accepts the sidecar FILE + ".source.json" that `python -m vision.scene
+      --out FILE` writes before its first scene (missing, unreadable, another writer, or "fake");
+    - unless the file shows a scene whose `t` is at most `stale_after` = SCENE_SEEN_TIMEOUT_S + 1/hz (the
+      sidecar's rate) from the wall clock within `timeout` seconds (default TRACKER_FRAME_S, read at call
+      time; re-read every SCENE_POLL_S): a leftover file of a killed writer is never a live feed.
+    The callable it returns then, on every call, re-stats the sidecar and raises RuntimeError when it is
+    gone or no longer the one accepted (the writer stopped, restarted or was replaced: a new `pid` /
+    `started_at` is a new writer even on the same FILE), which freezes a running session; and returns
+    `unseen_copy` of a scene older than `stale_after` (including the last good scene kept over read
+    failures), the way the live tracker flips everything unseen when its camera goes quiet, so a dead
+    writer never leaves the hand check trusting old poses. The accepted sidecar is the callable's `source`
+    attribute. `clock` (wall clock, default time.time) and `sleep` (default time.sleep) are for tests.
+    Without `require_live` (`--fake`) nothing of this applies and no sidecar is needed.
+    """
     if not path:
         return None
     file = Path(path)
@@ -1133,6 +1306,9 @@ def scene_file_reader(path: str | None) -> Callable[[], dict | None] | None:
         if not isinstance(scene, dict):
             raise ValueError(f"{file}: expected a JSON object (schemas/scene.json), got {_short(scene)}")
         return scene
+
+    if require_live:
+        return _live_scene_reader(file, load, timeout, clock, sleep)
 
     latest: dict[str, Any] = {"scene": load()}
 
@@ -1146,11 +1322,274 @@ def scene_file_reader(path: str | None) -> Callable[[], dict | None] | None:
     return read
 
 
+def _live_scene_reader(
+    file: Path,
+    load: Callable[[], dict],
+    timeout: float | None,
+    clock: Callable[[], float] | None,
+    sleep: Callable[[float], None] | None,
+) -> Callable[[], dict | None]:
+    """`scene_file_reader(..., require_live=True)`: the provenance and freshness checks (see there)."""
+    seconds = TRACKER_FRAME_S if timeout is None else float(timeout)
+    if not (math.isfinite(seconds) and seconds > 0.0):
+        raise ValueError(f"timeout must be a positive number of seconds, got {timeout!r}")
+    now = clock if clock is not None else time.time
+    sidecar = scene_source_path(file)
+    try:
+        signature = _source_signature(sidecar)  # before the read: a rewrite in between shows next tick
+    except FileNotFoundError:
+        signature = None  # check_scene_source names the missing sidecar
+    except OSError as exc:
+        raise SceneFileRefused(f"the provenance sidecar {sidecar} cannot be read ({exc})") from exc
+    source = check_scene_source(file)
+    stale_after = SCENE_SEEN_TIMEOUT_S + 1.0 / float(source["hz"])
+    scene = load()  # an unreadable file or one that is not a JSON object raises, as without require_live
+    polls = math.ceil(seconds / SCENE_POLL_S)
+    while _is_stale(_scene_age(scene, now()), stale_after):
+        if polls <= 0:
+            age = _scene_age(scene, now())
+            when = "has no numeric t" if age is None else f"is {age:.1f} s old"
+            raise SceneFileRefused(
+                f"{file} is not being refreshed: its newest scene {when} after {seconds:g} s (fresh means "
+                f"within {stale_after:.2f} s; is `python -m vision.scene --out` running with its camera "
+                "delivering?)"
+            )
+        polls -= 1
+        (sleep if sleep is not None else time.sleep)(SCENE_POLL_S)
+        try:
+            scene = load()
+        except (OSError, ValueError):
+            pass  # a rewrite in progress: try again on the next poll
+    state: dict[str, Any] = {"scene": scene, "signature": signature}
+
+    def pinned() -> None:
+        """RuntimeError unless the sidecar is still the one accepted at startup."""
+        try:
+            current = _source_signature(sidecar)
+        except OSError as exc:
+            raise RuntimeError(
+                f"the provenance sidecar {sidecar.name} is gone ({type(exc).__name__}): the scene writer "
+                "stopped or was replaced, so the hand data is no longer proven live"
+            ) from exc
+        if current == state["signature"]:
+            return
+        try:
+            data = json.loads(sidecar.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise RuntimeError(
+                f"the provenance sidecar {sidecar.name} changed and cannot be read ({exc})"
+            ) from exc
+        if data != source:
+            got = data if isinstance(data, dict) else {}
+            raise RuntimeError(
+                f"the scene writer changed during the run: {sidecar.name} was pid {source['pid']} started "
+                f"{source['started_at']} ({source['source']}), now pid {_short(got.get('pid'))} started "
+                f"{_short(got.get('started_at'))} ({_short(got.get('source'))})"
+            )
+        state["signature"] = current  # rewritten with the same content: still the same writer
+
+    pinned()  # the sidecar may have gone while the file was read or the freshness wait ran
+
+    def read() -> dict | None:
+        pinned()
+        try:
+            state["scene"] = load()
+        except (OSError, ValueError):
+            pass  # keep the last good scene; it turns unseen once it is stale
+        latest = state["scene"]
+        if _is_stale(_scene_age(latest, now()), stale_after):
+            return unseen_copy(latest)
+        return latest
+
+    read.source = dict(source)  # type: ignore[attr-defined]
+    return read
+
+
+def open_scene_file(path: str | None, *, real: bool) -> tuple[Callable[[], dict | None] | None, bool]:
+    """The `--scene-file` step of a CLI, run before any prompt and before a Driver exists: `(scene,
+    refused)`. `real` reads through `scene_file_reader(path, require_live=True)`. A refusal or a read
+    failure prints the reason and "nothing moved" to stderr and returns `(None, True)`; the caller exits 2.
+    With `real` the accepted provenance is printed. No path: `(None, False)`."""
+    try:
+        scene = scene_file_reader(path, require_live=real)
+    except SceneFileRefused as exc:
+        print(f"refusing --scene-file {path} for the real arm: {exc}; nothing moved", file=sys.stderr)
+        return None, True
+    except (OSError, ValueError) as exc:
+        print(f"cannot read --scene-file {path}: {exc}; nothing moved", file=sys.stderr)
+        return None, True
+    source = getattr(scene, "source", None)
+    if real and isinstance(source, dict):
+        print(
+            f"scene file {path}: live, from {source['tracker']} on camera {source.get('camera')} "
+            f"(writer pid {source['pid']}, started {source['started_at']})"
+        )
+    return scene, False
+
+
 _scene_file_reader = scene_file_reader  # the name the first review's probes used
 
 
+def tracker_scene(
+    fake: bool, *, hand_seen: bool | None = None, timeout: float | None = None
+) -> tuple[Any, Callable[[], dict]]:
+    """The live hand source of `--tracker`: `(tracker, tracker.latest)`, the pattern of
+    scripts/touch_markers.py. `vision.scene` is imported here, never at module import.
+
+    `fake`: a `FakeSceneTracker` serving config/fake_scene.json (no camera, no process-wide singleton), its
+    wristband forced to `hand_seen` when that is not None. Otherwise the process-wide
+    `vision.scene.get_tracker()` (the SceneTracker on the overhead camera, or the fake under FAKE_CAMERA=1
+    / FAKE=1), accepted only when it is provably real and live: a tracker whose `is_fake` is not False, or
+    whose `camera` (the SceneTracker has one) is not marked `is_fake = False` (the real SceneTracker on a
+    FakeCamera, `vision.scene.fake_chain_tracker`, reports `is_fake` False but its frames are synthetic),
+    raises RuntimeError (a fake scene must never feed the real arm), and one whose camera delivers no new
+    frame within `timeout` seconds (default TRACKER_FRAME_S, read at call time) raises TimeoutError. The
+    wait is `tracker.wait_for_frame(timeout=timeout)`; because the SceneTracker also publishes after a
+    missed grab (an unplugged or busy camera returns None), a tracker that counts its delivered frames
+    (`frames`) must also show that count growing before the deadline. Whatever `get_tracker()` raises (a
+    camera that does not open, a missing config/homography.npy) propagates. A refused tracker is closed
+    before the error propagates, so a CLI refuses before any confirmation prompt with the camera released;
+    an accepted one is closed by the caller (`close_tracker`) when its run ends.
+    """
+    if fake:
+        from vision.scene import FakeSceneTracker  # lazy: vision/ is Lane B's and needs cv2
+
+        tracker = FakeSceneTracker()
+        if hand_seen is not None:
+            scene = tracker.latest()
+            scene["hand"]["seen"] = bool(hand_seen)
+            tracker.set_scene(scene)
+        return tracker, tracker.latest
+    seconds = TRACKER_FRAME_S if timeout is None else float(timeout)
+    if not (math.isfinite(seconds) and seconds > 0.0):
+        raise ValueError(f"timeout must be a positive number of seconds, got {timeout!r}")
+    from vision.scene import get_tracker  # lazy: vision/ is Lane B's and needs cv2
+
+    tracker = get_tracker()
+    try:
+        if getattr(tracker, "is_fake", True) is not False:
+            raise RuntimeError(
+                f"vision.scene.get_tracker() is a {type(tracker).__name__}: a fake scene must never feed the "
+                "real arm (unset FAKE_CAMERA/FAKE or use --fake)"
+            )
+        camera = getattr(tracker, "camera", None)
+        if camera is not None and getattr(camera, "is_fake", True) is not False:
+            raise RuntimeError(
+                f"vision.scene.get_tracker() runs on a {type(camera).__name__}, not the overhead camera: a "
+                "fake scene must never feed the real arm (unset FAKE_CAMERA/FAKE or use --fake)"
+            )
+        if not _delivers_a_frame(tracker, seconds):
+            raise TimeoutError(f"the overhead camera delivered no frame within {seconds:g} s")
+    except BaseException:
+        close_tracker(tracker)
+        raise
+    return tracker, tracker.latest
+
+
+def _frame_count(tracker: Any) -> int | None:
+    """The tracker's count of delivered camera frames (`SceneTracker.frames`), None when it keeps none."""
+    frames = getattr(tracker, "frames", None)
+    return frames if isinstance(frames, int) and not isinstance(frames, bool) else None
+
+
+def _delivers_a_frame(tracker: Any, timeout: float) -> bool:
+    """True when the tracker publishes within `timeout` s and, if it counts delivered frames, that count
+    grew meanwhile: publications rebuilt from missed grabs alone are a dead camera, not a live one."""
+    before = _frame_count(tracker)
+    deadline = time.monotonic() + timeout
+    if not tracker.wait_for_frame(timeout=timeout):
+        return False
+    while before is not None and (_frame_count(tracker) or 0) <= before:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.0 or not tracker.wait_for_frame(timeout=remaining):
+            return False
+    return True
+
+
+def close_tracker(tracker: Any) -> None:
+    """`tracker.close()` without ever raising (a camera that fails to release must not mask the result)."""
+    try:
+        tracker.close()
+    except Exception:
+        log.exception("closing the scene tracker failed")
+
+
+def checked_record_name(name: Any) -> str:
+    """`--record NAME` as a safe file stem: letters, digits, `_` and `-`, 1 to 64 characters, starting with
+    a letter or digit (never a path, a dot, a space or an empty string); ValueError otherwise."""
+    if not isinstance(name, str) or not RECORD_NAME_RE.match(name):
+        raise ValueError(f"--record NAME must match {RECORD_NAME_RE.pattern}, got {_short(name)}")
+    return name
+
+
+def record_path(name: str, runs_dir: Path | str | None = None) -> Path:
+    """`<runs>/calibration/replays-<name>.jsonl`: `runs` is `runs_dir`, else VARA_RUNS_DIR when set, else
+    the repo's runs/. The name is checked with `checked_record_name`."""
+    base = Path(runs_dir) if runs_dir is not None else Path(os.environ.get("VARA_RUNS_DIR") or ROOT / "runs")
+    return base / "calibration" / f"replays-{checked_record_name(name)}.jsonl"
+
+
+def prepare_record(name: str, runs_dir: Path | str | None = None) -> tuple[Path, int, int]:
+    """The `--record` preflight, run before anything moves: `record_path(name, runs_dir)` with its folder
+    created and `(path, ok, total)` of the lines already there (`tally`; (0, 0) for a new file). Raises
+    ValueError for a bad name or a corrupt file and OSError when the folder cannot be created, so a CLI
+    refuses before a real attempt is spent without its evidence. Writes nothing to the file."""
+    path = record_path(name, runs_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists() and not path.is_file():
+        raise ValueError(f"{path} is not a file")
+    ok, total = tally(path)
+    return path, ok, total
+
+
+def record_attempt(
+    name: str, record: Mapping[str, Any], runs_dir: Path | str | None = None
+) -> tuple[Path, int, int]:
+    """Append one replay attempt as a JSON line to `record_path(name, runs_dir)` (parents created, the file
+    never overwritten) and return `(path, ok, total)`, the running tally of that file (`tally`).
+
+    `record` must carry a boolean `ok`; the CLI adds `t` (local time), `traj` (path), `traj_sha256`,
+    `skill`, `mode` (`fake` or `real`), `reason`, `events` (count) and `elapsed_s`. The line gets
+    `label: name` so a file that is copied elsewhere still says what it counted. A file that does not
+    tally (`prepare_record` raises) is never appended to.
+    """
+    if not isinstance(record, Mapping) or not isinstance(record.get("ok"), bool):
+        raise ValueError(f"a replay record needs a boolean 'ok', got {_short(record, 80)}")
+    path, _, _ = prepare_record(name, runs_dir)
+    line = json.dumps({"label": name, **dict(record)}, allow_nan=False)
+    # a last line without its newline (a hand edit) would otherwise glue two objects into one line
+    unterminated = path.exists() and path.stat().st_size > 0 and not path.read_bytes().endswith(b"\n")
+    with path.open("a", encoding="utf-8", newline="\n") as fh:
+        fh.write(("\n" if unterminated else "") + line + "\n")
+    ok, total = tally(path)
+    return path, ok, total
+
+
+def tally(path: Path | str) -> tuple[int, int]:
+    """`(ok, total)` over the JSON lines of a replays file: `total` lines (blank ones skipped), `ok` of them
+    with `"ok": true`. A missing file counts (0, 0); a line that is not a JSON object with a boolean `ok`
+    raises ValueError naming the line (the file is evidence, so it is never silently reinterpreted)."""
+    file = Path(path)
+    if not file.exists():
+        return 0, 0
+    ok = total = 0
+    for number, raw in enumerate(file.read_text(encoding="utf-8").splitlines(), start=1):
+        if not raw.strip():
+            continue
+        try:
+            entry = json.loads(raw)
+        except ValueError as exc:
+            raise ValueError(f"{file} line {number}: not JSON ({exc})") from exc
+        if not isinstance(entry, dict) or not isinstance(entry.get("ok"), bool):
+            raise ValueError(f"{file} line {number}: expected an object with a boolean 'ok'")
+        total += 1
+        ok += int(entry["ok"])
+    return ok, total
+
+
 def main(argv: Sequence[str] | None = None) -> int:
-    """`--traj file.json` validates; `--fake` replays on the in-memory arm; `--real` on the real arm."""
+    """`--traj file.json` validates; `--fake` replays on the in-memory arm; `--real` on the real arm.
+    `--scene-file` or `--tracker` give the hand check its data; `--record NAME` tallies the attempts."""
     parser = argparse.ArgumentParser(
         prog="python -m arm.replay",
         description="Validate a trajectory, or replay it (--fake in memory, --real on the arm).",
@@ -1158,14 +1597,41 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--traj", required=True, help="trajectory JSON (schemas/trajectory.json)")
     parser.add_argument("--real", action="store_true", help="replay on the REAL arm after confirmation")
     parser.add_argument("--fake", action="store_true", help="replay on the in-memory FakeDriver, no sleeping")
-    parser.add_argument("--scene-file", help="JSON scene file re-read every tick for the hand check")
+    hand = parser.add_mutually_exclusive_group()
+    hand.add_argument(
+        "--scene-file",
+        help="JSON scene file re-read every tick for the hand check; with --real only the file of a running "
+        "`python -m vision.scene --out FILE` on the real camera (its FILE.source.json says live)",
+    )
+    hand.add_argument(
+        "--tracker",
+        action="store_true",
+        help="hand check from the live overhead SceneTracker (vision.scene.get_tracker(); refused with "
+        "--real when it is a fake or shows no frame in 5 s); with --fake the FakeSceneTracker",
+    )
+    parser.add_argument(
+        "--record",
+        metavar="NAME",
+        help="with --fake or --real: append the attempt to runs/calibration/replays-NAME.jsonl "
+        "(VARA_RUNS_DIR moves runs/) and print the running tally 'NAME: k of n ok'",
+    )
     parser.add_argument("--port", help="serial port for --real; default FOLLOWER_PORT from .env")
     parser.add_argument("--id", dest="follower_id", help="LeRobot id for --real; default from config")
+    cli_args = list(sys.argv[1:] if argv is None else argv)  # the command line, for the Esc record
     args = parser.parse_args(argv)
+    if args.record is not None:
+        if not (args.real or args.fake):
+            parser.error("--record needs --fake or --real: a validate-only run is not a replay attempt")
+        try:
+            checked_record_name(args.record)
+        except ValueError as exc:
+            parser.error(str(exc))
     logging.basicConfig(level=logging.INFO, stream=sys.stderr, format="%(asctime)s %(levelname)s %(message)s")
 
+    traj_path = Path(args.traj)
     try:
-        traj = json.loads(Path(args.traj).read_text(encoding="utf-8"))
+        traj_bytes = traj_path.read_bytes()
+        traj = json.loads(traj_bytes.decode("utf-8"))
     except (OSError, ValueError) as exc:
         print(f"cannot read --traj {args.traj}: {exc}", file=sys.stderr)
         return 2
@@ -1188,52 +1654,105 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"OK: {args.traj} validated ({len(traj['segments'])} segments)")
     if not (args.real or args.fake):
         return 0
-
-    try:
-        scene = scene_file_reader(args.scene_file)
-    except (OSError, ValueError) as exc:
-        print(f"cannot read --scene-file {args.scene_file}: {exc}; nothing moved", file=sys.stderr)
-        return 2
-    if args.fake or _fake("FAKE_ROBOT") and not args.real:
-        result = replay(traj, driver=driver_mod.FakeDriver(), scene=scene, realtime=False)
-        print(json.dumps(result))
-        return 0 if result["ok"] else 1
-
-    from dotenv import load_dotenv
-
-    from arm import real_robot
-
-    load_dotenv()
-    if scene is None:
-        print(
-            "WARNING: no --scene-file: no hand data, the 10 cm hand check is off. Keep hands out of the box."
-        )
-    real_robot.clear_cancel()  # discard an earlier session's cancellation before watching this startup
-    drv = driver_mod.Driver(port=args.port, follower_id=args.follower_id)
-    watcher = driver_mod.EscWatcher(lambda: real_robot.freeze(drv))
-    watcher.start()
-    try:
-        if not real_robot.confirm_arm_clear(3, watcher):
-            return 1
-        if real_robot.esc_during_connect(watcher, drv):
-            return 1
-        drv.connect()  # the only place this CLI powers the arm
+    if args.record is not None:
         try:
+            record_file, ok_before, total_before = prepare_record(args.record)
+        except (OSError, ValueError) as exc:
+            print(f"cannot use --record {args.record}: {exc}; nothing moved", file=sys.stderr)
+            return 2
+        print(f"recording attempt {total_before + 1} in {record_file} ({ok_before} ok so far)")
+
+    def record(result: dict[str, Any], mode: str, elapsed: float) -> bool:
+        """`--record`: one line in runs/calibration/replays-NAME.jsonl and the running tally; False when
+        the evidence could not be written (the exit code then says so even after a good replay)."""
+        if args.record is None:
+            return True
+        entry = {
+            "t": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "traj": str(traj_path.resolve()),
+            "traj_sha256": hashlib.sha256(traj_bytes).hexdigest(),
+            "skill": traj.get("skill"),
+            "mode": mode,
+            "ok": bool(result["ok"]),
+            "reason": result["reason"],
+            "events": len(result["events"]),
+            "elapsed_s": round(float(elapsed), 3),
+        }
+        try:
+            path, ok, total = record_attempt(args.record, entry)
+        except (OSError, ValueError) as exc:
+            print(f"cannot record the attempt: {exc}", file=sys.stderr)
+            return False
+        print(f"{args.record}: {ok} of {total} ok ({path})")
+        return True
+
+    fake_mode = args.fake or (_fake("FAKE_ROBOT") and not args.real)
+    scene: Callable[[], dict | None] | None = None
+    if not args.tracker:
+        scene, refused = open_scene_file(args.scene_file, real=not fake_mode)
+        if refused:
+            return 2
+    if not fake_mode:
+        from dotenv import load_dotenv
+
+        load_dotenv()  # before the tracker: FAKE_CAMERA from .env makes it a fake, which --real refuses
+    tracker: Any = None
+    if args.tracker:
+        try:
+            tracker, scene = tracker_scene(fake_mode)
+        except Exception as exc:  # any failure to build or trust the tracker refuses before anything moves
+            print(f"cannot use --tracker: {type(exc).__name__}: {exc}; nothing moved", file=sys.stderr)
+            return 2
+    try:
+        if fake_mode:
+            started = time.perf_counter()
+            result = replay(traj, driver=driver_mod.FakeDriver(), scene=scene, realtime=False)
+            print(json.dumps(result))
+            recorded = record(result, "fake", time.perf_counter() - started)
+            return 0 if result["ok"] and recorded else 1
+
+        from arm import real_robot
+
+        if scene is None:
+            print(
+                "WARNING: no --scene-file or --tracker: no hand data, the 10 cm hand check is off. "
+                "Keep hands out of the box."
+            )
+        real_robot.clear_cancel()  # discard an earlier session's cancellation before watching this startup
+        drv = driver_mod.Driver(port=args.port, follower_id=args.follower_id)
+        watcher = driver_mod.EscWatcher(lambda: real_robot.freeze(drv))
+        watcher.start()
+        try:
+            if not real_robot.confirm_arm_clear(3, watcher):
+                return 1
             if real_robot.esc_during_connect(watcher, drv):
                 return 1
-            result = replay(traj, driver=drv, scene=scene, realtime=True)
-            print(json.dumps(result))
-            if drv.stopped:
-                print("Arm is FROZEN with torque on. Press Enter to release the port (torque stays on).")
-                try:
-                    input()
-                except EOFError:
-                    pass
-            return 0 if result["ok"] else 1
+            drv.connect()  # the only place this CLI powers the arm
+            connected_at = time.monotonic()  # Esc presses before this are connect-phase (A13)
+            try:
+                if real_robot.esc_during_connect(watcher, drv):
+                    return 1
+                started = time.perf_counter()
+                result = replay(traj, driver=drv, scene=scene, realtime=True)
+                print(json.dumps(result))
+                recorded = record(result, "real", time.perf_counter() - started)
+                if drv.stopped:
+                    print("Arm is FROZEN with torque on. Press Enter to release the port (torque stays on).")
+                    try:
+                        input()
+                    except EOFError:
+                        pass
+                return 0 if result["ok"] and recorded else 1
+            finally:
+                driver_mod.report_esc_latency(
+                    watcher, drv, source="arm.replay", connected_at=connected_at, extra={"argv": cli_args}
+                )
+                drv.disconnect()  # torque stays on; the arm keeps holding its pose
         finally:
-            drv.disconnect()  # torque stays on; the arm keeps holding its pose
+            watcher.stop()
     finally:
-        watcher.stop()
+        if tracker is not None:
+            close_tracker(tracker)
 
 
 if __name__ == "__main__":
